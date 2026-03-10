@@ -1,0 +1,21 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "ec5403f0dfd07d8e59c914ef31f186c56673482f",
+  "prompts": {
+    "dc010ba05eb0855d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019cc34f-89a1-7951-8f27-c4a20b3d1f03",
+        "model": "gpt-5.4"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 52,
+      "total_deletions": 14,
+      "accepted_lines": 52,
+      "overriden_lines": 0
+    }
+  }
+}

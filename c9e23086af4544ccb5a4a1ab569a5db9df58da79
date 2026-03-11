@@ -1,0 +1,23 @@
+scripts/picker/picker.sh
+  480fa7208df8c93c 26-27,38-48,50,54,58,61,77-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "c9e23086af4544ccb5a4a1ab569a5db9df58da79",
+  "prompts": {
+    "480fa7208df8c93c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7accca9-0324-4dda-95e4-3575c13e9700",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 27,
+      "total_deletions": 10,
+      "accepted_lines": 19,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,27 @@
+scripts/picker/render.js
+  d6701f210ea44135 98-100,116-117,123,129-131,135-136,149,153-157,164
+scripts/picker/sync.js
+  d6701f210ea44135 328
+scripts/picker/picker.sh
+  d6701f210ea44135 85-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "fa7ab73d9c0db611bd58154609a925223f77dc8d",
+  "prompts": {
+    "d6701f210ea44135": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "045e1745-7f6b-48a9-bc09-bcdcb55840ee",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 61,
+      "total_deletions": 34,
+      "accepted_lines": 41,
+      "overriden_lines": 0
+    }
+  }
+}

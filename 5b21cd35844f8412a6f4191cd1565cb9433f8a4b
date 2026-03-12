@@ -1,0 +1,23 @@
+scripts/status-bar.js
+  480fa7208df8c93c 4-6,9,12,34-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "5b21cd35844f8412a6f4191cd1565cb9433f8a4b",
+  "prompts": {
+    "480fa7208df8c93c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7accca9-0324-4dda-95e4-3575c13e9700",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 20,
+      "total_deletions": 3,
+      "accepted_lines": 20,
+      "overriden_lines": 0
+    }
+  }
+}

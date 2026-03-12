@@ -1,0 +1,27 @@
+tmux-scout.tmux
+  d4a02952b095ee58 7,9
+README_CN.md
+  d4a02952b095ee58 1-139
+README.md
+  d4a02952b095ee58 1-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "2565011762177dd101d732002f889a3fc526f49f",
+  "prompts": {
+    "d4a02952b095ee58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "252ee228-e78f-4476-8cee-21e4171cecc2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 348,
+      "total_deletions": 69,
+      "accepted_lines": 280,
+      "overriden_lines": 0
+    }
+  }
+}

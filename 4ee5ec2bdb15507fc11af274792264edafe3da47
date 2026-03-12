@@ -1,0 +1,25 @@
+scripts/status-bar.js
+  480fa7208df8c93c 1-31
+tmux-scout.tmux
+  480fa7208df8c93c 9-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "4ee5ec2bdb15507fc11af274792264edafe3da47",
+  "prompts": {
+    "480fa7208df8c93c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e7accca9-0324-4dda-95e4-3575c13e9700",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 73,
+      "total_deletions": 36,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    }
+  }
+}

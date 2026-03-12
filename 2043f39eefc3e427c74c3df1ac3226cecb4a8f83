@@ -1,0 +1,23 @@
+.gitignore
+  d4a02952b095ee58 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "2043f39eefc3e427c74c3df1ac3226cecb4a8f83",
+  "prompts": {
+    "d4a02952b095ee58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "252ee228-e78f-4476-8cee-21e4171cecc2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 5,
+      "total_deletions": 0,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    }
+  }
+}

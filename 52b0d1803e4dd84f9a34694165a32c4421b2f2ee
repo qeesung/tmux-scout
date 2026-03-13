@@ -1,0 +1,23 @@
+scripts/picker/sync.js
+  5e04b99bdf1dc838 447-451,503-514,518-519,521-522
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "52b0d1803e4dd84f9a34694165a32c4421b2f2ee",
+  "prompts": {
+    "5e04b99bdf1dc838": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5c4dffa0-7a6e-4d04-8599-7b2f533e739a",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 21,
+      "total_deletions": 8,
+      "accepted_lines": 21,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,25 @@
+README_CN.md
+  d4a02952b095ee58 143-151
+README.md
+  d4a02952b095ee58 143-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "270e4a3d08af471cf172e303e09e06762526ada9",
+  "prompts": {
+    "d4a02952b095ee58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "252ee228-e78f-4476-8cee-21e4171cecc2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Qin ShiCheng <qinshicheng@bytedance.com>",
+      "messages": [],
+      "total_additions": 30,
+      "total_deletions": 12,
+      "accepted_lines": 18,
+      "overriden_lines": 0
+    }
+  }
+}

@@ -1,0 +1,5 @@
+.vscode/
+.claude/
+.DS_Store
+node_modules/
+*.tmp.*

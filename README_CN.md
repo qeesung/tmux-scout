@@ -4,6 +4,10 @@
 
 [English](README.md)
 
+如果你更喜欢零依赖的安装方式，不想在系统里额外配置 Node.js 运行环境，推荐试试由 [@ianchesal](https://github.com/ianchesal) 开发的优秀 Go 语言重写版本：
+
+👉 **[tmux-scout-golang](https://github.com/ianchesal/tmux-scout-golang)**
+
 <video src="https://github.com/user-attachments/assets/01ab8cdb-b3da-43de-8082-545879817ce3" controls="controls" style="max-width: 100%;">
   Your browser does not support the video tag.
 </video>

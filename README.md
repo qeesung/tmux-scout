@@ -4,6 +4,10 @@ A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic
 
 [中文文档](README_CN.md)
 
+If you prefer a zero-dependency setup without needing a Node.js runtime, check out this awesome Golang port created by [@ianchesal](https://github.com/ianchesal):
+
+👉 **[tmux-scout-golang](https://github.com/ianchesal/tmux-scout-golang)**
+
 <video src="https://github.com/user-attachments/assets/01ab8cdb-b3da-43de-8082-545879817ce3" controls="controls" style="max-width: 100%;">
   Your browser does not support the video tag.
 </video>

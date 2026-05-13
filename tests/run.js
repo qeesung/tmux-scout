@@ -67,6 +67,25 @@ test('jsonl reader resets when files shrink', () => {
   }
 })
 
+test('jsonl reader reports invalid JSONL rows', () => {
+  const dir = tempDir()
+  try {
+    const file = path.join(dir, 'session.jsonl')
+    fs.writeFileSync(file, '{"ok":true}\nnot-json\n')
+
+    const full = readJsonlFile(file)
+    assert.strictEqual(full.parsed, 1)
+    assert.strictEqual(full.parseErrors, 1)
+
+    const state = {}
+    const incremental = readJsonlIncremental(file, state)
+    assert.strictEqual(incremental.parsed, 1)
+    assert.strictEqual(incremental.parseErrors, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('session reducer protects recent high-confidence hook state', () => {
   const session = { sessionId: 's1', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {

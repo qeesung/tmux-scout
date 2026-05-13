@@ -177,6 +177,8 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher on
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher stop
 ```
 
+`watcher status` 会包含最近一次 tick 的模式、耗时、reconcile 变更数、读取的 Codex JSONL 文件数、解析事件数，以及出现时的 JSONL 解析错误数。
+
 ## 数据存储
 
 会话数据存储在 `~/.tmux-scout/` 目录下：

@@ -134,20 +134,80 @@ function pruneState(state) {
   }
 }
 
+function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
+  const reconcile = stats && stats.reconcile ? stats.reconcile : {}
+  const codex = stats && stats.codex ? stats.codex : {}
+  const paneGroundTruth = stats && stats.paneGroundTruth ? stats.paneGroundTruth : {}
+  const stuckTools = stats && stats.stuckTools ? stats.stuckTools : {}
+  const reconcileChanges = (reconcile.processExits || 0)
+    + (reconcile.paneShellExits || 0)
+    + (reconcile.pidBindings || 0)
+  const codexChanges = (codex.discovered || 0) + (codex.updated || 0) + (codex.stale || 0)
+  const paneUpdates = paneGroundTruth.updates || 0
+  const stuckInterruptions = stuckTools.interrupted || 0
+
+  return {
+    mode,
+    startedAt,
+    finishedAt,
+    durationMs,
+    changes: reconcileChanges + codexChanges + paneUpdates + stuckInterruptions,
+    reconcileChanges,
+    processExits: reconcile.processExits || 0,
+    paneShellExits: reconcile.paneShellExits || 0,
+    pidBindings: reconcile.pidBindings || 0,
+    codexDiscovered: codex.discovered || 0,
+    codexUpdated: codex.updated || 0,
+    codexStale: codex.stale || 0,
+    codexFilesRead: codex.filesRead || 0,
+    codexEventsParsed: codex.eventsParsed || 0,
+    codexParseErrors: codex.parseErrors || 0,
+    paneUpdates,
+    stuckToolInterruptions: stuckInterruptions
+  }
+}
+
+function saveTickSummary(state, summary) {
+  state.lastTickDurationMs = summary.durationMs
+  state.lastTickSummary = summary
+  state.recentTicks = Array.isArray(state.recentTicks) ? state.recentTicks : []
+  state.recentTicks.unshift(summary)
+  state.recentTicks = state.recentTicks.slice(0, 10)
+}
+
+function formatTickDiagnostics(summary) {
+  if (!summary || typeof summary !== 'object') return ''
+  const parts = []
+  if (Number.isFinite(summary.durationMs)) parts.push(`duration=${summary.durationMs}ms`)
+  if (Number.isFinite(summary.changes)) parts.push(`changes=${summary.changes}`)
+  if (Number.isFinite(summary.reconcileChanges)) parts.push(`reconcile=${summary.reconcileChanges}`)
+  if (Number.isFinite(summary.codexFilesRead)) parts.push(`codexRead=${summary.codexFilesRead}`)
+  if (Number.isFinite(summary.codexEventsParsed)) parts.push(`codexParsed=${summary.codexEventsParsed}`)
+  if (summary.codexParseErrors > 0) parts.push(`codexParseErrors=${summary.codexParseErrors}`)
+  if (summary.codexDiscovered > 0) parts.push(`codexDiscovered=${summary.codexDiscovered}`)
+  if (summary.codexUpdated > 0) parts.push(`codexUpdated=${summary.codexUpdated}`)
+  if (summary.codexStale > 0) parts.push(`codexStale=${summary.codexStale}`)
+  if (summary.paneUpdates > 0) parts.push(`paneUpdates=${summary.paneUpdates}`)
+  if (summary.stuckToolInterruptions > 0) parts.push(`stuckTools=${summary.stuckToolInterruptions}`)
+  return parts.length > 0 ? ` ${parts.join(' ')}` : ''
+}
+
 function runTick(state, forceFull = false) {
-  const now = Date.now()
+  const startedAt = Date.now()
+  const now = startedAt
   const discoveryIntervalMs = optionSeconds('@scout-watchdog-discovery-interval', DEFAULT_DISCOVERY_INTERVAL_MS, 5000)
   const fullIntervalMs = optionSeconds('@scout-watchdog-full-interval', DEFAULT_FULL_INTERVAL_MS, 10000)
   const discoverDue = now - (state.lastDiscoveryAt || 0) >= discoveryIntervalMs
   const fullDue = forceFull || now - (state.lastFullReconcileAt || 0) >= fullIntervalMs
+  let result
 
   if (fullDue) {
-    sync.run(STATUS_FILE)
+    result = sync.run(STATUS_FILE)
     state.lastFullReconcileAt = now
     state.lastDiscoveryAt = now
     state.lastMode = 'full'
   } else {
-    sync.run(STATUS_FILE, {
+    result = sync.run(STATUS_FILE, {
       codexMode: 'incremental',
       watcherState: state,
       discoverCodex: discoverDue
@@ -156,9 +216,13 @@ function runTick(state, forceFull = false) {
     state.lastMode = discoverDue ? 'incremental+discover' : 'incremental'
   }
 
+  const finishedAt = Date.now()
+  const stats = result && result.stats ? result.stats : null
+  const summary = summarizeStats(stats, finishedAt - startedAt, state.lastMode, startedAt, finishedAt)
   state.pid = process.pid
-  state.lastTickAt = Date.now()
+  state.lastTickAt = finishedAt
   state.lastError = null
+  saveTickSummary(state, summary)
   pruneState(state)
   writeJsonAtomic(STATE_FILE, state)
 }
@@ -210,11 +274,12 @@ function status() {
   const files = Object.keys(state.codexFiles || {}).length
   const lastTick = state.lastTickAt ? new Date(state.lastTickAt).toISOString() : 'never'
   const error = state.lastError ? ` error=${JSON.stringify(state.lastError)}` : ''
+  const diagnostics = formatTickDiagnostics(state.lastTickSummary)
   if (lock && isPidAlive(lock.pid)) {
-    console.log(`running pid=${lock.pid} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${error}`)
+    console.log(`running pid=${lock.pid} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
     return
   }
-  console.log(`stopped lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${error}`)
+  console.log(`stopped lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
 }
 
 function stop(quiet) {

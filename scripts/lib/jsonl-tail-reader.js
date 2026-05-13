@@ -7,14 +7,17 @@ const DEFAULT_TAIL_BYTES = 128 * 1024
 function parseJsonlLines(lines) {
   const objects = []
   let parsed = 0
+  let parseErrors = 0
   for (const line of lines) {
     if (!line || !line.trim()) continue
     try {
       objects.push(JSON.parse(line))
       parsed++
-    } catch (_) {}
+    } catch (_) {
+      parseErrors++
+    }
   }
-  return { objects, parsed }
+  return { objects, parsed, parseErrors }
 }
 
 function readJsonlFile(filePath) {
@@ -71,14 +74,14 @@ function readJsonlIncremental(filePath, fileState, options = {}) {
 
     const lines = chunk.split('\n')
     state.partialLine = lines.pop() || ''
-    const { objects, parsed } = parseJsonlLines(lines)
+    const { objects, parsed, parseErrors } = parseJsonlLines(lines)
 
     state.offset = currentSize
     state.size = currentSize
     state.mtimeMs = stat.mtimeMs
     state.lastReadAt = Date.now()
 
-    return { changed: reset || parsed > 0, objects, parsed, state, reset }
+    return { changed: reset || parsed > 0, objects, parsed, parseErrors, state, reset }
   } catch (_) {
     return null
   }

@@ -1,0 +1,17 @@
+{
+  "name": "tmux-scout",
+  "version": "0.1.0",
+  "description": "A tmux plugin for monitoring and navigating Claude Code and Codex sessions.",
+  "license": "MIT",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "check": "node scripts/check-js.js",
+    "test": "node tests/run.js",
+    "ci": "npm run check && npm test",
+    "doctor": "node scripts/setup.js doctor"
+  }
+}

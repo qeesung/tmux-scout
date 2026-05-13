@@ -206,6 +206,14 @@ Internally, hook, pane, transcript, PID, and stale-timeout observations are redu
 
 For older Codex versions that only support `notify`, tmux-scout still installs and chains the legacy notify hook. In that fallback mode, first-turn discovery may still depend on JSONL polling until Codex emits a completion notification.
 
+## Development
+
+```bash
+npm run check   # Syntax-check project JavaScript files
+npm test        # Run focused unit tests
+npm run ci      # Run both checks
+```
+
 ## License
 
 MIT

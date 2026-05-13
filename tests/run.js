@@ -8,6 +8,9 @@ const path = require('path')
 
 const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental } = require('../scripts/lib/jsonl-tail-reader')
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
+const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
+const { getActiveSessions } = require('../scripts/picker/render')
+const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 
 const tests = []
@@ -52,6 +55,13 @@ function readScoutStatus(homeDir) {
 
 function stripAnsi(value) {
   return String(value).replace(/\x1b\[[0-9;]*m/g, '')
+}
+
+function codexSessionDir(homeDir, date = new Date()) {
+  return path.join(homeDir, '.codex', 'sessions',
+    String(date.getFullYear()),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0'))
 }
 
 test('jsonl reader parses complete files and appends incrementally', () => {
@@ -514,6 +524,152 @@ test('codex hook does not treat normal completed answers with question marks as 
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.lastEvent.type, 'stop')
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex classifier hides internal background prompts', () => {
+  const classification = classifyCodexSession({
+    prompt: [
+      'You are a helpful assistant. Generate a pull request title and body.',
+      'Write the result into the structured response fields title and body.'
+    ].join('\n')
+  })
+
+  assert.strictEqual(classification.hidden, true)
+  assert.strictEqual(classification.isInternal, true)
+  assert.strictEqual(classification.reason, 'codex-pr-metadata')
+})
+
+test('codex hook marks internal background sessions hidden', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-internal-pr'
+    runHook('scripts/hooks/codex.js', {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      prompt: 'You are a helpful assistant. Generate a pull request title and body.'
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(session.isHiddenFromScout, true)
+    assert.strictEqual(session.isInternalCodexSession, true)
+    assert.strictEqual(session.hiddenReason, 'codex-pr-metadata')
+    assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex legacy notify classifies full prompt before title truncation', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-legacy-title-worker'
+    runHook('scripts/hooks/codex.js', {
+      type: 'agent-turn-complete',
+      'thread-id': sessionId,
+      'turn-id': 'turn-1',
+      cwd: '/tmp/demo',
+      'input-messages': [{
+        role: 'user',
+        content: [
+          'Generate a short title for a task.',
+          'Return only the title.',
+          '',
+          'User prompt:',
+          'Please inspect the repository and explain the first issue.'
+        ].join('\n')
+      }],
+      'last-assistant-message': 'Inspect repo issue'
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(session.isHiddenFromScout, true)
+    assert.strictEqual(session.isInternalCodexSession, true)
+    assert.strictEqual(session.hiddenReason, 'codex-title-generation')
+    assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook reads transcript session_meta from first line of large transcript', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-large-transcript-subagent'
+    const transcriptPath = path.join(dir, 'large-rollout.jsonl')
+    const firstLine = JSON.stringify({
+      type: 'session_meta',
+      payload: {
+        id: sessionId,
+        forked_from_id: 'parent-session'
+      }
+    })
+    fs.writeFileSync(transcriptPath, firstLine + '\n' + 'x'.repeat(2 * 1024 * 1024))
+
+    runHook('scripts/hooks/codex.js', {
+      hook_event_name: 'SessionStart',
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(session.isHiddenFromScout, true)
+    assert.strictEqual(session.isCodexSubagent, true)
+    assert.strictEqual(session.hiddenReason, 'codex-subagent')
+    assert.strictEqual(session.parentSessionId, 'parent-session')
+    assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex jsonl discovery skips subagent sessions by default', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const now = new Date()
+    const sessionDir = codexSessionDir(dir, now)
+    fs.mkdirSync(sessionDir, { recursive: true })
+    const threadId = '11111111-1111-4111-8111-111111111111'
+    const file = path.join(sessionDir, `rollout-${threadId}.jsonl`)
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: threadId,
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: '22222222-2222-4222-8222-222222222222',
+                depth: 1,
+                agent_nickname: 'worker'
+              }
+            }
+          }
+        }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: now.toISOString(),
+        payload: { type: 'user_message', message: 'inspect files' }
+      })
+    ].join('\n') + '\n')
+
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    const result = sync.run(statusFile)
+    assert.deepStrictEqual(Object.keys(result.status.sessions), [])
+    assert.strictEqual(fs.existsSync(statusFile), false)
+  } finally {
+    process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })

@@ -9,6 +9,7 @@ const { execSync } = require('child_process')
 const { applySessionEvent, currentPhase } = require('../lib/session-state')
 const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental: readJsonlTailIncremental } = require('../lib/jsonl-tail-reader')
 const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-tree')
+const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
 
 let statusFile = process.argv[2] || ''
 let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') : ''
@@ -170,6 +171,7 @@ function sweepPidBindings(status, panes, processTable, stats) {
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
     if (!session || session.endedAt || !pane) continue
 
@@ -226,6 +228,7 @@ function sweepDeadProcesses(status, panes, stats) {
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
     if (!session || session.endedAt || !pane || !hasTrackedPid(session)) continue
     if (getPidState(session.pid) !== 'dead') continue
@@ -247,6 +250,7 @@ function sweepPaneReturnedToShell(status, panes, stats) {
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
     if (!session || session.endedAt || !pane || hasTrackedPid(session)) continue
     if (!canUseShellFallback(session) || !isShellCommand(pane.currentCommand || '')) continue
@@ -299,22 +303,14 @@ function findCodexJsonl(threadId) {
 
 function extractUserMessage(ev) {
   if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'user_message' && ev.payload.message) {
-    let msg = String(ev.payload.message)
-    const marker = '## My request for Codex:'
-    const idx = msg.indexOf(marker)
-    if (idx >= 0) msg = msg.slice(idx + marker.length)
-    return msg.trim().slice(0, 100).split('\n')[0].trim()
+    return cleanCodexPrompt(ev.payload.message)
   }
   if (ev.type === 'response_item' && ev.payload && ev.payload.type === 'message' && ev.payload.role === 'user') {
     const content = ev.payload.content
     if (Array.isArray(content)) {
       for (const part of content) {
         if ((part.type === 'input_text' || part.type === 'text') && part.text) {
-          let msg = String(part.text)
-          const marker = '## My request for Codex:'
-          const idx = msg.indexOf(marker)
-          if (idx >= 0) msg = msg.slice(idx + marker.length)
-          return msg.trim().slice(0, 100).split('\n')[0].trim()
+          return cleanCodexPrompt(part.text)
         }
       }
     }
@@ -328,6 +324,8 @@ function createCodexAccumulator(seed) {
     : []
   return {
     lastUserTitle: seed && seed.lastUserTitle,
+    lastUserPrompt: seed && seed.lastUserPrompt,
+    sessionMeta: seed && seed.sessionMeta,
     lastCompletedTs: Number.isFinite(seed && seed.lastCompletedTs) ? seed.lastCompletedTs : 0,
     lastInterruptedTs: Number.isFinite(seed && seed.lastInterruptedTs) ? seed.lastInterruptedTs : 0,
     lastUserTs: Number.isFinite(seed && seed.lastUserTs) ? seed.lastUserTs : 0,
@@ -348,9 +346,14 @@ function applyCodexEvent(accumulator, ev) {
   if (!ev || typeof ev !== 'object') return
   const pendingCalls = new Set(accumulator.pendingCalls || [])
 
+  if (ev.type === 'session_meta' && ev.payload && typeof ev.payload === 'object') {
+    accumulator.sessionMeta = ev.payload
+  }
+
   const userMsg = extractUserMessage(ev)
   if (userMsg) {
-    accumulator.lastUserTitle = userMsg
+    accumulator.lastUserPrompt = userMsg
+    accumulator.lastUserTitle = userMsg.slice(0, 100).split('\n')[0].trim()
     accumulator.lastUserTs = eventTimestamp(ev, 0)
     // User responded — no longer waiting for plan confirmation.
     accumulator.waitingForPlanConfirmation = false
@@ -397,6 +400,10 @@ function applyCodexEvent(accumulator, ev) {
 
 function codexResultFromAccumulator(accumulator) {
   const acc = createCodexAccumulator(accumulator)
+  const classification = classifyCodexSession({
+    prompt: acc.lastUserPrompt || acc.lastUserTitle || '',
+    sessionMeta: acc.sessionMeta
+  })
   let status = 'completed'
   const now = Date.now()
   const pendingCount = acc.pendingCalls.length
@@ -420,6 +427,13 @@ function codexResultFromAccumulator(accumulator) {
     status,
     title: acc.lastUserTitle || undefined,
     cwd: acc.cwd,
+    hidden: classification.hidden,
+    hiddenReason: classification.reason,
+    isInternalCodexSession: classification.isInternal,
+    isCodexSubagent: classification.isSubagent,
+    parentSessionId: classification.parentSessionId,
+    subagentDepth: classification.subagentDepth,
+    subagentNickname: classification.subagentNickname,
     hasTimeline: Boolean(acc.lastUserTs || acc.lastCompletedTs || acc.lastInterruptedTs || pendingCount || acc.waitingForPlanConfirmation)
   }
 }
@@ -495,6 +509,29 @@ function applyCodexResultToSession(session, result, now) {
   if (!session || !result) return false
   let sessionChanged = false
 
+  if (result.hidden && !session.isHiddenFromScout) {
+    session.isHiddenFromScout = true
+    session.hiddenReason = result.hiddenReason || 'codex-hidden-session'
+    session.hiddenAt = now
+    session.isInternalCodexSession = Boolean(result.isInternalCodexSession)
+    session.isCodexSubagent = Boolean(result.isCodexSubagent)
+    if (result.parentSessionId) session.parentSessionId = result.parentSessionId
+    if (result.subagentDepth !== undefined) session.subagentDepth = result.subagentDepth
+    if (result.subagentNickname) session.subagentNickname = result.subagentNickname
+    session.needsAttention = null
+    session.pendingToolUse = null
+    applySessionEvent(session, {
+      type: 'session_end',
+      source: 'transcript',
+      timestamp: now,
+      endedAt: now,
+      reason: session.hiddenReason,
+      details: session.hiddenReason,
+      force: true
+    })
+    return true
+  }
+
   // Recover PID from session file if hook has written it
   // (sync.js reads status.json which may have stale pid: null due to race with hook)
   if (!hasTrackedPid(session)) {
@@ -556,6 +593,14 @@ function addDiscoveredCodexSession(status, threadId, filePath, fileStat, result,
     tmuxPane: null,
     pid: null,
     stateSource: 'codex-jsonl',
+    isHiddenFromScout: Boolean(result.hidden),
+    hiddenReason: result.hiddenReason || undefined,
+    hiddenAt: result.hidden ? now : undefined,
+    isInternalCodexSession: Boolean(result.isInternalCodexSession),
+    isCodexSubagent: Boolean(result.isCodexSubagent),
+    parentSessionId: result.parentSessionId || undefined,
+    subagentDepth: result.subagentDepth,
+    subagentNickname: result.subagentNickname || undefined,
     lastEvent: { type: 'discovered', timestamp: now },
     lastUpdated: now
   }
@@ -610,6 +655,7 @@ function syncCodexSessionsFull(status, panes, stats) {
 
     const result = readCodexJsonl(filePath, stats)
     if (!result || !result.hasTimeline) continue
+    if (result.hidden) continue
 
     jsonlResultCache.set(filePath, result)
     addDiscoveredCodexSession(status, threadId, filePath, fstat, result, now)
@@ -620,6 +666,7 @@ function syncCodexSessionsFull(status, panes, stats) {
 
   // Phase 2: enrich existing sessions from JSONL (using caches)
   for (const session of Object.values(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     if (session.agentType !== 'codex' || session.endedAt) continue
     const threadId = session.threadId || session.sessionId
 
@@ -693,6 +740,7 @@ function syncCodexSessionsIncremental(status, panes, options = {}, stats) {
       const delta = readCodexJsonlIncremental(filePath, fileState, { stats })
       filesState[filePath] = fileState
       if (!delta || !delta.result || !delta.result.hasTimeline) continue
+      if (delta.result.hidden) continue
 
       addDiscoveredCodexSession(status, threadId, filePath, fstat, delta.result, now)
       if (stats) stats.codex.discovered++
@@ -702,6 +750,7 @@ function syncCodexSessionsIncremental(status, panes, options = {}, stats) {
   }
 
   for (const session of Object.values(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     if (session.agentType !== 'codex' || session.endedAt) continue
     const threadId = session.threadId || session.sessionId
     const jsonlPath = session.transcriptPath || jsonlPathCache.get(threadId) || findCodexJsonl(threadId)
@@ -752,6 +801,7 @@ function sweepStuckCodexTools(status, stats) {
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     if (!session || session.agentType !== 'codex' || session.endedAt) continue
     if (!session.pendingToolUse || !Number.isFinite(session.pendingToolUse.timestamp)) continue
     if (now - session.pendingToolUse.timestamp < CODEX_STUCK_TOOL_MS) continue
@@ -883,6 +933,7 @@ function detectPaneState(paneId, agentType) {
 function applyPaneGroundTruth(status, stats) {
   let changed = false
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
     if (!session.tmuxPane || session.endedAt) continue
 
     const detected = detectPaneState(session.tmuxPane, session.agentType)

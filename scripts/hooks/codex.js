@@ -7,6 +7,7 @@ const path = require('path')
 const os = require('os')
 const { spawnSync } = require('child_process')
 const { applySessionEvent } = require('../lib/session-state')
+const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
@@ -44,6 +45,16 @@ function readStatus() {
 
 function sessionPath(sessionId) {
   return path.join(SESSIONS_DIR, sessionId.replace(/[/\\:]/g, '_') + '.json')
+}
+
+function readSession(sessionId) {
+  try {
+    const filePath = sessionPath(sessionId)
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    }
+  } catch (_) {}
+  return null
 }
 
 function updateSession(sessionId, updates) {
@@ -108,17 +119,17 @@ function readStdin() {
   })
 }
 
-function extractSessionTitle(inputMessages) {
+function extractSessionPrompt(inputMessages) {
   if (!inputMessages || !Array.isArray(inputMessages)) return undefined
   for (const msg of inputMessages) {
     if (msg.role === 'user' && msg.content) {
       if (typeof msg.content === 'string') {
-        return cleanPrompt(msg.content).slice(0, 100).split('\n')[0].trim()
+        return cleanPrompt(msg.content)
       }
       if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if ((part.type === 'text' || part.type === 'input_text') && part.text) {
-            return cleanPrompt(part.text).slice(0, 100).split('\n')[0].trim()
+            return cleanPrompt(part.text)
           }
         }
       }
@@ -128,15 +139,7 @@ function extractSessionTitle(inputMessages) {
 }
 
 function cleanPrompt(prompt) {
-  if (!prompt) return ''
-  let clean = String(prompt)
-  const marker = '## My request for Codex:'
-  const idx = clean.indexOf(marker)
-  if (idx >= 0 && clean.trimStart().startsWith('# Context from my IDE setup:')) {
-    clean = clean.slice(idx + marker.length)
-  }
-  clean = clean.replace(/<system[-_]?(?:instruction|reminder)[^>]*>[\s\S]*?<\/system[-_]?(?:instruction|reminder)>/gi, '')
-  return clean.trim()
+  return cleanCodexPrompt(prompt)
 }
 
 function titleFromPrompt(prompt) {
@@ -290,6 +293,88 @@ function isBypassPermission(data) {
   return data.permission_mode === 'bypassPermissions'
 }
 
+function readFirstLineBounded(filePath, maxBytes = 64 * 1024) {
+  let fd = null
+  try {
+    fd = fs.openSync(filePath, 'r')
+    const chunks = []
+    const buffer = Buffer.alloc(Math.min(4096, maxBytes))
+    let total = 0
+
+    while (total < maxBytes) {
+      const toRead = Math.min(buffer.length, maxBytes - total)
+      const bytesRead = fs.readSync(fd, buffer, 0, toRead, total)
+      if (bytesRead <= 0) break
+
+      const chunk = buffer.subarray(0, bytesRead)
+      const newline = chunk.indexOf(10)
+      if (newline >= 0) {
+        chunks.push(chunk.subarray(0, newline))
+        return Buffer.concat(chunks).toString('utf-8')
+      }
+
+      chunks.push(Buffer.from(chunk))
+      total += bytesRead
+    }
+
+    if (total < maxBytes) {
+      return Buffer.concat(chunks).toString('utf-8')
+    }
+  } catch (_) {
+    return null
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch (_) {}
+    }
+  }
+  return null
+}
+
+function readTranscriptSessionMeta(transcriptPath) {
+  if (!transcriptPath) return null
+  try {
+    const firstLine = readFirstLineBounded(transcriptPath)
+    if (!firstLine.trim()) return null
+    const obj = JSON.parse(firstLine)
+    return obj && obj.type === 'session_meta' && obj.payload ? obj.payload : null
+  } catch (_) {
+    return null
+  }
+}
+
+function classifyHookPayload(data) {
+  const prompt = data.prompt || data.prompt_preview || ''
+  const sessionMeta = data._session_meta || readTranscriptSessionMeta(data.transcript_path)
+  return classifyCodexSession({ prompt, sessionMeta })
+}
+
+function markHiddenSession(sessionId, base, classification, now, details) {
+  const updates = Object.assign({}, base, {
+    isHiddenFromScout: true,
+    hiddenReason: classification.reason || 'codex-hidden-session',
+    hiddenAt: now,
+    isInternalCodexSession: Boolean(classification.isInternal),
+    isCodexSubagent: Boolean(classification.isSubagent),
+    parentSessionId: classification.parentSessionId || undefined,
+    subagentDepth: classification.subagentDepth,
+    subagentNickname: classification.subagentNickname || undefined,
+    needsAttention: null,
+    pendingToolUse: null,
+    endedAt: now,
+    lifecycleEvent: {
+      type: 'session_end',
+      source: 'hook',
+      stateSource: base.stateSource,
+      timestamp: now,
+      endedAt: now,
+      reason: classification.reason || 'codex-hidden-session',
+      details: details || classification.reason || 'codex-hidden-session',
+      force: true
+    }
+  })
+  updateSession(sessionId, updates)
+}
+
 function handleModernHook(data) {
   const eventName = data.hook_event_name
   const sessionId = data.session_id || data.thread_id || data['thread-id']
@@ -297,6 +382,14 @@ function handleModernHook(data) {
 
   const now = Date.now()
   const base = baseUpdates(data, now)
+  const existing = readSession(sessionId)
+  if (isHiddenCodexSession(existing)) return
+
+  const classification = classifyHookPayload(data)
+  if (classification.hidden) {
+    markHiddenSession(sessionId, base, classification, now, eventName)
+    return
+  }
 
   switch (eventName) {
     case 'SessionStart': {
@@ -408,7 +501,13 @@ function handleLegacyNotify(data) {
 
   const sessionId = threadId || 'unknown'
   const now = Date.now()
-  let title = extractSessionTitle(inputMessages)
+  const prompt = extractSessionPrompt(inputMessages)
+  let title = titleFromPrompt(prompt)
+  const classification = classifyCodexSession({ prompt: prompt || '' })
+  if (classification.hidden) {
+    markHiddenSession(sessionId, baseUpdates({ cwd, 'thread-id': threadId }, now), classification, now, type)
+    return
+  }
 
   if (!title && lastAssistantMessage && typeof lastAssistantMessage === 'string') {
     title = lastAssistantMessage.slice(0, 100).split('\n')[0].trim()

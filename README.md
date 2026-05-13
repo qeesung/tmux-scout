@@ -177,6 +177,8 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher on
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher stop
 ```
 
+`watcher status` includes the latest tick mode, duration, reconcile change count, Codex JSONL files read, parsed event count, and JSONL parse errors when present.
+
 ## Data Storage
 
 Session data is stored in `~/.tmux-scout/`:

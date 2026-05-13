@@ -278,7 +278,13 @@ function checkWatcher() {
   if (running) {
     const state = readJson(path.join(STATUS_DIR, 'watcher-state.json'), {})
     const lastTick = state.lastTickAt ? new Date(state.lastTickAt).toISOString() : 'unknown'
-    ok('watcher process', `running pid=${pid}, lastTick=${lastTick}`)
+    const summary = state.lastTickSummary || {}
+    const details = [`running pid=${pid}`, `lastTick=${lastTick}`]
+    if (Number.isFinite(summary.durationMs)) details.push(`duration=${summary.durationMs}ms`)
+    if (Number.isFinite(summary.changes)) details.push(`changes=${summary.changes}`)
+    if (Number.isFinite(summary.codexFilesRead)) details.push(`codexRead=${summary.codexFilesRead}`)
+    if (summary.codexParseErrors > 0) details.push(`codexParseErrors=${summary.codexParseErrors}`)
+    ok('watcher process', details.join(', '))
   } else if (enabled) {
     warn('watcher process', 'option is enabled but no live watcher pid was found')
   } else {

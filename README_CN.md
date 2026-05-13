@@ -90,13 +90,13 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status    
 每行显示内容：
 
 ```
-* [ BUSY ] claude  app-window            my-project       "implement the login page"  Bash: npm test
+* BUSY   claude app-window            my-project       "implement the login page"  Bash: npm test
 ```
 
 - `*` — 当前面板指示器
-- `[W:APP]` / `[W:ANS]` / `[W:PLAN]` — 等待审批、回答或计划确认
-- `[ BUSY ]` / `[ DONE ]` / `[ IDLE ]` — 会话状态
-- `[ INT ]` / `[CRASH]` / `[STALE]` — 最近被打断、异常退出或过期的会话
+- `W:APP` / `W:ANS` / `W:PLAN` — 等待审批、回答或计划确认
+- `BUSY` / `DONE` / `IDLE` — 会话状态
+- `INT` / `CRASH` / `STALE` — 最近被打断、异常退出或过期的会话
 - Agent 类型（claude / codex）
 - tmux window 名称（未关联 window 时显示 `-`）
 - 项目目录名

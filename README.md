@@ -90,14 +90,15 @@ Press `prefix + O` (default) to open the session picker.
 Each line shows:
 
 ```
-* [ BUSY ] claude  app-window            my-project                "implement the login page"  Bash: npm test
+* [ BUSY ] claude  app-window            my-project       "implement the login page"  Bash: npm test
 ```
 
 - `*` — current pane indicator
-- `[ WAIT ]` / `[ BUSY ]` / `[ DONE ]` / `[ IDLE ]` — session status
+- `[W:APP]` / `[W:ANS]` / `[W:PLAN]` — waiting for approval, answer, or plan confirmation
+- `[ BUSY ]` / `[ DONE ]` / `[ IDLE ]` — session status
 - `[ INT ]` / `[CRASH]` / `[STALE]` — recently interrupted, crashed, or stale sessions
 - Agent type (claude / codex)
-- tmux window name
+- tmux window name (`-` when no window is linked)
 - Project directory name
 - Session title (first prompt)
 - Current tool details (for working sessions)

@@ -180,9 +180,16 @@ function doWatcher() {
   process.exit(result.status || 0)
 }
 
+function doDoctor() {
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'doctor.js')], {
+    stdio: 'inherit'
+  })
+  process.exit(result.status || 0)
+}
+
 // Main dispatch
-if (!command || !['install', 'uninstall', 'status', 'watcher', 'watchdog'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status|watcher> [--claude] [--codex] [--quiet]')
+if (!command || !['install', 'uninstall', 'status', 'doctor', 'watcher', 'watchdog'].includes(command)) {
+  console.log('Usage: node setup.js <install|uninstall|status|doctor|watcher> [--claude] [--codex] [--quiet]')
   console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
   process.exit(command ? 1 : 0)
 }
@@ -191,6 +198,7 @@ try {
   if (command === 'install') doInstall()
   else if (command === 'uninstall') doUninstall()
   else if (command === 'status') doStatus()
+  else if (command === 'doctor') doDoctor()
   else if (command === 'watcher' || command === 'watchdog') doWatcher()
 } catch (e) {
   console.error('Error: ' + e.message)

@@ -826,6 +826,10 @@ const CLAUDE_DONE_RE = /✻ (Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Saut
 const CLAUDE_IDLE_RE = /✻ Idle/
 const CLAUDE_INTERRUPTED_RE = /Interrupted . What should Claude do instead/
 
+function paneState(status, attentionReason) {
+  return { status, attentionReason }
+}
+
 function detectPaneState(paneId, agentType) {
   const content = capturePaneContent(paneId)
   if (!content) return null
@@ -836,16 +840,19 @@ function detectPaneState(paneId, agentType) {
   if (agentType === 'codex') {
     // Phase 1: footer WAIT strings that coexist with 'esc to interrupt'
     for (const s of CODEX_WAIT_FOOTER) {
-      if (tail.includes(s)) return 'needsAttention'
+      if (tail.includes(s)) return paneState('needsAttention', 'waiting for answer')
     }
     // Phase 2: if model is actively generating, it's working.
     // This gates Phase 3 — dialog strings in model output won't false-positive.
-    if (tail.includes('esc to interrupt')) return 'working'
+    if (tail.includes('esc to interrupt')) return paneState('working')
     // Phase 3: dialog WAIT strings (UI has replaced normal view, no 'esc to interrupt')
     for (const s of CODEX_WAIT_DIALOG) {
-      if (tail.includes(s)) return 'needsAttention'
+      const reason = s.includes('plan') ? 'waiting for plan approval'
+        : s.includes('Submit with unanswered') || s.includes('enter to submit') ? 'waiting for answer'
+        : 'waiting for approval'
+      if (tail.includes(s)) return paneState('needsAttention', reason)
     }
-    return 'completed'
+    return paneState('completed')
   }
 
   // Claude Code — BUSY/DONE 门控 + WAIT 检测
@@ -854,21 +861,21 @@ function detectPaneState(paneId, agentType) {
   // ✻ Worked for... 是权威完成信号，此时 tail 中的 WAIT 字符串来自输出文本。
 
   // Phase 1: BUSY — 模型正在生成
-  if (CLAUDE_BUSY_RE.test(tail)) return 'working'
+  if (CLAUDE_BUSY_RE.test(tail)) return paneState('working')
 
   // Phase 2: DONE — 模型刚完成（短暂 ✻ Worked for... 窗口，门控假阳性）
-  if (CLAUDE_DONE_RE.test(tail)) return 'completed'
+  if (CLAUDE_DONE_RE.test(tail)) return paneState('completed')
 
   // Phase 3: WAIT — 权限/审批提示（BUSY/DONE 已排除，此时检测安全）
   for (const s of CLAUDE_WAIT_STRINGS) {
-    if (tail.includes(s)) return 'needsAttention'
+    if (tail.includes(s)) return paneState('needsAttention', 'waiting for approval')
   }
 
   // Phase 4: IDLE
-  if (CLAUDE_IDLE_RE.test(tail)) return 'completed'
+  if (CLAUDE_IDLE_RE.test(tail)) return paneState('completed')
 
   // Phase 5: INTERRUPTED
-  if (CLAUDE_INTERRUPTED_RE.test(tail)) return 'completed'
+  if (CLAUDE_INTERRUPTED_RE.test(tail)) return paneState('completed')
 
   return null
 }
@@ -878,11 +885,16 @@ function applyPaneGroundTruth(status, stats) {
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (!session.tmuxPane || session.endedAt) continue
 
-    const state = detectPaneState(session.tmuxPane, session.agentType)
-    if (state === null) continue
+    const detected = detectPaneState(session.tmuxPane, session.agentType)
+    if (detected === null) continue
+    const state = typeof detected === 'string' ? detected : detected.status
+    const attentionReason = typeof detected === 'object' && detected.attentionReason
+      ? detected.attentionReason
+      : 'waiting for approval'
 
     const now = Date.now()
-    const phase = state === 'needsAttention' ? 'waitingForApproval'
+    const phase = state === 'needsAttention' && attentionReason === 'waiting for answer' ? 'waitingForAnswer'
+      : state === 'needsAttention' ? 'waitingForApproval'
       : state === 'working' ? 'running'
       : state === 'completed' ? 'completed'
       : null
@@ -894,7 +906,7 @@ function applyPaneGroundTruth(status, stats) {
       timestamp: now,
       phase,
       status: state,
-      attentionReason: state === 'needsAttention' ? 'waiting for approval' : null,
+      attentionReason: state === 'needsAttention' ? attentionReason : null,
       reason: `pane ${session.tmuxPane} tail matched ${state}`,
       details: state
     })

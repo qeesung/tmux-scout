@@ -252,6 +252,40 @@ function hasExplicitInputWaitSignal(data) {
   return false
 }
 
+function looksLikeAssistantQuestion(message) {
+  if (typeof message !== 'string') return false
+  const text = message.trim()
+  if (!text) return false
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean)
+  const tailLines = lines.slice(-6)
+  if (tailLines.length === 0) return false
+
+  const promptQuestionRe = /(which|choose|pick|select|confirm|do you want|would you like|should i|shall i|what should i|what would you like|what do you want|请选择|请确认|是否|要我|需要.*(?:选择|输入|回答))/i
+  const optionRe = /^(?:[-*]|\d+[.)、．])\s+\S/
+
+  function isPromptQuestion(line) {
+    if (optionRe.test(line)) return false
+    return /[?？]/.test(line) && promptQuestionRe.test(line)
+  }
+
+  const lastLine = tailLines[tailLines.length - 1]
+  if (isPromptQuestion(lastLine)) return true
+
+  for (let i = 0; i < tailLines.length - 1; i++) {
+    if (!isPromptQuestion(tailLines[i])) continue
+    if (tailLines.slice(i + 1).some(line => optionRe.test(line))) return true
+  }
+
+  return false
+}
+
+function codexStopWantsAnswer(data, lastAssistantMessage) {
+  if (hasExplicitInputWaitSignal(data)) {
+    return true
+  }
+  return looksLikeAssistantQuestion(lastAssistantMessage)
+}
+
 function isBypassPermission(data) {
   return data.permission_mode === 'bypassPermissions'
 }
@@ -340,7 +374,7 @@ function handleModernHook(data) {
       const lastAssistantMessage = typeof data.last_assistant_message === 'string'
         ? data.last_assistant_message
         : ''
-      const wantsAnswer = hasExplicitInputWaitSignal(data)
+      const wantsAnswer = codexStopWantsAnswer(data, lastAssistantMessage)
       updateSession(sessionId, Object.assign({}, base, {
         status: wantsAnswer ? 'working' : 'completed',
         needsAttention: wantsAnswer ? 'waiting for answer' : null,

@@ -290,7 +290,7 @@ function stop(quiet) {
     return
   }
   try {
-    process.kill(lock.pid, 'TERM')
+    process.kill(lock.pid, 'SIGTERM')
     if (!quiet) console.log(`stopping pid=${lock.pid}`)
   } catch (error) {
     if (!quiet) console.log(`failed to stop pid=${lock.pid}: ${error.message}`)

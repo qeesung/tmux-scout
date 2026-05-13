@@ -11,6 +11,8 @@ let currentPane = process.argv[3] || ''
 
 const pidStateCache = new Map()
 const TERMINAL_DISPLAY_MS = 5 * 60 * 1000
+const WINDOW_WIDTH = 20
+const PROJECT_WIDTH = 16
 
 function readJson(filePath, fallback) {
   try {
@@ -111,7 +113,7 @@ function isActiveSession(session, panes, now = Date.now()) {
 
   // Discovered from JSONL but hook hasn't fired yet — no pane bound
   if (!session.tmuxPane) {
-    return true
+    return session.status !== 'idle'
   }
   const pane = panes.get(session.tmuxPane)
   if (!pane || pane.paneDead) {
@@ -149,24 +151,53 @@ function truncatePad(value, width) {
   return (text.length > width ? text.slice(0, width - 1) + '~' : text).padEnd(width)
 }
 
+function cleanText(value, fallback) {
+  const text = String(value || fallback || '?').replace(/[\r\n\t]+/g, ' ').trim()
+  return text || fallback || '?'
+}
+
+function truncateText(value, width) {
+  if (width <= 0) return ''
+  const text = cleanText(value, '')
+  return text.length > width ? text.slice(0, width - 1) + '~' : text
+}
+
+function waitCode(reason) {
+  const text = String(reason || '').toLowerCase()
+  if (text.includes('answer') || text.includes('input') || text.includes('question')) return 'ANS'
+  if (text.includes('plan')) return 'PLAN'
+  if (text.includes('approval') || text.includes('permission') || text.includes('allow')) return 'APP'
+  return 'WAIT'
+}
+
+function statusTag(session, now) {
+  if (isNeedsAttention(session, now)) return `\x1b[31m[W:${waitCode(session.needsAttention)}]\x1b[0m`
+  if (session.status === 'working') return '\x1b[33m[ BUSY ]\x1b[0m'
+  if (session.status === 'interrupted') return '\x1b[35m[ INT  ]\x1b[0m'
+  if (session.status === 'crashed') return '\x1b[31m[CRASH]\x1b[0m'
+  if (session.status === 'stale') return '\x1b[90m[STALE]\x1b[0m'
+  if (session.status === 'completed') return '\x1b[32m[ DONE ]\x1b[0m'
+  return '\x1b[34m[ IDLE ]\x1b[0m'
+}
+
+function formatField(value, width, color) {
+  const text = truncateText(value, width)
+  const padding = ' '.repeat(Math.max(0, width - text.length))
+  return `\x1b[${color}m${text}\x1b[0m${padding}`
+}
+
 function formatLine(session, now, currentPane) {
   const unbound = !session.tmuxPane
   const pane = unbound ? null : session._tmuxPaneSnapshot
 
-  const tag = isNeedsAttention(session, now) ? '\x1b[31m[ WAIT ]\x1b[0m'
-    : session.status === 'working' ? '\x1b[33m[ BUSY ]\x1b[0m'
-    : session.status === 'interrupted' ? '\x1b[35m[ INT  ]\x1b[0m'
-    : session.status === 'crashed' ? '\x1b[31m[CRASH]\x1b[0m'
-    : session.status === 'stale' ? '\x1b[90m[STALE]\x1b[0m'
-    : session.status === 'completed' ? '\x1b[32m[ DONE ]\x1b[0m'
-    : '\x1b[34m[ IDLE ]\x1b[0m'
-
   const isCurrent = !unbound && currentPane && session.tmuxPane === currentPane
   const cur = isCurrent ? '\x1b[33m*\x1b[0m' : ' '
+  const tag = statusTag(session, now)
   const agent = session.agentType === 'codex' ? '\x1b[38;5;114mcodex \x1b[0m' : '\x1b[38;5;209mclaude\x1b[0m'
   const windowName = pane && pane.windowName ? pane.windowName : session.tmuxWindowName || '-'
-  const window = truncatePad(windowName, 22)
-  const project = truncatePad(path.basename(session.workingDirectory || '?'), 25)
+  const projectName = path.basename(session.workingDirectory || '?')
+  const window = formatField(windowName, WINDOW_WIDTH, '36')
+  const project = formatField(projectName, PROJECT_WIDTH, '37')
   const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
   const terminalReason = session.crashReason || session.staleReason || session.stateReason
   const detail = isTerminalSession(session) && terminalReason
@@ -201,8 +232,8 @@ function run(file, pane, cached) {
   })
 
   const hStatus = 'STATUS '.padEnd(8)
-  const hWindow = 'WINDOW'.padEnd(22)
-  const hProject = 'PROJECT'.padEnd(25)
+  const hWindow = 'WINDOW'.padEnd(WINDOW_WIDTH)
+  const hProject = 'PROJECT'.padEnd(PROJECT_WIDTH)
   console.log(`_\t  ${hStatus} AGENT  ${hWindow} ${hProject} TITLE`)
 
   if (active.length === 0) {

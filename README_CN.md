@@ -72,7 +72,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 
 ### 修改了什么
 
-- **Claude Code**：在 `~/.claude/settings.json` 的 6 个事件类型中各添加一条 hook
+- **Claude Code**：在 `~/.claude/settings.json` 的 9 个 Claude 支持事件类型中各添加一条 hook
 - **Codex**：在 `~/.codex/hooks.json` 中添加 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`Stop` 事件 hook，并在 `~/.codex/config.toml` 中启用 hooks feature / trust state；同时保留 legacy `notify` 作为旧版 Codex 的兜底（原有 notify 命令会被备份并串联调用）
 
 ## 使用方法

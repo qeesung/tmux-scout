@@ -14,8 +14,16 @@ const HOOK_EVENTS = [
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
+  'Notification',
   'Stop',
+  'SubagentStop',
+  'PreCompact',
   'SessionEnd'
+]
+const LEGACY_UNSUPPORTED_HOOK_EVENTS = [
+  'PermissionRequest',
+  'PostToolUseFailure',
+  'StopFailure'
 ]
 
 function writeAtomic(filePath, content) {
@@ -85,6 +93,31 @@ function removeDuplicateScoutHooks(groups, keep) {
   return changed
 }
 
+function removeScoutHooksFromEvent(settings, event) {
+  if (!settings.hooks || !settings.hooks[event]) return false
+  const groups = settings.hooks[event]
+  let changed = false
+
+  for (let gi = groups.length - 1; gi >= 0; gi--) {
+    const group = groups[gi]
+    if (!group || !Array.isArray(group.hooks)) continue
+    const before = group.hooks.length
+    group.hooks = group.hooks.filter(h => !isScoutHook(h))
+    if (group.hooks.length < before) changed = true
+    if (group.hooks.length === 0) {
+      groups.splice(gi, 1)
+      changed = true
+    }
+  }
+
+  if (groups.length === 0) {
+    delete settings.hooks[event]
+    changed = true
+  }
+
+  return changed
+}
+
 function install() {
   const settings = readSettings()
   if (!settings) {
@@ -125,6 +158,13 @@ function install() {
     }
   }
 
+  for (const event of LEGACY_UNSUPPORTED_HOOK_EVENTS) {
+    if (removeScoutHooksFromEvent(settings, event)) {
+      changed = true
+      results.push({ event, action: 'removed_legacy' })
+    }
+  }
+
   if (changed) writeSettings(settings)
   return { results, path: HOOK_PATH }
 }
@@ -138,7 +178,7 @@ function uninstall() {
   let changed = false
   const results = []
 
-  for (const event of HOOK_EVENTS) {
+  for (const event of [...HOOK_EVENTS, ...LEGACY_UNSUPPORTED_HOOK_EVENTS]) {
     const groups = settings.hooks[event]
     if (!groups) {
       results.push({ event, action: 'not_found' })
@@ -223,7 +263,8 @@ if (require.main === module) {
       console.log('Claude Code: ' + r.reason)
     } else {
       for (const { event, action } of r.results) {
-        console.log(`  ${action === 'ok' ? '=' : '+'} ${event}: ${action}`)
+        const marker = action === 'ok' ? '=' : action === 'removed_legacy' ? '-' : '+'
+        console.log(`  ${marker} ${event}: ${action}`)
       }
     }
   } else if (cmd === 'uninstall') {

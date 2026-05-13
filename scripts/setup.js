@@ -41,8 +41,14 @@ function doInstall() {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
     } else {
       for (const { event, action } of r.results) {
-        const icon = action === 'ok' ? c.green('✓') : action === 'updated' ? c.yellow('↻') : c.green('✓')
-        const label = action === 'ok' ? 'already installed' : action === 'updated' ? 'path updated' : 'hook installed'
+        const icon = action === 'ok' ? c.green('✓')
+          : action === 'updated' ? c.yellow('↻')
+          : action === 'removed_legacy' ? c.red('✗')
+          : c.green('✓')
+        const label = action === 'ok' ? 'already installed'
+          : action === 'updated' ? 'path updated'
+          : action === 'removed_legacy' ? 'legacy hook removed'
+          : 'hook installed'
         console.log(`  ${icon} ${event.padEnd(17)} ${label}`)
       }
     }

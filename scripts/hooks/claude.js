@@ -134,6 +134,10 @@ function getToolDetails(tool_name, tool_input) {
   return toolDetails
 }
 
+function isQuestionTool(toolName) {
+  return toolName === 'AskUserQuestion' || toolName === 'mcp__conductor__AskUserQuestion'
+}
+
 async function main() {
   let input = ''
   for await (const chunk of process.stdin) {
@@ -163,6 +167,15 @@ async function main() {
 
   switch (hook_event_name) {
     case 'SessionStart':
+      if (source === 'compact') {
+        updateSession(session_id, {
+          workingDirectory: cwd,
+          tmuxPane,
+          pid,
+          lastHookAt: now
+        })
+        break
+      }
       updateSession(session_id, liveSessionState({
         status: 'idle',
         workingDirectory: cwd,
@@ -201,18 +214,19 @@ async function main() {
       const toolDetails = getToolDetails(tool_name, tool_input)
       const attentionTools = ['ExitPlanMode', 'AskUserQuestion', 'mcp__conductor__AskUserQuestion']
       const needsAttention = attentionTools.includes(tool_name)
+      const questionTool = isQuestionTool(tool_name)
       updateSession(session_id, liveSessionState({
         status: 'working',
         needsAttention: needsAttention ? tool_name : null,
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
         lastEvent: { type: 'tool_use', timestamp: now, details: toolDetails },
         lifecycleEvent: needsAttention ? {
-          type: tool_name && tool_name.includes('AskUserQuestion') ? 'question_asked' : 'permission_request',
+          type: questionTool ? 'question_asked' : 'permission_request',
           source: 'hook',
           stateSource: 'claude-hooks',
           timestamp: now,
           details: toolDetails,
-          attentionReason: tool_name && tool_name.includes('AskUserQuestion') ? 'waiting for answer' : 'waiting for approval',
+          attentionReason: questionTool ? 'waiting for answer' : 'waiting for approval',
           pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
           force: true
         } : undefined,
@@ -237,7 +251,43 @@ async function main() {
         status: 'completed',
         needsAttention: null,
         pendingToolUse: null,
+        lastAssistantMessage: data.last_assistant_message,
         lastEvent: { type: 'stop', timestamp: now },
+        tmuxPane,
+        pid
+      })
+      break
+
+    case 'SubagentStop':
+      updateSession(session_id, {
+        lastEvent: { type: 'subagent_stop', timestamp: now },
+        tmuxPane,
+        pid
+      })
+      break
+
+    case 'Notification':
+      updateSession(session_id, {
+        lastNotification: data.message || data.notification || data.title || null,
+        lastEvent: {
+          type: 'notification',
+          timestamp: now,
+          details: data.message || data.notification || data.title || null
+        },
+        tmuxPane,
+        pid
+      })
+      break
+
+    case 'PreCompact':
+      updateSession(session_id, {
+        lastCompactAt: now,
+        lastCompactReason: data.trigger || data.reason || null,
+        lastEvent: {
+          type: 'pre_compact',
+          timestamp: now,
+          details: data.trigger || data.reason || null
+        },
         tmuxPane,
         pid
       })

@@ -72,7 +72,7 @@ The installer is **idempotent** — running it multiple times is safe. If you mo
 
 ### What gets modified
 
-- **Claude Code**: Adds a hook entry to each of the 6 event types in `~/.claude/settings.json`
+- **Claude Code**: Adds a hook entry to each of the 9 supported Claude hook event types in `~/.claude/settings.json`
 - **Codex**: Adds event hooks for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` in `~/.codex/hooks.json`, enables Codex hook features/trust state in `~/.codex/config.toml`, and keeps the legacy `notify` hook as a fallback for older Codex builds (original notify command is backed up and chained)
 
 ## Usage

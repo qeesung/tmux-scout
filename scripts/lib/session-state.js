@@ -99,8 +99,8 @@ function currentPhaseFromStatus(status, needsAttention) {
 
 function shouldApplyPhase(session, event, nextPhase, now) {
   if (!nextPhase) return false
+  const current = currentPhase(session)
   if (TERMINAL_PHASES.has(nextPhase)) return true
-  if (currentPhase(session) === nextPhase) return true
 
   const incomingPriority = Number.isFinite(event.priority)
     ? event.priority
@@ -113,11 +113,13 @@ function shouldApplyPhase(session, event, nextPhase, now) {
     ? lifecycle.updatedAt
     : (session.lastUpdated || 0)
   const currentAge = now - currentUpdatedAt
-  const currentIsTerminal = TERMINAL_PHASES.has(currentPhase(session))
+  const currentIsTerminal = TERMINAL_PHASES.has(current)
 
   if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== 'session_start') return false
   if (event.force) return true
+  if (nextPhase === 'interrupted') return true
   if (incomingPriority < currentPriority && currentAge < PROTECTED_PHASE_MS) return false
+  if (current === nextPhase) return true
 
   return true
 }

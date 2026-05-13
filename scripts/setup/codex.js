@@ -7,6 +7,7 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
+const { buildNodeHookCommand, extractHookPathFromCommand } = require('../lib/hook-command')
 
 const CODEX_DIR = path.join(os.homedir(), '.codex')
 const CODEX_CONFIG = path.join(CODEX_DIR, 'config.toml')
@@ -62,12 +63,8 @@ function writeJson(filePath, data) {
   writeAtomic(filePath, JSON.stringify(data, null, 2) + '\n')
 }
 
-function shellQuote(value) {
-  return "'" + String(value).replace(/'/g, "'\\''") + "'"
-}
-
 function buildHookCommand() {
-  return `node ${shellQuote(HOOK_PATH)}`
+  return buildNodeHookCommand(HOOK_PATH)
 }
 
 function parseNotifyArray(content) {
@@ -82,20 +79,46 @@ function parseNotifyArray(content) {
   return strings.length > 0 ? strings : null
 }
 
+function tomlString(value) {
+  return JSON.stringify(String(value))
+}
+
 function buildNotifyLine(hookPath) {
-  return `notify = [\n  "node",\n  "${hookPath}"\n]`
+  const values = [
+    'sh',
+    '-c',
+    'test -e "$1" || exit 0; exec node "$1" "$2"',
+    'tmux-scout',
+    hookPath
+  ]
+  return `notify = [\n${values.map(value => `  ${tomlString(value)}`).join(',\n')}\n]`
+}
+
+function notifyArrayMatchesExpected(content, hookPath) {
+  const current = parseNotifyArray(content)
+  const expected = parseNotifyArray(buildNotifyLine(hookPath))
+  return Boolean(current && expected && JSON.stringify(current) === JSON.stringify(expected))
 }
 
 function installLegacyNotify() {
   const content = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf-8') : ''
 
   if (content.includes(HOOK_PATH)) {
-    return { action: 'ok', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
+    if (notifyArrayMatchesExpected(content, HOOK_PATH)) {
+      return { action: 'ok', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
+    }
+    if (!NOTIFY_REGEX.test(content)) {
+      return { action: 'ok', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
+    }
+    const newNotify = buildNotifyLine(HOOK_PATH)
+    const newContent = content.replace(NOTIFY_REGEX, () => newNotify)
+    writeAtomic(CODEX_CONFIG, newContent)
+    return { action: 'updated', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
   }
 
   if (content.includes(HOOK_IDENTIFIER)) {
     const newNotify = buildNotifyLine(HOOK_PATH)
-    const newContent = content.replace(NOTIFY_REGEX, newNotify)
+    const newContent = content.replace(NOTIFY_REGEX, () => newNotify)
     writeAtomic(CODEX_CONFIG, newContent)
     return { action: 'updated', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
   }
@@ -110,7 +133,7 @@ function installLegacyNotify() {
   const match = content.match(NOTIFY_REGEX)
   let newContent
   if (match) {
-    newContent = content.replace(NOTIFY_REGEX, newNotify)
+    newContent = content.replace(NOTIFY_REGEX, () => newNotify)
   } else if (content.trim()) {
     const lines = content.split('\n')
     let insertIdx = 0
@@ -143,7 +166,7 @@ function uninstallLegacyNotify() {
       const saved = JSON.parse(fs.readFileSync(ORIGINAL_NOTIFY_FILE, 'utf-8'))
       if (saved && Array.isArray(saved.notify) && saved.notify.length > 0) {
         const restored = `notify = [\n${saved.notify.map(s => `  "${String(s).replace(/"/g, '\\"')}"`).join(',\n')}\n]`
-        newContent = content.replace(NOTIFY_REGEX, restored)
+        newContent = content.replace(NOTIFY_REGEX, () => restored)
       } else {
         newContent = content.replace(NOTIFY_REGEX, '').replace(/^\s*\n/gm, '\n')
       }
@@ -169,13 +192,11 @@ function statusLegacyNotify() {
   const match = content.match(NOTIFY_REGEX)
   let currentPath = null
   if (match) {
-    const strings = []
-    const strRegex = /"([^"\\]*(?:\\.[^"\\]*)*)"/g
-    let strMatch
-    while ((strMatch = strRegex.exec(match[1])) !== null) {
-      strings.push(strMatch[1])
+    const strings = parseNotifyArray(content) || []
+    currentPath = strings.find(value => path.basename(value) === 'codex.js') || null
+    if (!currentPath) {
+      currentPath = extractHookPathFromCommand(strings.join(' '), 'codex.js')
     }
-    if (strings.length >= 2) currentPath = strings[1]
   }
   return { installed: true, path: currentPath }
 }

@@ -6,6 +6,7 @@ const fs = require('fs')
 const path = require('path')
 const { execSync } = require('child_process')
 const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
+const { agentDisplay } = require('../lib/agents')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
@@ -13,7 +14,7 @@ let currentPane = process.argv[3] || ''
 const pidStateCache = new Map()
 const TERMINAL_DISPLAY_MS = 5 * 60 * 1000
 const STATUS_WIDTH = 6
-const AGENT_WIDTH = 6
+const AGENT_WIDTH = 9
 const WINDOW_WIDTH = 20
 const PROJECT_WIDTH = 16
 
@@ -216,9 +217,8 @@ function formatLine(session, now, currentPane) {
   const isCurrent = !unbound && currentPane && session.tmuxPane === currentPane
   const cur = isCurrent ? '\x1b[33m*\x1b[0m' : ' '
   const tag = statusTag(session, now)
-  const agent = session.agentType === 'codex'
-    ? formatField('codex', AGENT_WIDTH, '38;5;114')
-    : formatField('claude', AGENT_WIDTH, '38;5;209')
+  const agentInfo = agentDisplay(session.agentType)
+  const agent = formatField(agentInfo.label, AGENT_WIDTH, agentInfo.color)
   const windowName = pane && pane.windowName ? pane.windowName : session.tmuxWindowName || '-'
   const projectName = path.basename(session.workingDirectory || '?')
   const window = formatField(windowName, WINDOW_WIDTH, '36')

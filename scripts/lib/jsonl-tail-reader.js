@@ -4,6 +4,10 @@ const fs = require('fs')
 
 const DEFAULT_TAIL_BYTES = 128 * 1024
 
+function splitJsonlLines(text) {
+  return String(text || '').split('\n').filter(line => line.trim())
+}
+
 function parseJsonlLines(lines) {
   const objects = []
   let parsed = 0
@@ -23,7 +27,7 @@ function parseJsonlLines(lines) {
 function readJsonlFile(filePath) {
   try {
     const content = fs.readFileSync(filePath, 'utf-8')
-    const lines = content.split('\n').filter(line => line.trim())
+    const lines = splitJsonlLines(content)
     if (lines.length === 0) return { objects: [], parsed: 0 }
     return parseJsonlLines(lines)
   } catch (_) {
@@ -41,6 +45,24 @@ function readFileRange(filePath, start, endExclusive) {
     return buffer.toString('utf-8', 0, bytesRead)
   } finally {
     fs.closeSync(fd)
+  }
+}
+
+function readFileTail(filePath, maxBytes = DEFAULT_TAIL_BYTES) {
+  try {
+    const stat = fs.statSync(filePath)
+    const start = Math.max(0, stat.size - maxBytes)
+    const length = stat.size - start
+    if (length <= 0) return { text: '', mtimeMs: stat.mtimeMs }
+
+    let text = readFileRange(filePath, start, stat.size)
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n')
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : ''
+    }
+    return { text, mtimeMs: stat.mtimeMs }
+  } catch (_) {
+    return null
   }
 }
 
@@ -89,6 +111,8 @@ function readJsonlIncremental(filePath, fileState, options = {}) {
 
 module.exports = {
   DEFAULT_TAIL_BYTES,
+  splitJsonlLines,
+  readFileTail,
   readJsonlFile,
   readJsonlIncremental
 }

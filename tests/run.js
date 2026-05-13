@@ -6,10 +6,13 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
-const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental } = require('../scripts/lib/jsonl-tail-reader')
+const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, splitJsonlLines } = require('../scripts/lib/jsonl-tail-reader')
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
 const { formatLine, getActiveSessions } = require('../scripts/picker/render')
+const { agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
+const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
+const { markInterrupted: markClaudeInterrupted } = require('../scripts/lib/claude-transcript-watcher')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 
@@ -146,6 +149,42 @@ test('jsonl reader reports invalid JSONL rows', () => {
   }
 })
 
+test('jsonl reader exposes reusable tail and line splitting helpers', () => {
+  const dir = tempDir()
+  try {
+    const file = path.join(dir, 'tail.jsonl')
+    fs.writeFileSync(file, [
+      JSON.stringify({ index: 1 }),
+      '',
+      JSON.stringify({ index: 2 }),
+      JSON.stringify({ index: 3 })
+    ].join('\n') + '\n')
+
+    assert.deepStrictEqual(splitJsonlLines('\n{"a":1}\n\n{"b":2}\n'), ['{"a":1}', '{"b":2}'])
+    const tail = readFileTail(file, 32)
+    assert.ok(tail)
+    assert.ok(tail.text.includes('"index":3'))
+    assert.ok(Number.isFinite(tail.mtimeMs))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('hook command helper wraps installed hooks with missing-file guard', () => {
+  const hookPath = path.join(__dirname, '..', 'scripts', 'hooks', 'claude.js')
+  const command = buildNodeHookCommand(hookPath)
+  assert.ok(command.startsWith('[ -e '))
+  assert.ok(command.includes(' || exit 0; node '))
+  assert.strictEqual(extractHookPathFromCommand(command, 'claude.js'), hookPath)
+})
+
+test('agent registry provides display metadata and process scoring', () => {
+  assert.deepStrictEqual(agentDisplay('codex'), { label: 'codex', color: '38;5;114' })
+  assert.strictEqual(scoreAgentProcess({ basename: 'opencode', commandLine: '/usr/bin/opencode' }, 'opencode'), 100)
+  assert.strictEqual(scoreAgentProcess({ basename: 'gh', commandLine: 'gh copilot suggest' }, 'copilot-cli'), 70)
+  assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)
+})
+
 test('session reducer protects recent high-confidence hook state', () => {
   const session = { sessionId: 's1', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
@@ -225,6 +264,7 @@ test('session reducer applies attention and terminal events', () => {
   assert.strictEqual(session.status, 'working')
   assert.strictEqual(session.needsAttention, 'waiting for approval')
   assert.deepStrictEqual(session.pendingToolUse.tool, 'Bash')
+  assert.strictEqual(session.activeTool, 'Bash')
 
   applySessionEvent(session, {
     type: 'process_exit_detected',
@@ -237,6 +277,79 @@ test('session reducer applies attention and terminal events', () => {
   assert.strictEqual(currentPhase(session), 'crashed')
   assert.strictEqual(session.status, 'crashed')
   assert.strictEqual(session.endedAt, 2000)
+  assert.strictEqual(session.activeTool, null)
+})
+
+test('session reducer tracks active tool separately from pending approval state', () => {
+  const session = { sessionId: 's2-tool', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 1000,
+    pendingToolUse: { tool: 'Read', details: 'Read: package.json', timestamp: 1000 }
+  })
+
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.activeTool, 'Read')
+
+  applySessionEvent(session, {
+    type: 'post_tool_use',
+    source: 'hook',
+    timestamp: 2000,
+    pendingToolUse: null
+  })
+
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, null)
+})
+
+test('session reducer clears stale tool state for answer-only pane waits', () => {
+  const session = { sessionId: 's2-answer', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 1000,
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
+  })
+
+  const answerWait = applySessionEvent(session, {
+    type: 'pane_state',
+    source: 'pane',
+    timestamp: 1000 + PROTECTED_PHASE_MS + 1,
+    phase: 'waitingForAnswer',
+    status: 'working',
+    needsAttention: 'waiting for answer'
+  })
+
+  assert.strictEqual(answerWait.applied, true)
+  assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+  assert.strictEqual(session.needsAttention, 'waiting for answer')
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, null)
+})
+
+test('session reducer restores tool state for tool-backed answer waits', () => {
+  const session = { sessionId: 's2-tool-answer', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 1000,
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
+  })
+
+  applySessionEvent(session, {
+    type: 'question_asked',
+    source: 'hook',
+    timestamp: 2000,
+    attentionReason: 'waiting for answer',
+    pendingToolUse: { tool: 'AskUserQuestion', details: 'AskUserQuestion: continue?', timestamp: 2000 }
+  })
+
+  assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+  assert.strictEqual(session.needsAttention, 'waiting for answer')
+  assert.strictEqual(session.pendingToolUse.tool, 'AskUserQuestion')
+  assert.strictEqual(session.activeTool, 'AskUserQuestion')
 })
 
 test('session reducer does not reopen crashed sessions with late interrupted transcript events', () => {
@@ -315,7 +428,9 @@ test('claude setup installs failure and permission hooks without deleting user h
     runScript('scripts/setup/claude.js', ['install'], dir)
 
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
-    assert.ok(findScoutHookGroup(settings, 'PermissionRequest', '*'))
+    const permissionGroup = findScoutHookGroup(settings, 'PermissionRequest', '*')
+    assert.ok(permissionGroup)
+    assert.ok(permissionGroup.hooks.some(hook => hook.command.startsWith('[ -e ')))
     assert.ok(findScoutHookGroup(settings, 'PostToolUseFailure', '*'))
     assert.ok(findScoutHookGroup(settings, 'StopFailure', ''))
     assert.ok(settings.hooks.PermissionRequest.some(group => {
@@ -346,6 +461,26 @@ test('unified setup reports Claude permission hooks as installed or updated', ()
     const output = stripAnsi(runScriptOutput('scripts/setup.js', ['install', '--claude'], dir))
     assert.ok(/PermissionRequest\s+(path updated|hook installed)/.test(output))
     assert.ok(!/PermissionRequest\s+legacy hook removed/.test(output))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex setup upgrades legacy notify hook to guarded shell command', () => {
+  const dir = tempDir()
+  try {
+    const codexDir = path.join(dir, '.codex')
+    fs.mkdirSync(codexDir, { recursive: true })
+    const hookPath = path.join(__dirname, '..', 'scripts', 'hooks', 'codex.js')
+    const configPath = path.join(codexDir, 'config.toml')
+    fs.writeFileSync(configPath, `notify = [\n  "node",\n  "${hookPath}"\n]\n`)
+
+    runScript('scripts/setup/codex.js', ['install'], dir)
+
+    const config = fs.readFileSync(configPath, 'utf-8')
+    assert.ok(config.includes('"sh"'))
+    assert.ok(config.includes('test -e \\"$1\\" || exit 0; exec node \\"$1\\" \\"$2\\"'))
+    assert.ok(config.includes(hookPath))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -420,6 +555,50 @@ test('sync marks running Claude session interrupted from transcript marker', () 
   }
 })
 
+test('claude transcript watcher helper marks running sessions interrupted', () => {
+  const dir = tempDir()
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    const sessionsDir = path.join(scoutDir, 'sessions')
+    fs.mkdirSync(sessionsDir, { recursive: true })
+    const sessionId = 'claude-watch-interrupt'
+    const transcriptPath = path.join(dir, 'claude-watch.jsonl')
+    const now = Date.now()
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      timestamp: new Date(now + 1000).toISOString(),
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }]
+      }
+    }) + '\n')
+
+    const session = {
+      sessionId,
+      agentType: 'claude',
+      status: 'working',
+      phase: 'running',
+      startedAt: now - 1000,
+      lastUpdated: now,
+      endedAt: null,
+      transcriptPath
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: { [sessionId]: session }
+    }, null, 2))
+
+    assert.strictEqual(markClaudeInterrupted(statusFile, sessionId), true)
+    const updated = JSON.parse(fs.readFileSync(statusFile, 'utf-8')).sessions[sessionId]
+    assert.strictEqual(currentPhase(updated), 'interrupted')
+    assert.strictEqual(updated.status, 'interrupted')
+    assert.strictEqual(updated.endedAt, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => {
   const dir = tempDir()
   try {
@@ -443,6 +622,7 @@ test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => 
     assert.strictEqual(currentPhase(session), 'waitingForAnswer')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for answer')
+    assert.strictEqual(session.activeTool, 'AskUserQuestion')
     assert.strictEqual(session.lastEvent.type, 'question_asked')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -473,6 +653,7 @@ test('claude hook records PermissionRequest as approval wait', () => {
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.details, 'Bash: npm test')
+    assert.strictEqual(session.activeTool, 'Bash')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -505,6 +686,7 @@ test('claude hook clears approval wait on PostToolUseFailure', () => {
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastToolError, 'exit code 1')
     assert.strictEqual(session.lastEvent.type, 'post_tool_use_failure')
   } finally {
@@ -534,6 +716,7 @@ test('claude hook records StopFailure as completed with error detail', () => {
     assert.strictEqual(session.errorDetail, 'model stream ended unexpectedly')
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastEvent.type, 'stop_failure')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -642,6 +825,7 @@ test('codex hook treats question-like Stop messages as waiting for answer', () =
     assert.strictEqual(currentPhase(session), 'waitingForAnswer')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for answer')
+    assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastEvent.type, 'question_asked')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })

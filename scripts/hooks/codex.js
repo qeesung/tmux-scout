@@ -8,6 +8,7 @@ const os = require('os')
 const { spawnSync } = require('child_process')
 const { applySessionEvent } = require('../lib/session-state')
 const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
+const { terminalContext } = require('../lib/terminal-context')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
@@ -78,12 +79,13 @@ function updateSession(sessionId, updates) {
     turnId: updates.lastEvent.turnId,
     attentionReason: updates.needsAttention || null,
     pendingToolUse: updates.pendingToolUse,
+    activeTool: updates.activeTool,
     endedAt: updates.endedAt,
     force: !isLegacyNotify
   } : null)
   delete updates.lifecycleEvent
 
-  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'endedAt', 'stateSource', 'lastEvent'])
+  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'activeTool', 'endedAt', 'stateSource', 'lastEvent'])
   for (const [key, value] of Object.entries(updates)) {
     if (lifecycleEvent && lifecycleFields.has(key)) continue
     if (value !== undefined) session[key] = value
@@ -191,7 +193,7 @@ function baseUpdates(data, now) {
   const pid = Number.isInteger(payloadPid) && payloadPid > 0
     ? payloadPid
     : Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null
-  return {
+  return Object.assign({
     agentType: 'codex',
     endedAt: null,
     workingDirectory: data.cwd,
@@ -201,7 +203,7 @@ function baseUpdates(data, now) {
     pid,
     stateSource: data.hook_event_name ? 'codex-hooks' : 'notify',
     lastHookAt: now
-  }
+  }, terminalContext(pid))
 }
 
 function normalizeSignal(value) {
@@ -360,6 +362,7 @@ function markHiddenSession(sessionId, base, classification, now, details) {
     subagentNickname: classification.subagentNickname || undefined,
     needsAttention: null,
     pendingToolUse: null,
+    activeTool: null,
     endedAt: now,
     lifecycleEvent: {
       type: 'session_end',
@@ -513,6 +516,7 @@ function handleModernHook(data) {
         startedAt: now,
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         sessionTitle: data.session_title || undefined,
         lastEvent: { type: 'session_start', timestamp: now, details: data.source }
       }))
@@ -525,6 +529,7 @@ function handleModernHook(data) {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         sessionTitle: title,
         lastUserPrompt: cleanPrompt(data.prompt || data.prompt_preview || ''),
         lastTurnId: data.turn_id,
@@ -540,6 +545,7 @@ function handleModernHook(data) {
         status: 'working',
         needsAttention: null,
         pendingToolUse: { tool: toolName, details, timestamp: now },
+        activeTool: toolName,
         lastTurnId: data.turn_id,
         lastEvent: { type: 'tool_use', timestamp: now, details, turnId: data.turn_id }
       }))
@@ -560,6 +566,7 @@ function handleModernHook(data) {
         status: 'working',
         needsAttention: 'waiting for approval',
         pendingToolUse: { tool: toolName, details, timestamp: now },
+        activeTool: toolName,
         lastTurnId: data.turn_id,
         lastEvent: { type: 'permission_request', timestamp: now, details, turnId: data.turn_id }
       }))
@@ -572,6 +579,7 @@ function handleModernHook(data) {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         lastTurnId: data.turn_id,
         lastEvent: { type: 'post_tool_use', timestamp: now, details: toolName, turnId: data.turn_id }
       }))
@@ -587,6 +595,7 @@ function handleModernHook(data) {
         status: wantsAnswer ? 'working' : 'completed',
         needsAttention: wantsAnswer ? 'waiting for answer' : null,
         pendingToolUse: null,
+        activeTool: null,
         sessionTitle: data.session_title || undefined,
         lastAssistantMessage,
         lastTurnId: data.turn_id,
@@ -640,6 +649,7 @@ function handleLegacyNotify(data) {
     endedAt: null,
     needsAttention: null,
     pendingToolUse: null,
+    activeTool: null,
     sessionTitle: title,
     threadId,
     lastEvent: {

@@ -15,6 +15,7 @@ const SOURCE_PRIORITY = {
 const PROTECTED_PHASE_MS = 120000
 const TERMINAL_PHASES = new Set(['crashed', 'stale'])
 const NON_TERMINAL_END_PHASES = new Set(['completed', 'interrupted'])
+const ACTIVE_TOOL_PHASES = new Set(['running', 'waitingForApproval'])
 
 function normalizeSource(source) {
   if (!source) return 'unknown'
@@ -135,8 +136,9 @@ function setPhase(session, phase, event, now) {
   session.status = status
   session.needsAttention = attentionForPhase(phase, event.attentionReason)
 
-  if (phase !== 'running' && phase !== 'waitingForApproval') {
+  if (!ACTIVE_TOOL_PHASES.has(phase)) {
     session.pendingToolUse = null
+    session.activeTool = null
   }
 
   if (event.type === 'session_end') {
@@ -176,6 +178,13 @@ function applySessionEvent(session, event) {
 
   if (applied || !nextPhase) {
     if (event.pendingToolUse !== undefined) session.pendingToolUse = event.pendingToolUse
+    if (event.activeTool !== undefined) {
+      session.activeTool = event.activeTool
+    } else if (event.pendingToolUse && event.pendingToolUse.tool) {
+      session.activeTool = event.pendingToolUse.tool
+    } else if (event.pendingToolUse === null) {
+      session.activeTool = null
+    }
     session.lastEvent = {
       type: event.type,
       timestamp: now,

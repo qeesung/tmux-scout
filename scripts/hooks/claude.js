@@ -6,6 +6,7 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const { applySessionEvent } = require('../lib/session-state')
+const { terminalContext } = require('../lib/terminal-context')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
@@ -66,12 +67,13 @@ function updateSession(sessionId, updates) {
     details: updates.lastEvent.details,
     attentionReason: updates.needsAttention || null,
     pendingToolUse: updates.pendingToolUse,
+    activeTool: updates.activeTool,
     endedAt: updates.endedAt,
     force: true
   } : null)
   delete updates.lifecycleEvent
 
-  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'endedAt', 'stateSource', 'lastEvent'])
+  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'activeTool', 'endedAt', 'stateSource', 'lastEvent'])
   for (const [key, value] of Object.entries(updates)) {
     if (lifecycleEvent && lifecycleFields.has(key)) continue
     if (value !== undefined) session[key] = value
@@ -143,13 +145,13 @@ function isPlanApprovalTool(toolName) {
 }
 
 function eventBase(data, now, tmuxPane, pid) {
-  return {
+  return Object.assign({
     workingDirectory: data.cwd,
     transcriptPath: data.transcript_path,
     tmuxPane,
     pid,
     lastHookAt: now
-  }
+  }, terminalContext(pid))
 }
 
 async function main() {
@@ -189,6 +191,7 @@ async function main() {
         status: 'idle',
         startedAt: now,
         pendingToolUse: null,
+        activeTool: null,
         lastEvent: { type: 'session_start', timestamp: now, details: source }
       })))
       break
@@ -210,6 +213,7 @@ async function main() {
         sessionTitle: title,
         lastUserPrompt: cleanPrompt || undefined,
         pendingToolUse: null,
+        activeTool: null,
         lastEvent: { type: 'prompt_submit', timestamp: now, details: title }
       })))
       break
@@ -224,6 +228,7 @@ async function main() {
         status: 'working',
         needsAttention: needsAttention ? tool_name : null,
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
+        activeTool: tool_name || 'unknown',
         lastEvent: { type: 'tool_use', timestamp: now, details: toolDetails },
         lifecycleEvent: needsAttention ? {
           type: questionTool ? 'question_asked' : 'permission_request',
@@ -233,6 +238,7 @@ async function main() {
           details: toolDetails,
           attentionReason: questionTool ? 'waiting for answer' : 'waiting for approval',
           pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
+          activeTool: tool_name || 'unknown',
           force: true
         } : undefined,
       })))
@@ -247,6 +253,7 @@ async function main() {
         status: 'working',
         needsAttention: questionTool ? 'waiting for answer' : (planTool ? 'waiting for plan approval' : 'waiting for approval'),
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
+        activeTool: tool_name || 'unknown',
         lastEvent: {
           type: questionTool ? 'question_asked' : 'permission_request',
           timestamp: now,
@@ -260,6 +267,7 @@ async function main() {
       updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
         pendingToolUse: null,
+        activeTool: null,
         lastEvent: { type: 'post_tool_use', timestamp: now },
       })))
       break
@@ -272,6 +280,7 @@ async function main() {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         lastToolError: error || true,
         lastEvent: { type: 'post_tool_use_failure', timestamp: now, details }
       })))
@@ -283,6 +292,7 @@ async function main() {
         status: 'completed',
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         lastAssistantMessage: data.last_assistant_message,
         lastEvent: { type: 'stop', timestamp: now },
       }))
@@ -293,6 +303,7 @@ async function main() {
         status: 'completed',
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         error: data.error || data.error_type || 'stop_failure',
         errorDetail: data.error_details || data.error_detail || data.message || data.reason,
         lastEvent: {
@@ -352,6 +363,7 @@ async function main() {
         endedAt: now,
         needsAttention: null,
         pendingToolUse: null,
+        activeTool: null,
         lastEvent: { type: 'session_end', timestamp: now, details: reason },
         tmuxPane,
         pid

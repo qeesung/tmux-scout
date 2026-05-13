@@ -5,6 +5,7 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const { buildNodeHookCommand, extractHookPathFromCommand } = require('../lib/hook-command')
 
 const SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.json')
 const HOOK_PATH = path.join(__dirname, '..', 'hooks', 'claude.js')
@@ -50,7 +51,7 @@ function writeSettings(settings) {
 function makeHookEntry(config) {
   const entry = {
     type: 'command',
-    command: `node "${HOOK_PATH}"`,
+    command: buildNodeHookCommand(HOOK_PATH),
     timeout: config && config.timeout ? config.timeout : 5
   }
   return entry
@@ -61,7 +62,8 @@ function matcherForConfig(config) {
 }
 
 function isScoutHook(hook) {
-  return Boolean(hook && typeof hook.command === 'string' && hook.command.includes(HOOK_IDENTIFIER))
+  return Boolean(hook && typeof hook.command === 'string'
+    && (hook.command.includes(HOOK_IDENTIFIER) || hook.command.includes(HOOK_PATH)))
 }
 
 function findScoutHook(groups) {
@@ -236,9 +238,7 @@ function status() {
     const found = findScoutHook(groups)
     if (found) {
       if (!currentPath) {
-        // Extract path from command
-        const m = found.hook.command.match(/"([^"]*)"/)
-        if (m) currentPath = m[1]
+        currentPath = extractHookPathFromCommand(found.hook.command, 'claude.js')
       }
       if (hookMatchesExpected(found, makeHookEntry(eventConfig), matcherForConfig(eventConfig))) {
         installed.push(event)

@@ -8,6 +8,7 @@ const path = require('path')
 const os = require('os')
 const { execFileSync } = require('child_process')
 const sync = require('./picker/sync')
+const { ClaudeTranscriptWatchManager } = require('./lib/claude-transcript-watcher')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
@@ -200,7 +201,7 @@ function formatTickDiagnostics(summary) {
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
 
-function runTick(state, forceFull = false) {
+function runTick(state, forceFull = false, transcriptWatchManager = null) {
   const startedAt = Date.now()
   const now = startedAt
   const discoveryIntervalMs = optionSeconds('@scout-watchdog-discovery-interval', DEFAULT_DISCOVERY_INTERVAL_MS, 5000)
@@ -233,6 +234,10 @@ function runTick(state, forceFull = false) {
   saveTickSummary(state, summary)
   pruneState(state)
   writeJsonAtomic(STATE_FILE, state)
+  if (transcriptWatchManager && result && result.status) {
+    transcriptWatchManager.reconcile(result.status)
+  }
+  return result
 }
 
 async function runLoop({ requireTmuxOption }) {
@@ -244,9 +249,14 @@ async function runLoop({ requireTmuxOption }) {
   if (existing && existing.pid !== process.pid && isPidAlive(existing.pid)) return
 
   writeLock()
-  process.on('exit', removeOwnLock)
+  const transcriptWatchManager = new ClaudeTranscriptWatchManager(STATUS_FILE, appendLog)
+  process.on('exit', () => {
+    transcriptWatchManager.close()
+    removeOwnLock()
+  })
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signal, () => {
+      transcriptWatchManager.close()
       removeOwnLock()
       process.exit(0)
     })
@@ -259,7 +269,7 @@ async function runLoop({ requireTmuxOption }) {
     if (requireTmuxOption && !watchdogEnabled()) break
 
     try {
-      runTick(state)
+      runTick(state, false, transcriptWatchManager)
     } catch (error) {
       state.pid = process.pid
       state.lastTickAt = Date.now()
@@ -273,6 +283,7 @@ async function runLoop({ requireTmuxOption }) {
   }
 
   appendLog(`stopped pid=${process.pid}`)
+  transcriptWatchManager.close()
   removeOwnLock()
 }
 

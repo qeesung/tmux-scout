@@ -138,6 +138,20 @@ function isQuestionTool(toolName) {
   return toolName === 'AskUserQuestion' || toolName === 'mcp__conductor__AskUserQuestion'
 }
 
+function isPlanApprovalTool(toolName) {
+  return toolName === 'ExitPlanMode'
+}
+
+function eventBase(data, now, tmuxPane, pid) {
+  return {
+    workingDirectory: data.cwd,
+    transcriptPath: data.transcript_path,
+    tmuxPane,
+    pid,
+    lastHookAt: now
+  }
+}
+
 async function main() {
   let input = ''
   for await (const chunk of process.stdin) {
@@ -155,7 +169,7 @@ async function main() {
     process.exit(0)
   }
 
-  const { session_id, cwd, hook_event_name, tool_name, tool_input, prompt, source, reason } = data
+  const { session_id, hook_event_name, tool_name, tool_input, prompt, source, reason } = data
 
   if (!session_id) {
     process.exit(0)
@@ -168,29 +182,22 @@ async function main() {
   switch (hook_event_name) {
     case 'SessionStart':
       if (source === 'compact') {
-        updateSession(session_id, {
-          workingDirectory: cwd,
-          tmuxPane,
-          pid,
-          lastHookAt: now
-        })
+        updateSession(session_id, eventBase(data, now, tmuxPane, pid))
         break
       }
-      updateSession(session_id, liveSessionState({
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'idle',
-        workingDirectory: cwd,
         startedAt: now,
         pendingToolUse: null,
-        tmuxPane,
-        pid,
         lastEvent: { type: 'session_start', timestamp: now, details: source }
-      }))
+      })))
       break
 
     case 'UserPromptSubmit': {
       let title = undefined
+      let cleanPrompt = ''
       if (prompt) {
-        let cleanPrompt = String(prompt)
+        cleanPrompt = String(prompt)
         cleanPrompt = cleanPrompt.replace(/<system[-_]?(?:instruction|reminder)[^>]*>[\s\S]*?<\/system[-_]?(?:instruction|reminder)>/gi, '')
         cleanPrompt = cleanPrompt.replace(/^[\s\n]*<[^>]+>[\s\S]*?<\/[^>]+>[\s\n]*/gi, '')
         cleanPrompt = cleanPrompt.trim()
@@ -198,15 +205,13 @@ async function main() {
           title = cleanPrompt.slice(0, 100).split('\n')[0].trim()
         }
       }
-      updateSession(session_id, liveSessionState({
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
-        workingDirectory: cwd,
         sessionTitle: title,
+        lastUserPrompt: cleanPrompt || undefined,
         pendingToolUse: null,
-        tmuxPane,
-        pid,
         lastEvent: { type: 'prompt_submit', timestamp: now, details: title }
-      }))
+      })))
       break
     }
 
@@ -215,7 +220,7 @@ async function main() {
       const attentionTools = ['ExitPlanMode', 'AskUserQuestion', 'mcp__conductor__AskUserQuestion']
       const needsAttention = attentionTools.includes(tool_name)
       const questionTool = isQuestionTool(tool_name)
-      updateSession(session_id, liveSessionState({
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
         needsAttention: needsAttention ? tool_name : null,
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
@@ -230,29 +235,77 @@ async function main() {
           pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
           force: true
         } : undefined,
-        tmuxPane,
-        pid
-      }))
+      })))
+      break
+    }
+
+    case 'PermissionRequest': {
+      const toolDetails = getToolDetails(tool_name, tool_input)
+      const questionTool = isQuestionTool(tool_name)
+      const planTool = isPlanApprovalTool(tool_name)
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        needsAttention: questionTool ? 'waiting for answer' : (planTool ? 'waiting for plan approval' : 'waiting for approval'),
+        pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
+        lastEvent: {
+          type: questionTool ? 'question_asked' : 'permission_request',
+          timestamp: now,
+          details: toolDetails
+        }
+      })))
       break
     }
 
     case 'PostToolUse':
-      updateSession(session_id, liveSessionState({
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
         pendingToolUse: null,
         lastEvent: { type: 'post_tool_use', timestamp: now },
-        tmuxPane,
-        pid
-      }))
+      })))
       break
 
+    case 'PostToolUseFailure': {
+      const toolDetails = getToolDetails(tool_name, tool_input)
+      const error = data.error || data.error_message || data.message || data.reason
+      const details = error ? `${toolDetails} failed: ${String(error).slice(0, 80)}` : `${toolDetails} failed`
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        needsAttention: null,
+        pendingToolUse: null,
+        lastToolError: error || true,
+        lastEvent: { type: 'post_tool_use_failure', timestamp: now, details }
+      })))
+      break
+    }
+
     case 'Stop':
-      updateSession(session_id, {
+      updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
         pendingToolUse: null,
         lastAssistantMessage: data.last_assistant_message,
         lastEvent: { type: 'stop', timestamp: now },
+      }))
+      break
+
+    case 'StopFailure':
+      updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'completed',
+        needsAttention: null,
+        pendingToolUse: null,
+        error: data.error || data.error_type || 'stop_failure',
+        errorDetail: data.error_details || data.error_detail || data.message || data.reason,
+        lastEvent: {
+          type: 'stop_failure',
+          timestamp: now,
+          details: data.error_details || data.error_detail || data.error || data.message || data.reason
+        }
+      }))
+      break
+
+    case 'SubagentStart':
+      updateSession(session_id, {
+        lastEvent: { type: 'subagent_start', timestamp: now },
         tmuxPane,
         pid
       })

@@ -194,6 +194,21 @@ function attentionDetail(session) {
   return tool ? `${reason}: ${tool}` : reason
 }
 
+function subagentDetail(session) {
+  const subagents = Array.isArray(session.activeSubagents)
+    ? session.activeSubagents.filter(Boolean)
+    : []
+  if (subagents.length === 0) return ''
+
+  const latest = subagents.slice().sort((left, right) => {
+    return (right.updatedAt || 0) - (left.updatedAt || 0)
+  })[0]
+  const count = `${subagents.length} subagent${subagents.length === 1 ? '' : 's'}`
+  const label = cleanText(latest.nickname || latest.agentType || latest.title, 'subagent')
+  const activity = cleanText(latest.lastToolActivity || latest.title || latest.phase, '')
+  return activity ? `${count} · ${label}: ${activity}` : `${count} · ${label}`
+}
+
 function formatLine(session, now, currentPane) {
   const unbound = !session.tmuxPane
   const pane = unbound ? null : session._tmuxPaneSnapshot
@@ -210,6 +225,7 @@ function formatLine(session, now, currentPane) {
   const project = formatField(projectName, PROJECT_WIDTH, '37')
   const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
   const terminalReason = session.crashReason || session.staleReason || session.stateReason
+  const subagents = subagentDetail(session)
   const detail = isTerminalSession(session) && terminalReason
     ? `  \x1b[2m${String(terminalReason).replace(/[\r\n]+/g, ' ').slice(0, 55)}\x1b[0m`
     : isNeedsAttention(session, now)
@@ -218,6 +234,8 @@ function formatLine(session, now, currentPane) {
     ? `  \x1b[2m(pane not yet linked — waiting for first response)\x1b[0m`
     : session.pendingToolUse && session.pendingToolUse.details
       ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n]+/g, ' ').slice(0, 40)}\x1b[0m`
+      : subagents
+        ? `  \x1b[35m${subagents.slice(0, 55)}\x1b[0m`
       : ''
 
   const paneId = session.tmuxPane || 'UNBOUND'
@@ -259,7 +277,7 @@ function run(file, pane, cached) {
   }
 }
 
-module.exports = { run, getActiveSessions }
+module.exports = { run, getActiveSessions, formatLine, subagentDetail }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

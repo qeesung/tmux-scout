@@ -11,6 +11,8 @@ let currentPane = process.argv[3] || ''
 
 const pidStateCache = new Map()
 const TERMINAL_DISPLAY_MS = 5 * 60 * 1000
+const STATUS_WIDTH = 6
+const AGENT_WIDTH = 6
 const WINDOW_WIDTH = 20
 const PROJECT_WIDTH = 16
 
@@ -146,11 +148,6 @@ function getActiveSessions(status, panes) {
   return Array.from(byPane.values()).concat(unbound)
 }
 
-function truncatePad(value, width) {
-  const text = String(value || '?').replace(/[\r\n\t]+/g, ' ')
-  return (text.length > width ? text.slice(0, width - 1) + '~' : text).padEnd(width)
-}
-
 function cleanText(value, fallback) {
   const text = String(value || fallback || '?').replace(/[\r\n\t]+/g, ' ').trim()
   return text || fallback || '?'
@@ -162,6 +159,12 @@ function truncateText(value, width) {
   return text.length > width ? text.slice(0, width - 1) + '~' : text
 }
 
+function formatField(value, width, color) {
+  const text = truncateText(value, width)
+  const padding = ' '.repeat(Math.max(0, width - text.length))
+  return `\x1b[${color}m${text}\x1b[0m${padding}`
+}
+
 function waitCode(reason) {
   const text = String(reason || '').toLowerCase()
   if (text.includes('answer') || text.includes('input') || text.includes('question')) return 'ANS'
@@ -171,19 +174,22 @@ function waitCode(reason) {
 }
 
 function statusTag(session, now) {
-  if (isNeedsAttention(session, now)) return `\x1b[31m[W:${waitCode(session.needsAttention)}]\x1b[0m`
-  if (session.status === 'working') return '\x1b[33m[ BUSY ]\x1b[0m'
-  if (session.status === 'interrupted') return '\x1b[35m[ INT  ]\x1b[0m'
-  if (session.status === 'crashed') return '\x1b[31m[CRASH]\x1b[0m'
-  if (session.status === 'stale') return '\x1b[90m[STALE]\x1b[0m'
-  if (session.status === 'completed') return '\x1b[32m[ DONE ]\x1b[0m'
-  return '\x1b[34m[ IDLE ]\x1b[0m'
+  if (isNeedsAttention(session, now)) return formatField(`W:${waitCode(session.needsAttention)}`, STATUS_WIDTH, '31')
+  if (session.status === 'working') return formatField('BUSY', STATUS_WIDTH, '33')
+  if (session.status === 'interrupted') return formatField('INT', STATUS_WIDTH, '35')
+  if (session.status === 'crashed') return formatField('CRASH', STATUS_WIDTH, '31')
+  if (session.status === 'stale') return formatField('STALE', STATUS_WIDTH, '90')
+  if (session.status === 'completed') return formatField('DONE', STATUS_WIDTH, '32')
+  return formatField('IDLE', STATUS_WIDTH, '34')
 }
 
-function formatField(value, width, color) {
-  const text = truncateText(value, width)
-  const padding = ' '.repeat(Math.max(0, width - text.length))
-  return `\x1b[${color}m${text}\x1b[0m${padding}`
+function attentionDetail(session) {
+  if (!session.needsAttention) return ''
+  const reason = cleanText(session.needsAttention, 'waiting')
+  const tool = session.pendingToolUse && session.pendingToolUse.details
+    ? cleanText(session.pendingToolUse.details, '')
+    : ''
+  return tool ? `${reason}: ${tool}` : reason
 }
 
 function formatLine(session, now, currentPane) {
@@ -193,7 +199,9 @@ function formatLine(session, now, currentPane) {
   const isCurrent = !unbound && currentPane && session.tmuxPane === currentPane
   const cur = isCurrent ? '\x1b[33m*\x1b[0m' : ' '
   const tag = statusTag(session, now)
-  const agent = session.agentType === 'codex' ? '\x1b[38;5;114mcodex \x1b[0m' : '\x1b[38;5;209mclaude\x1b[0m'
+  const agent = session.agentType === 'codex'
+    ? formatField('codex', AGENT_WIDTH, '38;5;114')
+    : formatField('claude', AGENT_WIDTH, '38;5;209')
   const windowName = pane && pane.windowName ? pane.windowName : session.tmuxWindowName || '-'
   const projectName = path.basename(session.workingDirectory || '?')
   const window = formatField(windowName, WINDOW_WIDTH, '36')
@@ -202,6 +210,8 @@ function formatLine(session, now, currentPane) {
   const terminalReason = session.crashReason || session.staleReason || session.stateReason
   const detail = isTerminalSession(session) && terminalReason
     ? `  \x1b[2m${String(terminalReason).replace(/[\r\n]+/g, ' ').slice(0, 55)}\x1b[0m`
+    : isNeedsAttention(session, now)
+    ? `  \x1b[31m${attentionDetail(session).slice(0, 55)}\x1b[0m`
     : unbound
     ? `  \x1b[2m(pane not yet linked — waiting for first response)\x1b[0m`
     : session.pendingToolUse && session.pendingToolUse.details
@@ -231,10 +241,11 @@ function run(file, pane, cached) {
     return (right.lastUpdated || 0) - (left.lastUpdated || 0)
   })
 
-  const hStatus = 'STATUS '.padEnd(8)
+  const hStatus = 'STATUS'.padEnd(STATUS_WIDTH)
+  const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)
   const hWindow = 'WINDOW'.padEnd(WINDOW_WIDTH)
   const hProject = 'PROJECT'.padEnd(PROJECT_WIDTH)
-  console.log(`_\t  ${hStatus} AGENT  ${hWindow} ${hProject} TITLE`)
+  console.log(`_\t  ${hStatus} ${hAgent} ${hWindow} ${hProject} TITLE`)
 
   if (active.length === 0) {
     console.log('NONE\tNo active sessions found.')

@@ -137,6 +137,7 @@ function pruneState(state) {
 function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
   const reconcile = stats && stats.reconcile ? stats.reconcile : {}
   const codex = stats && stats.codex ? stats.codex : {}
+  const claudeTranscript = stats && stats.claudeTranscript ? stats.claudeTranscript : {}
   const paneGroundTruth = stats && stats.paneGroundTruth ? stats.paneGroundTruth : {}
   const stuckTools = stats && stats.stuckTools ? stats.stuckTools : {}
   const reconcileChanges = (reconcile.processExits || 0)
@@ -145,13 +146,14 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
   const codexChanges = (codex.discovered || 0) + (codex.updated || 0) + (codex.stale || 0)
   const paneUpdates = paneGroundTruth.updates || 0
   const stuckInterruptions = stuckTools.interrupted || 0
+  const claudeInterruptions = claudeTranscript.interrupted || 0
 
   return {
     mode,
     startedAt,
     finishedAt,
     durationMs,
-    changes: reconcileChanges + codexChanges + paneUpdates + stuckInterruptions,
+    changes: reconcileChanges + codexChanges + paneUpdates + stuckInterruptions + claudeInterruptions,
     reconcileChanges,
     processExits: reconcile.processExits || 0,
     paneShellExits: reconcile.paneShellExits || 0,
@@ -162,6 +164,9 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     codexFilesRead: codex.filesRead || 0,
     codexEventsParsed: codex.eventsParsed || 0,
     codexParseErrors: codex.parseErrors || 0,
+    claudeTranscriptRead: claudeTranscript.filesRead || 0,
+    claudeTranscriptParseErrors: claudeTranscript.parseErrors || 0,
+    claudeInterrupted: claudeInterruptions,
     paneUpdates,
     stuckToolInterruptions: stuckInterruptions
   }
@@ -184,6 +189,9 @@ function formatTickDiagnostics(summary) {
   if (Number.isFinite(summary.codexFilesRead)) parts.push(`codexRead=${summary.codexFilesRead}`)
   if (Number.isFinite(summary.codexEventsParsed)) parts.push(`codexParsed=${summary.codexEventsParsed}`)
   if (summary.codexParseErrors > 0) parts.push(`codexParseErrors=${summary.codexParseErrors}`)
+  if (Number.isFinite(summary.claudeTranscriptRead)) parts.push(`claudeRead=${summary.claudeTranscriptRead}`)
+  if (summary.claudeTranscriptParseErrors > 0) parts.push(`claudeParseErrors=${summary.claudeTranscriptParseErrors}`)
+  if (summary.claudeInterrupted > 0) parts.push(`claudeInterrupted=${summary.claudeInterrupted}`)
   if (summary.codexDiscovered > 0) parts.push(`codexDiscovered=${summary.codexDiscovered}`)
   if (summary.codexUpdated > 0) parts.push(`codexUpdated=${summary.codexUpdated}`)
   if (summary.codexStale > 0) parts.push(`codexStale=${summary.codexStale}`)

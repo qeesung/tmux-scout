@@ -16,6 +16,8 @@ let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') :
 const pidStateCache = new Map()
 const CODEX_TAIL_BYTES = DEFAULT_TAIL_BYTES
 const CODEX_STUCK_TOOL_MS = 180000
+const CLAUDE_TRANSCRIPT_TAIL_BYTES = DEFAULT_TAIL_BYTES
+const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
 
 function createStats(options = {}) {
   return {
@@ -41,6 +43,11 @@ function createStats(options = {}) {
     },
     stuckTools: {
       interrupted: 0
+    },
+    claudeTranscript: {
+      interrupted: 0,
+      filesRead: 0,
+      parseErrors: 0
     }
   }
 }
@@ -48,7 +55,7 @@ function createStats(options = {}) {
 function ensureStats(options = {}) {
   const defaults = createStats(options)
   const stats = options.stats || defaults
-  for (const key of ['reconcile', 'codex', 'paneGroundTruth', 'stuckTools']) {
+  for (const key of ['reconcile', 'codex', 'paneGroundTruth', 'stuckTools', 'claudeTranscript']) {
     stats[key] = Object.assign({}, defaults[key], stats[key] || {})
   }
   if (!stats.mode) stats.mode = defaults.mode
@@ -827,6 +834,126 @@ function sweepStuckCodexTools(status, stats) {
   }
 }
 
+// --- Claude transcript helpers ---
+
+function readFileTail(filePath, maxBytes) {
+  try {
+    const stat = fs.statSync(filePath)
+    const start = Math.max(0, stat.size - maxBytes)
+    const length = stat.size - start
+    if (length <= 0) return { text: '', mtimeMs: stat.mtimeMs }
+
+    const fd = fs.openSync(filePath, 'r')
+    try {
+      const buffer = Buffer.allocUnsafe(length)
+      const bytesRead = fs.readSync(fd, buffer, 0, length, start)
+      let text = buffer.toString('utf-8', 0, bytesRead)
+      if (start > 0) {
+        const firstNewline = text.indexOf('\n')
+        text = firstNewline >= 0 ? text.slice(firstNewline + 1) : ''
+      }
+      return { text, mtimeMs: stat.mtimeMs }
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch (_) {
+    return null
+  }
+}
+
+function isClaudeInterruptText(value) {
+  const text = String(value || '')
+  return text.includes(CLAUDE_INTERRUPT_MARKER) || /request interrupted by user/i.test(text)
+}
+
+function objectContainsInterrupt(value, depth = 0) {
+  if (depth > 8 || value === null || value === undefined) return false
+  if (typeof value === 'string') return isClaudeInterruptText(value)
+  if (Array.isArray(value)) return value.some(item => objectContainsInterrupt(item, depth + 1))
+  if (typeof value === 'object') {
+    return Object.values(value).some(item => objectContainsInterrupt(item, depth + 1))
+  }
+  return false
+}
+
+function eventTimestampMs(obj) {
+  if (!obj || typeof obj !== 'object') return null
+  for (const key of ['timestamp', 'created_at', 'createdAt']) {
+    const value = obj[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = new Date(value).getTime()
+      if (Number.isFinite(parsed)) return parsed
+    }
+  }
+  return null
+}
+
+function findLatestClaudeInterrupt(transcriptPath, sinceMs, stats) {
+  const tail = readFileTail(transcriptPath, CLAUDE_TRANSCRIPT_TAIL_BYTES)
+  if (!tail) return null
+  if (stats) stats.claudeTranscript.filesRead++
+
+  const hits = []
+  for (const line of tail.text.split('\n')) {
+    if (!line.trim()) continue
+    let obj = null
+    try {
+      obj = JSON.parse(line)
+    } catch (_) {
+      if (stats) stats.claudeTranscript.parseErrors++
+    }
+
+    const hit = obj ? objectContainsInterrupt(obj) : isClaudeInterruptText(line)
+    if (!hit) continue
+    hits.push({
+      timestamp: eventTimestampMs(obj),
+      rawLine: line
+    })
+  }
+
+  const threshold = Number.isFinite(sinceMs) && sinceMs > 0 ? sinceMs - 1000 : 0
+  for (let index = hits.length - 1; index >= 0; index--) {
+    const hit = hits[index]
+    if (Number.isFinite(hit.timestamp)) {
+      if (!threshold || hit.timestamp >= threshold) return hit
+      continue
+    }
+    if (!threshold || tail.mtimeMs >= threshold) return hit
+  }
+  return null
+}
+
+function sweepInterruptedClaudeTranscripts(status, stats) {
+  const now = Date.now()
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (!session || session.agentType !== 'claude' || session.endedAt) continue
+    if (currentPhase(session) !== 'running') continue
+    if (!session.transcriptPath) continue
+
+    const hit = findLatestClaudeInterrupt(session.transcriptPath, session.lastUpdated || session.startedAt, stats)
+    if (!hit) continue
+
+    const updated = applySessionUpdate(status, sessionId, session, {
+      type: 'interrupted',
+      source: 'transcript',
+      timestamp: now,
+      reason: 'Claude transcript recorded request interruption',
+      details: CLAUDE_INTERRUPT_MARKER,
+      force: false
+    })
+    if (updated && stats) stats.claudeTranscript.interrupted++
+    changed = updated || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
 // --- Pane content ground truth ---
 
 function capturePaneContent(paneId) {
@@ -1005,6 +1132,7 @@ function run(file, options = {}) {
   if (options.reconcile !== false) reconcileSessions(status, panes, stats)
   syncCodexSessions(status, panes, options, stats)
   if (options.stuckSweep !== false) sweepStuckCodexTools(status, stats)
+  if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats)
   if (options.paneGroundTruth !== false) applyPaneGroundTruth(status, stats)
   stats.durationMs = Date.now() - stats.startedAt
   return { status, panes, stats }

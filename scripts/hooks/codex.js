@@ -373,6 +373,118 @@ function markHiddenSession(sessionId, base, classification, now, details) {
     }
   })
   updateSession(sessionId, updates)
+
+  if (classification.isSubagent && classification.parentSessionId) {
+    upsertParentSubagent(classification.parentSessionId, sessionId, {
+      nickname: classification.subagentNickname || 'subagent',
+      depth: classification.subagentDepth,
+      phase: 'running',
+      startedAt: now,
+      updatedAt: now
+    })
+  }
+}
+
+function normalizeSubagents(value) {
+  return Array.isArray(value) ? value.filter(Boolean) : []
+}
+
+function upsertParentSubagent(parentSessionId, childSessionId, patch) {
+  if (!parentSessionId || !childSessionId) return false
+  const parent = readSession(parentSessionId)
+  if (!parent || isHiddenCodexSession(parent)) return false
+
+  const activeSubagents = normalizeSubagents(parent.activeSubagents)
+  const index = activeSubagents.findIndex(item => item && item.agentId === childSessionId)
+  const existing = index >= 0 ? activeSubagents[index] : { agentId: childSessionId }
+  const nextInfo = Object.assign({}, existing, patch, {
+    agentId: childSessionId,
+    updatedAt: patch.updatedAt || Date.now()
+  })
+
+  if (index >= 0) activeSubagents[index] = nextInfo
+  else activeSubagents.push(nextInfo)
+
+  updateSession(parentSessionId, {
+    activeSubagents,
+    lastSubagentUpdatedAt: nextInfo.updatedAt
+  })
+  return true
+}
+
+function removeParentSubagent(parentSessionId, childSessionId, now) {
+  if (!parentSessionId || !childSessionId) return false
+  const parent = readSession(parentSessionId)
+  if (!parent || !Array.isArray(parent.activeSubagents)) return false
+  const activeSubagents = parent.activeSubagents.filter(item => item && item.agentId !== childSessionId)
+  if (activeSubagents.length === parent.activeSubagents.length) return false
+  updateSession(parentSessionId, {
+    activeSubagents,
+    lastSubagentUpdatedAt: now
+  })
+  return true
+}
+
+function updateParentSubagentFromHiddenEvent(session, data, now) {
+  if (!session || !session.isCodexSubagent || !session.parentSessionId) return
+  const eventName = data.hook_event_name
+  const childSessionId = session.sessionId || data.session_id || data.thread_id
+  const base = {
+    nickname: session.subagentNickname || data.agent_nickname || 'subagent',
+    depth: session.subagentDepth,
+    updatedAt: now
+  }
+
+  if (eventName === 'Stop' || eventName === 'SessionEnd') {
+    removeParentSubagent(session.parentSessionId, childSessionId, now)
+    return
+  }
+
+  if (eventName === 'UserPromptSubmit') {
+    const title = titleFromPrompt(data.prompt || data.prompt_preview)
+    upsertParentSubagent(session.parentSessionId, childSessionId, Object.assign({}, base, {
+      title: title || session.sessionTitle,
+      phase: 'running'
+    }))
+    return
+  }
+
+  if (eventName === 'PreToolUse' || eventName === 'PermissionRequest') {
+    const toolName = data.tool_name || 'unknown'
+    const details = getToolDetails(toolName, data.tool_input)
+    upsertParentSubagent(session.parentSessionId, childSessionId, Object.assign({}, base, {
+      phase: eventName === 'PermissionRequest' ? 'waitingForApproval' : 'running',
+      lastToolActivity: details
+    }))
+    return
+  }
+
+  if (eventName === 'PostToolUse') {
+    const toolName = data.tool_name || 'unknown'
+    upsertParentSubagent(session.parentSessionId, childSessionId, Object.assign({}, base, {
+      phase: 'running',
+      lastToolActivity: `${toolName} done`
+    }))
+    return
+  }
+
+  if (eventName === 'PostToolUseFailure') {
+    const toolName = data.tool_name || 'unknown'
+    const error = data.error || data.error_message || data.message || 'failed'
+    upsertParentSubagent(session.parentSessionId, childSessionId, Object.assign({}, base, {
+      phase: 'running',
+      lastToolActivity: `${toolName} failed: ${String(error).slice(0, 80)}`
+    }))
+    return
+  }
+
+  if (eventName === 'SessionStart') {
+    upsertParentSubagent(session.parentSessionId, childSessionId, Object.assign({}, base, {
+      title: data.session_title || session.sessionTitle,
+      phase: 'running',
+      startedAt: session.startedAt || now
+    }))
+  }
 }
 
 function handleModernHook(data) {
@@ -383,7 +495,10 @@ function handleModernHook(data) {
   const now = Date.now()
   const base = baseUpdates(data, now)
   const existing = readSession(sessionId)
-  if (isHiddenCodexSession(existing)) return
+  if (isHiddenCodexSession(existing)) {
+    updateParentSubagentFromHiddenEvent(existing, data, now)
+    return
+  }
 
   const classification = classifyHookPayload(data)
   if (classification.hidden) {

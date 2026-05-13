@@ -9,7 +9,7 @@ const path = require('path')
 const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental } = require('../scripts/lib/jsonl-tail-reader')
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
-const { getActiveSessions } = require('../scripts/picker/render')
+const { formatLine, getActiveSessions } = require('../scripts/picker/render')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 
@@ -55,6 +55,20 @@ function readScoutStatus(homeDir) {
 
 function stripAnsi(value) {
   return String(value).replace(/\x1b\[[0-9;]*m/g, '')
+}
+
+function findScoutHookGroup(settings, event, matcher) {
+  return (settings.hooks[event] || []).find(group => {
+    return group &&
+      group.matcher === matcher &&
+      Array.isArray(group.hooks) &&
+      group.hooks.some(hook => {
+        return hook &&
+          hook.type === 'command' &&
+          typeof hook.command === 'string' &&
+          hook.command.includes('scripts/hooks/claude.js')
+      })
+  })
 }
 
 function codexSessionDir(homeDir, date = new Date()) {
@@ -253,21 +267,25 @@ test('session reducer does not reopen crashed sessions with late interrupted tra
   assert.strictEqual(session.endedAt, 2000)
 })
 
-test('claude setup registers only supported hook events', () => {
+test('claude setup registers monitored official hook events', () => {
   assert.deepStrictEqual(CLAUDE_HOOK_EVENTS, [
     'SessionStart',
     'UserPromptSubmit',
     'PreToolUse',
+    'PermissionRequest',
     'PostToolUse',
+    'PostToolUseFailure',
     'Notification',
     'Stop',
+    'StopFailure',
+    'SubagentStart',
     'SubagentStop',
     'PreCompact',
     'SessionEnd'
   ])
 })
 
-test('claude setup removes legacy unsupported scout hook entries on install', () => {
+test('claude setup installs failure and permission hooks without deleting user hooks', () => {
   const dir = tempDir()
   try {
     const claudeDir = path.join(dir, '.claude')
@@ -297,11 +315,12 @@ test('claude setup removes legacy unsupported scout hook entries on install', ()
     runScript('scripts/setup/claude.js', ['install'], dir)
 
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
-    assert.strictEqual(settings.hooks.PermissionRequest.length, 1)
-    assert.strictEqual(settings.hooks.PermissionRequest[0].hooks.length, 1)
-    assert.strictEqual(settings.hooks.PermissionRequest[0].hooks[0].command, 'echo keep-me')
-    assert.strictEqual(settings.hooks.PostToolUseFailure, undefined)
-    assert.strictEqual(settings.hooks.StopFailure, undefined)
+    assert.ok(findScoutHookGroup(settings, 'PermissionRequest', '*'))
+    assert.ok(findScoutHookGroup(settings, 'PostToolUseFailure', '*'))
+    assert.ok(findScoutHookGroup(settings, 'StopFailure', ''))
+    assert.ok(settings.hooks.PermissionRequest.some(group => {
+      return Array.isArray(group.hooks) && group.hooks.some(hook => hook.command === 'echo keep-me')
+    }))
     for (const event of CLAUDE_HOOK_EVENTS) {
       assert.ok(settings.hooks[event], `${event} hook missing`)
     }
@@ -310,7 +329,7 @@ test('claude setup removes legacy unsupported scout hook entries on install', ()
   }
 })
 
-test('unified setup reports removed Claude legacy hook entries accurately', () => {
+test('unified setup reports Claude permission hooks as installed or updated', () => {
   const dir = tempDir()
   try {
     const claudeDir = path.join(dir, '.claude')
@@ -325,8 +344,8 @@ test('unified setup reports removed Claude legacy hook entries accurately', () =
     }, null, 2))
 
     const output = stripAnsi(runScriptOutput('scripts/setup.js', ['install', '--claude'], dir))
-    assert.ok(/PermissionRequest\s+legacy hook removed/.test(output))
-    assert.ok(!/PermissionRequest\s+hook installed/.test(output))
+    assert.ok(/PermissionRequest\s+(path updated|hook installed)/.test(output))
+    assert.ok(!/PermissionRequest\s+legacy hook removed/.test(output))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -361,6 +380,46 @@ test('session reducer keeps interrupted turns eligible for sync', () => {
   assert.strictEqual(session.endedAt, null)
 })
 
+test('sync marks running Claude session interrupted from transcript marker', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-transcript-interrupt'
+    const transcriptPath = path.join(dir, 'claude-transcript.jsonl')
+    fs.writeFileSync(transcriptPath, '')
+    runHook('scripts/hooks/claude.js', {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath,
+      prompt: 'keep going'
+    }, dir)
+    fs.appendFileSync(transcriptPath, JSON.stringify({
+      timestamp: new Date(Date.now() + 1000).toISOString(),
+      type: 'assistant',
+      message: {
+        content: [{ type: 'text', text: '[Request interrupted by user]' }]
+      }
+    }) + '\n')
+
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    const result = sync.run(statusFile, {
+      codexMode: 'none',
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+    const session = result.status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'interrupted')
+    assert.strictEqual(session.status, 'interrupted')
+    assert.strictEqual(session.endedAt, null)
+    assert.strictEqual(session.lastEvent.type, 'interrupted')
+    assert.strictEqual(result.stats.claudeTranscript.filesRead, 1)
+    assert.strictEqual(result.stats.claudeTranscript.interrupted, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => {
   const dir = tempDir()
   try {
@@ -385,6 +444,97 @@ test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => 
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for answer')
     assert.strictEqual(session.lastEvent.type, 'question_asked')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude hook records PermissionRequest as approval wait', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-permission'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run tests'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.pendingToolUse.details, 'Bash: npm test')
+    assert.strictEqual(session.lastEvent.type, 'permission_request')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude hook clears approval wait on PostToolUseFailure', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-tool-failure'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run tests'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PostToolUseFailure',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' },
+      error: 'exit code 1'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.lastToolError, 'exit code 1')
+    assert.strictEqual(session.lastEvent.type, 'post_tool_use_failure')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude hook records StopFailure as completed with error detail', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-stop-failure'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'summarize'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'StopFailure',
+      error: 'stop_failed',
+      error_details: 'model stream ended unexpectedly'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(session.error, 'stop_failed')
+    assert.strictEqual(session.errorDetail, 'model stream ended unexpectedly')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.lastEvent.type, 'stop_failure')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -443,6 +593,9 @@ test('claude hook records metadata-only official events without changing active 
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'UserPromptSubmit',
       prompt: 'keep working'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'SubagentStart'
     }), dir)
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'SubagentStop'
@@ -626,6 +779,92 @@ test('codex hook reads transcript session_meta from first line of large transcri
     assert.strictEqual(session.hiddenReason, 'codex-subagent')
     assert.strictEqual(session.parentSessionId, 'parent-session')
     assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hidden subagents are summarized on parent picker rows', () => {
+  const dir = tempDir()
+  try {
+    const parentId = 'codex-parent'
+    const childId = 'codex-child-subagent'
+    const parentBase = { session_id: parentId, thread_id: parentId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, parentBase, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, parentBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'review the change'
+    }), dir)
+
+    const transcriptPath = path.join(dir, 'child-rollout.jsonl')
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      type: 'session_meta',
+      payload: {
+        id: childId,
+        forked_from_id: parentId,
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: parentId,
+              depth: 1,
+              agent_nickname: 'reviewer'
+            }
+          }
+        }
+      }
+    }) + '\n')
+
+    const childBase = {
+      session_id: childId,
+      thread_id: childId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath
+    }
+    runHook('scripts/hooks/codex.js', Object.assign({}, childBase, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, childBase, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let status = readScoutStatus(dir)
+    const parent = status.sessions[parentId]
+    const child = status.sessions[childId]
+    assert.strictEqual(child.isHiddenFromScout, true)
+    assert.strictEqual(child.isCodexSubagent, true)
+    assert.strictEqual(parent.activeSubagents.length, 1)
+    assert.strictEqual(parent.activeSubagents[0].agentId, childId)
+    assert.strictEqual(parent.activeSubagents[0].nickname, 'reviewer')
+    assert.strictEqual(parent.activeSubagents[0].lastToolActivity, 'Bash: npm test')
+
+    const pane = {
+      paneId: '%1',
+      currentCommand: 'node',
+      paneDead: false,
+      windowName: 'main'
+    }
+    assert.deepStrictEqual(
+      getActiveSessions(status, new Map([['%1', pane]])).map(session => session.sessionId),
+      [parentId]
+    )
+    parent._tmuxPaneSnapshot = pane
+    const line = stripAnsi(formatLine(parent, Date.now(), '%1'))
+    assert.ok(/1 subagent · reviewer: Bash: npm test/.test(line), line)
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, childBase, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'done'
+    }), dir)
+    status = readScoutStatus(dir)
+    assert.deepStrictEqual(status.sessions[parentId].activeSubagents, [])
+    status.sessions[parentId]._tmuxPaneSnapshot = pane
+    assert.ok(!stripAnsi(formatLine(status.sessions[parentId], Date.now(), '%1')).includes('subagent'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

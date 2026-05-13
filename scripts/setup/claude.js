@@ -9,22 +9,22 @@ const os = require('os')
 const SETTINGS_FILE = path.join(os.homedir(), '.claude', 'settings.json')
 const HOOK_PATH = path.join(__dirname, '..', 'hooks', 'claude.js')
 const HOOK_IDENTIFIER = 'tmux-scout/scripts/hooks/claude.js'
-const HOOK_EVENTS = [
-  'SessionStart',
-  'UserPromptSubmit',
-  'PreToolUse',
-  'PostToolUse',
-  'Notification',
-  'Stop',
-  'SubagentStop',
-  'PreCompact',
-  'SessionEnd'
-]
-const LEGACY_UNSUPPORTED_HOOK_EVENTS = [
-  'PermissionRequest',
-  'PostToolUseFailure',
-  'StopFailure'
-]
+const HOOK_EVENT_CONFIGS = [
+  { event: 'SessionStart' },
+  { event: 'UserPromptSubmit' },
+  { event: 'PreToolUse', matcher: '*' },
+  { event: 'PermissionRequest', matcher: '*' },
+  { event: 'PostToolUse', matcher: '*' },
+  { event: 'PostToolUseFailure', matcher: '*' },
+  { event: 'Notification' },
+  { event: 'Stop' },
+  { event: 'StopFailure' },
+  { event: 'SubagentStart' },
+  { event: 'SubagentStop' },
+  { event: 'PreCompact' },
+  { event: 'SessionEnd' }
+].map(config => typeof config === 'string' ? { event: config } : config)
+const HOOK_EVENTS = HOOK_EVENT_CONFIGS.map(config => config.event)
 
 function writeAtomic(filePath, content) {
   const tempPath = filePath + '.tmp.' + process.pid
@@ -47,12 +47,17 @@ function writeSettings(settings) {
   writeAtomic(SETTINGS_FILE, JSON.stringify(settings, null, 2) + '\n')
 }
 
-function makeHookEntry() {
-  return {
+function makeHookEntry(config) {
+  const entry = {
     type: 'command',
     command: `node "${HOOK_PATH}"`,
-    timeout: 5
+    timeout: config && config.timeout ? config.timeout : 5
   }
+  return entry
+}
+
+function matcherForConfig(config) {
+  return config && config.matcher !== undefined ? config.matcher : ''
 }
 
 function isScoutHook(hook) {
@@ -93,9 +98,8 @@ function removeDuplicateScoutHooks(groups, keep) {
   return changed
 }
 
-function removeScoutHooksFromEvent(settings, event) {
-  if (!settings.hooks || !settings.hooks[event]) return false
-  const groups = settings.hooks[event]
+function removeScoutHooksFromGroups(groups) {
+  if (!Array.isArray(groups)) return false
   let changed = false
 
   for (let gi = groups.length - 1; gi >= 0; gi--) {
@@ -110,12 +114,18 @@ function removeScoutHooksFromEvent(settings, event) {
     }
   }
 
-  if (groups.length === 0) {
-    delete settings.hooks[event]
-    changed = true
-  }
-
   return changed
+}
+
+function hookMatchesExpected(found, expected, matcher) {
+  return Boolean(
+    found &&
+    found.group &&
+    found.group.matcher === matcher &&
+    found.hook &&
+    found.hook.command === expected.command &&
+    found.hook.timeout === expected.timeout
+  )
 }
 
 function install() {
@@ -129,39 +139,30 @@ function install() {
   const results = []
   let changed = false
 
-  for (const event of HOOK_EVENTS) {
+  for (const eventConfig of HOOK_EVENT_CONFIGS) {
+    const event = eventConfig.event
     if (!settings.hooks[event]) settings.hooks[event] = []
 
     const groups = settings.hooks[event]
+    const matcher = matcherForConfig(eventConfig)
+    const expected = makeHookEntry(eventConfig)
     const existing = findScoutHook(groups)
-    if (existing) {
-      const expected = makeHookEntry()
-      if (existing.hook.command === expected.command) {
-        results.push({ event, action: 'ok' })
-      } else {
-        existing.group.hooks[existing.hookIndex] = expected
-        changed = true
-        results.push({ event, action: 'updated' })
-      }
+    if (hookMatchesExpected(existing, expected, matcher)) {
       changed = removeDuplicateScoutHooks(groups, existing) || changed
+      results.push({ event, action: 'ok' })
     } else {
-      // Find catch-all matcher group (matcher: "")
-      let catchAll = groups.find(g => g.matcher === '')
+      const hadScoutHook = Boolean(existing)
+      changed = removeScoutHooksFromGroups(groups) || changed
+      // Find matching catch-all / wildcard matcher group.
+      let catchAll = groups.find(g => g.matcher === matcher)
       if (!catchAll) {
-        catchAll = { matcher: '', hooks: [] }
+        catchAll = { matcher, hooks: [] }
         // Prepend so catch-all runs before specific matchers
         groups.unshift(catchAll)
       }
-      catchAll.hooks.push(makeHookEntry())
+      catchAll.hooks.push(expected)
       changed = true
-      results.push({ event, action: 'installed' })
-    }
-  }
-
-  for (const event of LEGACY_UNSUPPORTED_HOOK_EVENTS) {
-    if (removeScoutHooksFromEvent(settings, event)) {
-      changed = true
-      results.push({ event, action: 'removed_legacy' })
+      results.push({ event, action: hadScoutHook ? 'updated' : 'installed' })
     }
   }
 
@@ -178,7 +179,7 @@ function uninstall() {
   let changed = false
   const results = []
 
-  for (const event of [...HOOK_EVENTS, ...LEGACY_UNSUPPORTED_HOOK_EVENTS]) {
+  for (const event of HOOK_EVENTS) {
     const groups = settings.hooks[event]
     if (!groups) {
       results.push({ event, action: 'not_found' })
@@ -227,17 +228,22 @@ function status() {
   const missing = []
   let currentPath = null
 
-  for (const event of HOOK_EVENTS) {
+  for (const eventConfig of HOOK_EVENT_CONFIGS) {
+    const event = eventConfig.event
     const groups = settings.hooks[event]
     if (!groups) { missing.push(event); continue }
 
     const found = findScoutHook(groups)
     if (found) {
-      installed.push(event)
       if (!currentPath) {
         // Extract path from command
         const m = found.hook.command.match(/"([^"]*)"/)
         if (m) currentPath = m[1]
+      }
+      if (hookMatchesExpected(found, makeHookEntry(eventConfig), matcherForConfig(eventConfig))) {
+        installed.push(event)
+      } else {
+        missing.push(event)
       }
     } else {
       missing.push(event)
@@ -263,7 +269,7 @@ if (require.main === module) {
       console.log('Claude Code: ' + r.reason)
     } else {
       for (const { event, action } of r.results) {
-        const marker = action === 'ok' ? '=' : action === 'removed_legacy' ? '-' : '+'
+        const marker = action === 'ok' ? '=' : '+'
         console.log(`  ${marker} ${event}: ${action}`)
       }
     }

@@ -14,7 +14,7 @@
 
 ## 功能特性
 
-- **会话选择器** — `prefix + O` 打开 fzf 弹窗，列出所有活跃的 agent 会话，显示状态标签（`WAIT` / `BUSY` / `DONE` / `IDLE`）、项目名、提示标题和实时工具详情
+- **会话选择器** — `prefix + O` 打开 fzf 弹窗，列出所有活跃的 agent 会话，显示状态标签（`WAIT` / `BUSY` / `DONE` / `IDLE`）、tmux window 名称、项目名、提示标题和实时工具详情
 - **面板预览** — 右侧预览面板显示每个会话 tmux 面板的最后 40 行内容
 - **状态栏组件** — 在 tmux 的 status-right 中显示按状态分类的会话计数（如 `0|1|2`），每 2 秒刷新
 - **自动刷新** — `Ctrl-T` 切换每 2 秒自动刷新选择器
@@ -72,7 +72,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status    
 ### 修改了什么
 
 - **Claude Code**：在 `~/.claude/settings.json` 的 6 个事件类型中各添加一条 hook
-- **Codex**：设置 `~/.codex/config.toml` 中的 `notify` 字段（原有的 notify 命令会被备份并串联调用）
+- **Codex**：在 `~/.codex/hooks.json` 中添加 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`Stop` 事件 hook，并在 `~/.codex/config.toml` 中启用 hooks feature / trust state；同时保留 legacy `notify` 作为旧版 Codex 的兜底（原有 notify 命令会被备份并串联调用）
 
 ## 使用方法
 
@@ -90,12 +90,14 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status    
 每行显示内容：
 
 ```
-* [ BUSY ] claude  my-project                "implement the login page"  Bash: npm test
+* [ BUSY ] claude  app-window            my-project                "implement the login page"  Bash: npm test
 ```
 
 - `*` — 当前面板指示器
 - `[ WAIT ]` / `[ BUSY ]` / `[ DONE ]` / `[ IDLE ]` — 会话状态
+- `[ INT ]` / `[CRASH]` / `[STALE]` — 最近被打断、异常退出或过期的会话
 - Agent 类型（claude / codex）
+- tmux window 名称
 - 项目目录名
 - 会话标题（首条提示）
 - 当前工具详情（工作中的会话）
@@ -143,6 +145,36 @@ set -g @scout-status-format '{W} wait {B} busy'   # 带标签
 
 占位符：`{W}` 等待，`{B}` 工作中，`{D}` 已完成，`{I}` 空闲。
 
+### 可选 Watchdog
+
+默认情况下，tmux-scout 是被动的：hook 更新状态，picker / 状态栏刷新时做一次校正。如果希望即使不打开 picker、不刷新状态栏，也持续维护会话状态，可以启用 tmux 管理的 watchdog：
+
+```bash
+set -g @scout-watchdog on
+```
+
+这不是 launchd/systemd daemon，而是一个由 tmux 拥有的单实例 Node.js 进程；关闭选项或 tmux 不可用时会退出。watchdog 使用混合循环：
+
+- 每 2 秒做进程/pane 生命周期检查和 Codex JSONL 增量读取
+- 每 30 秒做 Codex JSONL 发现
+- 每 60 秒做一次全量 reconcile
+
+可选间隔，单位为秒：
+
+```bash
+set -g @scout-watchdog-interval 2
+set -g @scout-watchdog-discovery-interval 30
+set -g @scout-watchdog-full-interval 60
+```
+
+watchdog 诊断命令：
+
+```bash
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher status
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher once --full
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher stop
+```
+
 ## 数据存储
 
 会话数据存储在 `~/.tmux-scout/` 目录下：
@@ -153,19 +185,24 @@ set -g @scout-status-format '{W} wait {B} busy'   # 带标签
 ├── sessions/                        # 每个会话的 JSON 文件
 │   ├── {session-id}.json
 │   └── ...
+├── watcher.pid                      # 可选 watchdog 进程锁
+├── watcher-state.json               # 可选 watchdog JSONL offset/cache
+├── watcher.log                      # 可选 watchdog 诊断日志
+├── codex-hooks-manifest.json        # tmux-scout 管理的 Codex event hook trust key
 └── codex-original-notify.json       # 备份的原始 Codex notify 命令
 ```
 
 超过 24 小时的会话会被自动清理。
 
-## 已知问题
+## Codex 兼容说明
 
-Codex 的 hook 机制极其糟糕 — 只提供了一个 `notify` hook，且仅在每轮 agent 响应完成后触发（`agent-turn-complete`）。没有会话开始、没有会话结束、没有工具调用事件，什么都没有。这导致了两个问题：
+tmux-scout 现在优先使用 Codex event hook，可以近实时同步会话开始、提示提交、工具执行、审批等待和回合完成状态。这套生命周期跟踪方式参考了 Flux Desktop App 的实现。
 
-- **新会话无法跳转** — 在 Codex 完成第一次响应之前，tmux-scout 无法知道会话运行在哪个面板中。这些会话在选择器中显示为"未绑定"状态，在第一轮响应完成前无法跳转。
-- **会话信息不一致** — 会话开始、提示提交、工具调用、会话结束等关键事件在 Codex 的 hook 中完全缺失。这意味着会话状态可能是完全错误的 — 一个会话可能显示为"已完成"但 Codex 正在处理中，或者显示为"工作中"但实际早已结束。
+开启 `@scout-watchdog` 后，tmux-scout 仍以 hook 作为主状态源，并增加 Flux 风格的校正机制：进程/pane 生命周期检查、带 offset 缓存的 Codex transcript 尾部增量读取、较低频的 JSONL 发现，以及周期性全量 reconcile。快速路径不会反复全量读取所有 transcript。
 
-这些是 Codex hook 设计的根本性缺陷，而非 tmux-scout 的 bug。我们实现了多种补偿机制：通过轮询 JSONL 日志文件提前发现会话、通过进程存活检测识别崩溃、通过文件过期检测清理死亡会话、以及从 JSONL 中解析 pending tool call 状态。不过不用担心，tmux-scout 会将状态最终收敛到正确的状态。
+内部会把 hook、pane、transcript、PID、stale timeout 等观察结果统一交给 session-state reducer。短时间竞态里，高置信度的 hook/PID 事件会压过低置信度的 pane/transcript 观察；但 crash/stale 这类终止事件仍会关闭已经死亡的会话。
+
+如果使用的是只支持 `notify` 的旧版 Codex，tmux-scout 仍会安装并串联 legacy notify hook。在该兜底模式下，首轮完成前的新会话发现仍可能依赖 JSONL 轮询。
 
 ## 许可证
 

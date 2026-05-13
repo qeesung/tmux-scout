@@ -14,7 +14,7 @@ If you prefer a zero-dependency setup without needing a Node.js runtime, check o
 
 ## Features
 
-- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), project names, prompt titles, and live tool details
+- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux window names, project names, prompt titles, and live tool details
 - **Pane preview** — right-side preview panel shows the last 40 lines of each session's tmux pane
 - **Status bar widget** — displays session counts by status (e.g. `0|1|2`) in tmux's status-right, refreshed every 2 seconds
 - **Auto-refresh** — `Ctrl-T` toggles automatic picker reload every 2 seconds
@@ -72,7 +72,7 @@ The installer is **idempotent** — running it multiple times is safe. If you mo
 ### What gets modified
 
 - **Claude Code**: Adds a hook entry to each of the 6 event types in `~/.claude/settings.json`
-- **Codex**: Sets the `notify` field in `~/.codex/config.toml` (original notify command is backed up and chained)
+- **Codex**: Adds event hooks for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` in `~/.codex/hooks.json`, enables Codex hook features/trust state in `~/.codex/config.toml`, and keeps the legacy `notify` hook as a fallback for older Codex builds (original notify command is backed up and chained)
 
 ## Usage
 
@@ -90,12 +90,14 @@ Press `prefix + O` (default) to open the session picker.
 Each line shows:
 
 ```
-* [ BUSY ] claude  my-project                "implement the login page"  Bash: npm test
+* [ BUSY ] claude  app-window            my-project                "implement the login page"  Bash: npm test
 ```
 
 - `*` — current pane indicator
 - `[ WAIT ]` / `[ BUSY ]` / `[ DONE ]` / `[ IDLE ]` — session status
+- `[ INT ]` / `[CRASH]` / `[STALE]` — recently interrupted, crashed, or stale sessions
 - Agent type (claude / codex)
+- tmux window name
 - Project directory name
 - Session title (first prompt)
 - Current tool details (for working sessions)
@@ -143,6 +145,36 @@ set -g @scout-status-format '{W} wait {B} busy'   # with labels
 
 Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle.
 
+### Optional Watchdog
+
+By default, tmux-scout stays passive: hooks update state, while the picker/status widget reconcile on refresh. To keep session state current even when the picker/status bar is not refreshing, enable the tmux-managed watchdog:
+
+```bash
+set -g @scout-watchdog on
+```
+
+This is not a launchd/systemd daemon. It is a single tmux-owned Node.js process that exits when the option is turned off or tmux is gone. The watchdog uses a hybrid loop:
+
+- fast lifecycle/pane checks and incremental Codex JSONL reads every 2s
+- Codex JSONL discovery every 30s
+- full reconcile every 60s
+
+Optional intervals, in seconds:
+
+```bash
+set -g @scout-watchdog-interval 2
+set -g @scout-watchdog-discovery-interval 30
+set -g @scout-watchdog-full-interval 60
+```
+
+Watchdog diagnostics:
+
+```bash
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher status
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher once --full
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher stop
+```
+
 ## Data Storage
 
 Session data is stored in `~/.tmux-scout/`:
@@ -153,19 +185,24 @@ Session data is stored in `~/.tmux-scout/`:
 ├── sessions/                        # Per-session JSON files
 │   ├── {session-id}.json
 │   └── ...
+├── watcher.pid                      # Optional watchdog process lock
+├── watcher-state.json               # Optional watchdog JSONL offsets/cache
+├── watcher.log                      # Optional watchdog diagnostics
+├── codex-hooks-manifest.json        # Codex event hook trust keys owned by tmux-scout
 └── codex-original-notify.json       # Backup of original Codex notify command
 ```
 
 Sessions older than 24 hours are automatically cleaned up.
 
-## Known Issues
+## Codex Compatibility Notes
 
-Codex has an extremely poor hook mechanism — it only provides a single `notify` hook that fires after each agent turn completes (`agent-turn-complete`). No session start, no session end, no tool use events, nothing. This causes two issues:
+tmux-scout now prefers Codex's event hook mechanism, which gives near-real-time updates for session start, prompt submission, tool activity, approval waits, and turn completion. This is the same style of lifecycle tracking used by Flux Desktop App.
 
-- **Unable to jump to new sessions** — Before Codex completes its first response, tmux-scout has no way to know which pane the session is running in. These sessions appear as "unbound" in the picker and cannot be jumped to until the first turn finishes.
-- **Inconsistent session info** — Critical events like session start, prompt submission, tool use, and session end are completely missing from Codex's hook. This means session status can be outright wrong — a session may show as "completed" while Codex is actively processing, or show as "working" long after it has finished.
+When `@scout-watchdog` is enabled, tmux-scout keeps hooks as the primary state source and adds Flux-style reconciliation: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, lower-frequency JSONL discovery, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
 
-These are fundamental limitations of Codex's hook design, not bugs in tmux-scout. We have implemented several workarounds to compensate: JSONL log file polling for early session discovery, crash detection via process liveness checks, file staleness detection for dead sessions, and pending tool call tracking from JSONL parsing. But don't worry — tmux-scout will eventually converge to the correct state.
+Internally, hook, pane, transcript, PID, and stale-timeout observations are reduced through a shared session-state model. Higher-confidence hook/PID events win over lower-confidence pane/transcript observations for short races, while terminal crash/stale events still close dead sessions.
+
+For older Codex versions that only support `notify`, tmux-scout still installs and chains the legacy notify hook. In that fallback mode, first-turn discovery may still depend on JSONL polling until Codex emits a completion notification.
 
 ## License
 

@@ -5,6 +5,7 @@
 const fs = require('fs')
 const path = require('path')
 const { execSync } = require('child_process')
+const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
@@ -110,6 +111,7 @@ function isRecentlyTerminal(session, now) {
 
 function isActiveSession(session, panes, now = Date.now()) {
   if (!session) return false
+  if (isHiddenCodexSession(session)) return false
   if (isRecentlyTerminal(session, now)) return true
   if (session.endedAt || session.status === 'crashed' || session.status === 'stale') return false
 

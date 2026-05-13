@@ -1,15 +1,20 @@
 #!/usr/bin/env node
 // Sync session data: reconcile crashed processes and poll Codex JSONL state.
-// Writes results back to status.json. Should run before generate-lines.js.
+// Writes results back to status.json. Should run before rendering picker/status lines.
 
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const { execSync } = require('child_process')
+const { applySessionEvent, currentPhase } = require('../lib/session-state')
+const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental: readJsonlTailIncremental } = require('../lib/jsonl-tail-reader')
+const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-tree')
 
 let statusFile = process.argv[2] || ''
 let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') : ''
 const pidStateCache = new Map()
+const CODEX_TAIL_BYTES = DEFAULT_TAIL_BYTES
+const CODEX_STUCK_TOOL_MS = 180000
 
 // --- I/O helpers ---
 
@@ -43,7 +48,7 @@ function sessionFilePath(sessionId) {
 function getPaneSnapshot() {
   const panes = new Map()
   try {
-    const output = execSync('tmux list-panes -a -F "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}:#{window_name}"', {
+    const output = execSync('tmux list-panes -a -F "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_index}\t#{window_name}"', {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore']
     }).trim()
@@ -51,13 +56,16 @@ function getPaneSnapshot() {
     if (!output) return panes
 
     for (const line of output.split('\n')) {
-      const [paneId, panePid, currentCommand, paneDead] = line.split('\t')
+      const [paneId, panePid, currentCommand, paneDead, sessionName, windowIndex, windowName] = line.split('\t')
       if (paneId) {
         panes.set(paneId.trim(), {
           paneId: paneId.trim(),
           panePid: Number.parseInt(panePid, 10) || null,
           currentCommand: currentCommand || '',
-          paneDead: paneDead === '1'
+          paneDead: paneDead === '1',
+          sessionName: sessionName || '',
+          windowIndex: Number.parseInt(windowIndex, 10) || 0,
+          windowName: windowName || ''
         })
       }
     }
@@ -88,6 +96,10 @@ function getPidState(pid) {
   return state
 }
 
+function clearPidStateCache() {
+  pidStateCache.clear()
+}
+
 // --- Crash detection ---
 
 function isShellCommand(command) {
@@ -100,51 +112,112 @@ function canUseShellFallback(session) {
   return session.status === 'working' || lastEventType === 'prompt_submit' || lastEventType === 'tool_use' || Boolean(session.pendingToolUse)
 }
 
-function detectCrashReason(session, pane) {
-  if (!pane || pane.paneDead) return null
-
-  if (hasTrackedPid(session) && getPidState(session.pid) === 'dead') {
-    return `pid ${session.pid} exited while pane ${session.tmuxPane} remained open`
-  }
-
-  if (!hasTrackedPid(session) && canUseShellFallback(session) && isShellCommand(pane.currentCommand || '')) {
-    return `pane ${session.tmuxPane} returned to shell ${pane.currentCommand}`
-  }
-
-  return null
+function applySessionUpdate(status, sessionId, session, event) {
+  const result = applySessionEvent(session, event)
+  if (!result.changed) return false
+  status.sessions[sessionId] = session
+  writeJsonAtomic(sessionFilePath(sessionId), session)
+  return true
 }
 
-function reconcileSessions(status, panes) {
+function sweepPidBindings(status, panes, processTable) {
   const now = Date.now()
-  const changedSessions = new Map()
+  let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
     if (!session || session.endedAt || !pane) continue
 
-    const crashReason = detectCrashReason(session, pane)
-    if (!crashReason) continue
+    const phase = currentPhase(session)
+    if (phase !== 'running' && phase !== 'waitingForApproval' && phase !== 'waitingForAnswer') continue
 
-    const updatedSession = Object.assign({}, session, {
-      crashReason,
-      status: 'crashed',
-      endedAt: now,
-      needsAttention: null,
-      pendingToolUse: null,
-      lastEvent: { type: 'process_exit_detected', timestamp: now, details: crashReason },
-      lastUpdated: now
-    })
-    status.sessions[sessionId] = updatedSession
-    changedSessions.set(sessionId, updatedSession)
+    const agentProcess = findAgentProcessFromPane(pane.panePid, session.agentType, processTable)
+    if (!agentProcess || agentProcess.pid === session.pid) continue
+
+    session.pid = agentProcess.pid
+    session.pidSource = 'process-tree'
+    session.pidCommand = agentProcess.command
+    session.pidBoundAt = now
+    session.lastUpdated = now
+    writeJsonAtomic(sessionFilePath(sessionId), session)
+    changed = true
   }
 
-  if (changedSessions.size > 0) {
+  if (changed) {
     status.lastUpdated = now
-    for (const [sessionId, session] of changedSessions) {
-      writeJsonAtomic(sessionFilePath(sessionId), session)
-    }
     writeJsonAtomic(statusFile, status)
   }
+}
+
+function exitEventForSession(session, reason, source, now) {
+  const phase = currentPhase(session)
+  const active = phase === 'running' || phase === 'waitingForApproval' || phase === 'waitingForAnswer'
+  if (active) {
+    session.crashReason = reason
+    return {
+      type: 'process_exit_detected',
+      source,
+      timestamp: now,
+      reason,
+      details: reason,
+      force: true
+    }
+  }
+
+  session.staleReason = reason
+  return {
+    type: 'stale',
+    source,
+    timestamp: now,
+    reason,
+    details: reason,
+    force: true
+  }
+}
+
+function sweepDeadProcesses(status, panes) {
+  const now = Date.now()
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
+    if (!session || session.endedAt || !pane || !hasTrackedPid(session)) continue
+    if (getPidState(session.pid) !== 'dead') continue
+
+    const reason = `pid ${session.pid} exited while pane ${session.tmuxPane} remained open`
+    changed = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pid', now)) || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
+function sweepPaneReturnedToShell(status, panes) {
+  const now = Date.now()
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
+    if (!session || session.endedAt || !pane || hasTrackedPid(session)) continue
+    if (!canUseShellFallback(session) || !isShellCommand(pane.currentCommand || '')) continue
+
+    const reason = `pane ${session.tmuxPane} returned to shell ${pane.currentCommand}`
+    changed = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pane', now)) || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
+function reconcileSessions(status, panes) {
+  const processTable = readProcessTable()
+  sweepDeadProcesses(status, panes)
+  sweepPaneReturnedToShell(status, panes)
+  sweepPidBindings(status, panes, processTable)
 }
 
 // --- Codex JSONL helpers ---
@@ -199,83 +272,265 @@ function extractUserMessage(ev) {
   return null
 }
 
-function readCodexJsonl(jsonlPath) {
-  if (!jsonlPath) return null
-  try {
-    const content = fs.readFileSync(jsonlPath, 'utf-8')
-    const lines = content.split('\n').filter(l => l.trim())
-    if (lines.length === 0) return null
+function createCodexAccumulator(seed) {
+  const pendingCalls = Array.isArray(seed && seed.pendingCalls)
+    ? Array.from(new Set(seed.pendingCalls.filter(Boolean).map(String)))
+    : []
+  return {
+    lastUserTitle: seed && seed.lastUserTitle,
+    lastCompletedTs: Number.isFinite(seed && seed.lastCompletedTs) ? seed.lastCompletedTs : 0,
+    lastInterruptedTs: Number.isFinite(seed && seed.lastInterruptedTs) ? seed.lastInterruptedTs : 0,
+    lastUserTs: Number.isFinite(seed && seed.lastUserTs) ? seed.lastUserTs : 0,
+    cwd: seed && seed.cwd,
+    waitingForPlanConfirmation: Boolean(seed && seed.waitingForPlanConfirmation),
+    pendingCalls,
+    eventCount: Number.isFinite(seed && seed.eventCount) ? seed.eventCount : 0
+  }
+}
 
-    let lastUserTitle = undefined
-    let lastCompletedTs = 0
-    let lastUserTs = 0
-    let cwd = undefined
-    let waitingForPlanConfirmation = false
-    const pendingCalls = new Set()
+function eventTimestamp(ev, fallback = 0) {
+  if (!ev || !ev.timestamp) return fallback
+  const ts = new Date(ev.timestamp).getTime()
+  return Number.isFinite(ts) ? ts : fallback
+}
 
-    for (const line of lines) {
-      let ev
-      try { ev = JSON.parse(line) } catch (_) { continue }
+function applyCodexEvent(accumulator, ev) {
+  if (!ev || typeof ev !== 'object') return
+  const pendingCalls = new Set(accumulator.pendingCalls || [])
 
-      const userMsg = extractUserMessage(ev)
-      if (userMsg) {
-        lastUserTitle = userMsg
-        lastUserTs = ev.timestamp ? new Date(ev.timestamp).getTime() : 0
-        // User responded — no longer waiting for plan confirmation
-        waitingForPlanConfirmation = false
-      }
+  const userMsg = extractUserMessage(ev)
+  if (userMsg) {
+    accumulator.lastUserTitle = userMsg
+    accumulator.lastUserTs = eventTimestamp(ev, 0)
+    // User responded — no longer waiting for plan confirmation.
+    accumulator.waitingForPlanConfirmation = false
+  }
 
-      // Only task_complete is a true turn-end signal
-      // agent_message fires mid-turn (progress updates) and is NOT completion
-      if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'task_complete') {
-        lastCompletedTs = ev.timestamp ? new Date(ev.timestamp).getTime() : 0
-      }
+  // Only task_complete is a true turn-end signal.
+  // agent_message fires mid-turn (progress updates) and is NOT completion.
+  if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'task_complete') {
+    accumulator.lastCompletedTs = eventTimestamp(ev, 0)
+  }
 
-      // Detect plan mode completion — Codex is waiting for user to confirm/reject
-      if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'item_completed'
-        && ev.payload.item && ev.payload.item.type === 'Plan') {
-        waitingForPlanConfirmation = true
-      }
+  // Codex does not always emit Stop hooks on Ctrl-C / ESC interruption.
+  // The transcript records that as turn_aborted; treat it as a completed
+  // turn so interrupted sessions do not remain BUSY forever.
+  if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'turn_aborted'
+    && ev.payload.reason === 'interrupted') {
+    const interruptedTs = eventTimestamp(ev, Date.now())
+    accumulator.lastCompletedTs = interruptedTs
+    accumulator.lastInterruptedTs = interruptedTs
+  }
 
-      if (ev.type === 'turn_context' && ev.payload && ev.payload.cwd) {
-        cwd = ev.payload.cwd
-      }
+  // Detect plan mode completion — Codex is waiting for user to confirm/reject.
+  if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'item_completed'
+    && ev.payload.item && ev.payload.item.type === 'Plan') {
+    accumulator.waitingForPlanConfirmation = true
+  }
 
-      if (ev.type === 'response_item' && ev.payload) {
-        if (ev.payload.type === 'custom_tool_call' || ev.payload.type === 'function_call') {
-          if (ev.payload.call_id) pendingCalls.add(ev.payload.call_id)
-        }
-        if (ev.payload.type === 'custom_tool_call_output' || ev.payload.type === 'function_call_output') {
-          if (ev.payload.call_id) pendingCalls.delete(ev.payload.call_id)
-        }
-      }
+  if (ev.type === 'turn_context' && ev.payload && ev.payload.cwd) {
+    accumulator.cwd = ev.payload.cwd
+  }
+
+  if (ev.type === 'response_item' && ev.payload) {
+    if (ev.payload.type === 'custom_tool_call' || ev.payload.type === 'function_call') {
+      if (ev.payload.call_id) pendingCalls.add(String(ev.payload.call_id))
     }
+    if (ev.payload.type === 'custom_tool_call_output' || ev.payload.type === 'function_call_output') {
+      if (ev.payload.call_id) pendingCalls.delete(String(ev.payload.call_id))
+    }
+  }
 
-    let status = 'completed'
-    const now = Date.now()
+  accumulator.pendingCalls = Array.from(pendingCalls)
+  accumulator.eventCount = (accumulator.eventCount || 0) + 1
+}
 
-    if (waitingForPlanConfirmation && lastCompletedTs > 0) {
-      // Plan mode ended, waiting for user to confirm "Implement this plan?"
+function codexResultFromAccumulator(accumulator) {
+  const acc = createCodexAccumulator(accumulator)
+  let status = 'completed'
+  const now = Date.now()
+  const pendingCount = acc.pendingCalls.length
+
+  if (acc.waitingForPlanConfirmation && acc.lastCompletedTs > 0) {
+    // Plan mode ended, waiting for user to confirm "Implement this plan?"
+    status = 'needsAttention'
+  } else if (acc.lastInterruptedTs > 0 && acc.lastInterruptedTs >= acc.lastUserTs) {
+    status = 'interrupted'
+  } else if (pendingCount > 0) {
+    if (now - acc.lastCompletedTs > 30000 && now - acc.lastUserTs > 30000) {
       status = 'needsAttention'
-    } else if (pendingCalls.size > 0) {
-      if (now - lastCompletedTs > 30000 && now - lastUserTs > 30000) {
-        status = 'needsAttention'
-      } else {
-        status = 'working'
-      }
-    } else if (lastUserTs > lastCompletedTs) {
+    } else {
       status = 'working'
     }
+  } else if (acc.lastUserTs > acc.lastCompletedTs) {
+    status = 'working'
+  }
 
-    return { status, title: lastUserTitle || undefined, cwd }
-  } catch (_) {
-    return null
+  return {
+    status,
+    title: acc.lastUserTitle || undefined,
+    cwd: acc.cwd,
+    hasTimeline: Boolean(acc.lastUserTs || acc.lastCompletedTs || acc.lastInterruptedTs || pendingCount || acc.waitingForPlanConfirmation)
+  }
+}
+
+function readCodexJsonl(jsonlPath) {
+  if (!jsonlPath) return null
+  const parsed = readJsonlFile(jsonlPath)
+  if (!parsed || parsed.objects.length === 0) return null
+  const accumulator = createCodexAccumulator()
+  for (const ev of parsed.objects) applyCodexEvent(accumulator, ev)
+  return codexResultFromAccumulator(accumulator)
+}
+
+function readCodexJsonlIncremental(jsonlPath, fileState, options = {}) {
+  if (!jsonlPath) return null
+  const state = fileState || {}
+  const maxInitialBytes = options.maxInitialBytes || CODEX_TAIL_BYTES
+
+  const delta = readJsonlTailIncremental(jsonlPath, state, { maxInitialBytes })
+  if (!delta) return null
+
+  if (delta.reset || !state.accumulator) {
+    state.accumulator = createCodexAccumulator()
+  } else {
+    state.accumulator = createCodexAccumulator(state.accumulator)
+  }
+
+  for (const ev of delta.objects) applyCodexEvent(state.accumulator, ev)
+
+  return {
+    changed: delta.changed,
+    parsed: delta.parsed,
+    result: codexResultFromAccumulator(state.accumulator),
+    state
   }
 }
 
 // --- Codex session sync ---
 
-function syncCodexSessions(status, panes) {
+function recentCodexSessionDirs(now) {
+  const sessionsBase = path.join(os.homedir(), '.codex', 'sessions')
+  const today = new Date(now)
+  const yesterday = new Date(now - 86400000)
+  return [today, yesterday].map(d => path.join(sessionsBase, String(d.getFullYear()),
+    String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')))
+}
+
+function discoverCodexJsonlFiles(now) {
+  const sessionsBase = path.join(os.homedir(), '.codex', 'sessions')
+  if (!fs.existsSync(sessionsBase)) return []
+
+  const filesByThread = new Map()
+  for (const dir of recentCodexSessionDirs(now)) {
+    if (!fs.existsSync(dir)) continue
+    let files
+    try { files = fs.readdirSync(dir) } catch (_) { continue }
+
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue
+      const match = f.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)
+      if (!match) continue
+      const fp = path.join(dir, f)
+      if (!filesByThread.has(match[1])) filesByThread.set(match[1], fp)
+    }
+  }
+  return Array.from(filesByThread, ([threadId, filePath]) => ({ threadId, filePath }))
+}
+
+function applyCodexResultToSession(session, result, now) {
+  if (!session || !result) return false
+  let sessionChanged = false
+
+  // Recover PID from session file if hook has written it
+  // (sync.js reads status.json which may have stale pid: null due to race with hook)
+  if (!hasTrackedPid(session)) {
+    const fileData = readJson(sessionFilePath(session.sessionId), null)
+    if (fileData && hasTrackedPid(fileData)) {
+      session.pid = fileData.pid
+      sessionChanged = true
+    }
+  }
+
+  if (result.title && result.title !== session.sessionTitle) {
+    session.sessionTitle = result.title
+    sessionChanged = true
+  }
+
+  if (result.cwd && result.cwd !== session.workingDirectory) {
+    session.workingDirectory = result.cwd
+    sessionChanged = true
+  }
+
+  if (result.hasTimeline === false) return sessionChanged
+
+  const phase = result.status === 'needsAttention' ? 'waitingForApproval'
+    : result.status === 'working' ? 'running'
+    : result.status === 'completed' ? 'completed'
+    : result.status === 'interrupted' ? 'interrupted'
+    : null
+  const eventResult = applySessionEvent(session, {
+    type: result.status === 'interrupted' ? 'interrupted' : 'transcript_status',
+    source: 'transcript',
+    timestamp: now,
+    phase,
+    status: result.status,
+    attentionReason: result.status === 'needsAttention' ? 'waiting for approval' : null,
+    reason: result.status === 'interrupted' ? 'Codex transcript recorded turn_aborted/interrupted' : 'Codex transcript status',
+    details: result.status,
+    updates: {
+      stateSource: session.stateSource || 'codex-jsonl'
+    }
+  })
+  sessionChanged = eventResult.changed || sessionChanged
+
+  return sessionChanged
+}
+
+function addDiscoveredCodexSession(status, threadId, filePath, fileStat, result, now) {
+  const session = {
+    sessionId: threadId,
+    agentType: 'codex',
+    startedAt: fileStat.birthtimeMs || now,
+    status: 'idle',
+    endedAt: null,
+    needsAttention: null,
+    pendingToolUse: null,
+    workingDirectory: result.cwd || '',
+    sessionTitle: result.title,
+    threadId,
+    transcriptPath: filePath,
+    tmuxPane: null,
+    pid: null,
+    stateSource: 'codex-jsonl',
+    lastEvent: { type: 'discovered', timestamp: now },
+    lastUpdated: now
+  }
+  applyCodexResultToSession(session, result, now)
+  status.sessions[threadId] = session
+}
+
+function markUnboundCodexStale(session, jsonlPath, now) {
+  if (session.tmuxPane || hasTrackedPid(session) || !jsonlPath) return false
+  try {
+    const mtime = fs.statSync(jsonlPath).mtimeMs
+    if (now - mtime <= 300000) return false
+    session.staleReason = 'JSONL file inactive — Codex process likely exited before hook fired'
+    applySessionEvent(session, {
+      type: 'stale',
+      source: 'stale',
+      timestamp: now,
+      reason: session.staleReason,
+      details: 'JSONL stale for unbound session',
+      force: true
+    })
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+function syncCodexSessionsFull(status, panes) {
   const sessionsBase = path.join(os.homedir(), '.codex', 'sessions')
   if (!fs.existsSync(sessionsBase)) return
 
@@ -288,63 +543,25 @@ function syncCodexSessions(status, panes) {
     if (s.agentType === 'codex' && s.threadId) knownThreadIds.add(s.threadId)
   }
 
-  const today = new Date(now)
-  const yesterday = new Date(now - 86400000)
-
   // Shared caches between Phase 1 and Phase 2
-  const jsonlPathCache = new Map()   // threadId → jsonlPath
-  const jsonlResultCache = new Map() // jsonlPath → result
+  const jsonlPathCache = new Map()   // threadId -> jsonlPath
+  const jsonlResultCache = new Map() // jsonlPath -> result
 
-  for (const d of [today, yesterday]) {
-    const dir = path.join(sessionsBase, String(d.getFullYear()),
-      String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'))
-    if (!fs.existsSync(dir)) continue
-    let files
-    try { files = fs.readdirSync(dir) } catch (_) { continue }
+  for (const { threadId, filePath } of discoverCodexJsonlFiles(now)) {
+    if (!jsonlPathCache.has(threadId)) jsonlPathCache.set(threadId, filePath)
+    if (knownThreadIds.has(threadId)) continue
 
-    for (const f of files) {
-      if (!f.endsWith('.jsonl')) continue
+    let fstat
+    try { fstat = fs.statSync(filePath) } catch (_) { continue }
+    if (now - fstat.mtimeMs > 300000) continue
 
-      const match = f.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)
-      if (!match) continue
-      const threadId = match[1]
+    const result = readCodexJsonl(filePath)
+    if (!result || !result.hasTimeline) continue
 
-      const fp = path.join(dir, f)
-
-      // Cache path for Phase 2 lookups
-      if (!jsonlPathCache.has(threadId)) jsonlPathCache.set(threadId, fp)
-
-      if (knownThreadIds.has(threadId)) continue
-
-      let fstat
-      try { fstat = fs.statSync(fp) } catch (_) { continue }
-      if (now - fstat.mtimeMs > 300000) continue
-
-      const result = readCodexJsonl(fp)
-      if (!result) continue
-
-      // Cache result for Phase 2
-      jsonlResultCache.set(fp, result)
-
-      status.sessions[threadId] = {
-        sessionId: threadId,
-        agentType: 'codex',
-        startedAt: fstat.birthtimeMs || now,
-        status: result.status,
-        endedAt: null,
-        needsAttention: result.status === 'needsAttention' ? 'waiting' : null,
-        pendingToolUse: null,
-        workingDirectory: result.cwd || '',
-        sessionTitle: result.title,
-        threadId,
-        tmuxPane: null,
-        pid: null,
-        lastEvent: { type: 'discovered', timestamp: now },
-        lastUpdated: now
-      }
-      knownThreadIds.add(threadId)
-      changed = true
-    }
+    jsonlResultCache.set(filePath, result)
+    addDiscoveredCodexSession(status, threadId, filePath, fstat, result, now)
+    knownThreadIds.add(threadId)
+    changed = true
   }
 
   // Phase 2: enrich existing sessions from JSONL (using caches)
@@ -352,75 +569,145 @@ function syncCodexSessions(status, panes) {
     if (session.agentType !== 'codex' || session.endedAt) continue
     const threadId = session.threadId || session.sessionId
 
-    const jsonlPath = jsonlPathCache.get(threadId) || findCodexJsonl(threadId)
+    const jsonlPath = session.transcriptPath || jsonlPathCache.get(threadId) || findCodexJsonl(threadId)
+    if (jsonlPath && jsonlPath !== session.transcriptPath) {
+      session.transcriptPath = jsonlPath
+      writeJsonAtomic(sessionFilePath(session.sessionId), session)
+      changed = true
+    }
 
     // Unbound sessions (no pane/PID): detect stale JSONL as process death.
     // If the JSONL file hasn't been written to for over 2 minutes, the Codex
     // process is no longer running — mark crashed.
-    if (!session.tmuxPane && !hasTrackedPid(session) && jsonlPath) {
-      try {
-        const mtime = fs.statSync(jsonlPath).mtimeMs
-        if (now - mtime > 300000) {
-          Object.assign(session, {
-            status: 'crashed',
-            endedAt: now,
-            needsAttention: null,
-            pendingToolUse: null,
-            crashReason: 'JSONL file inactive — Codex process likely exited before hook fired',
-            lastEvent: { type: 'process_exit_detected', timestamp: now, details: 'JSONL stale for unbound session' },
-            lastUpdated: now
-          })
-          writeJsonAtomic(sessionFilePath(session.sessionId), session)
-          changed = true
-          continue
-        }
-      } catch (_) {}
+    if (markUnboundCodexStale(session, jsonlPath, now)) {
+      writeJsonAtomic(sessionFilePath(session.sessionId), session)
+      changed = true
+      continue
     }
 
     const result = jsonlResultCache.get(jsonlPath) || readCodexJsonl(jsonlPath)
     if (!result) continue
 
-    let sessionChanged = false
-
-    // Recover PID from session file if hook has written it
-    // (sync.js reads status.json which may have stale pid: null due to race with hook)
-    if (!hasTrackedPid(session)) {
-      const fileData = readJson(sessionFilePath(session.sessionId), null)
-      if (fileData && hasTrackedPid(fileData)) {
-        session.pid = fileData.pid
-        sessionChanged = true
-      }
-    }
-
-    if (result.title && result.title !== session.sessionTitle) {
-      session.sessionTitle = result.title
-      sessionChanged = true
-    }
-
-    let newStatus = session.status
-    let newNeedsAttention = session.needsAttention
-    if (result.status === 'needsAttention') {
-      newStatus = 'working'
-      newNeedsAttention = 'waiting for approval'
-    } else if (result.status === 'working') {
-      newStatus = 'working'
-      newNeedsAttention = null
-    } else if (result.status === 'completed') {
-      newStatus = 'completed'
-      newNeedsAttention = null
-    }
-
-    if (newStatus !== session.status || newNeedsAttention !== session.needsAttention) {
-      session.status = newStatus
-      session.needsAttention = newNeedsAttention
-      session.lastUpdated = now
-      sessionChanged = true
-    }
-
-    if (sessionChanged) {
+    if (applyCodexResultToSession(session, result, now)) {
       writeJsonAtomic(sessionFilePath(session.sessionId), session)
       changed = true
     }
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
+function getCodexWatcherFilesState(watcherState) {
+  if (!watcherState || typeof watcherState !== 'object') return null
+  if (!watcherState.codexFiles || typeof watcherState.codexFiles !== 'object') {
+    watcherState.codexFiles = {}
+  }
+  return watcherState.codexFiles
+}
+
+function syncCodexSessionsIncremental(status, panes, options = {}) {
+  const sessionsBase = path.join(os.homedir(), '.codex', 'sessions')
+  if (!fs.existsSync(sessionsBase)) return
+
+  const now = Date.now()
+  const filesState = getCodexWatcherFilesState(options.watcherState)
+  if (!filesState) return
+
+  let changed = false
+  const knownThreadIds = new Set()
+  const jsonlPathCache = new Map()
+
+  for (const s of Object.values(status.sessions || {})) {
+    if (s.agentType === 'codex' && s.threadId) knownThreadIds.add(s.threadId)
+  }
+
+  if (options.discoverCodex) {
+    for (const { threadId, filePath } of discoverCodexJsonlFiles(now)) {
+      if (!jsonlPathCache.has(threadId)) jsonlPathCache.set(threadId, filePath)
+      if (knownThreadIds.has(threadId)) continue
+
+      let fstat
+      try { fstat = fs.statSync(filePath) } catch (_) { continue }
+      if (now - fstat.mtimeMs > 300000) continue
+
+      const fileState = filesState[filePath] || {}
+      const delta = readCodexJsonlIncremental(filePath, fileState)
+      filesState[filePath] = fileState
+      if (!delta || !delta.result || !delta.result.hasTimeline) continue
+
+      addDiscoveredCodexSession(status, threadId, filePath, fstat, delta.result, now)
+      knownThreadIds.add(threadId)
+      changed = true
+    }
+  }
+
+  for (const session of Object.values(status.sessions || {})) {
+    if (session.agentType !== 'codex' || session.endedAt) continue
+    const threadId = session.threadId || session.sessionId
+    const jsonlPath = session.transcriptPath || jsonlPathCache.get(threadId) || findCodexJsonl(threadId)
+
+    if (!jsonlPath) continue
+    if (jsonlPath !== session.transcriptPath) {
+      session.transcriptPath = jsonlPath
+      writeJsonAtomic(sessionFilePath(session.sessionId), session)
+      changed = true
+    }
+
+    if (markUnboundCodexStale(session, jsonlPath, now)) {
+      writeJsonAtomic(sessionFilePath(session.sessionId), session)
+      changed = true
+      continue
+    }
+
+    const fileState = filesState[jsonlPath] || {}
+    const delta = readCodexJsonlIncremental(jsonlPath, fileState)
+    filesState[jsonlPath] = fileState
+    if (!delta || !delta.changed || !delta.result) continue
+
+    if (applyCodexResultToSession(session, delta.result, now)) {
+      writeJsonAtomic(sessionFilePath(session.sessionId), session)
+      changed = true
+    }
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
+function syncCodexSessions(status, panes, options = {}) {
+  if (options.codexMode === 'none') return
+  if (options.codexMode === 'incremental') {
+    syncCodexSessionsIncremental(status, panes, options)
+    return
+  }
+  syncCodexSessionsFull(status, panes)
+}
+
+function sweepStuckCodexTools(status) {
+  const now = Date.now()
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (!session || session.agentType !== 'codex' || session.endedAt) continue
+    if (!session.pendingToolUse || !Number.isFinite(session.pendingToolUse.timestamp)) continue
+    if (now - session.pendingToolUse.timestamp < CODEX_STUCK_TOOL_MS) continue
+
+    const phase = currentPhase(session)
+    if (phase !== 'running' || session.needsAttention) continue
+
+    changed = applySessionUpdate(status, sessionId, session, {
+      type: 'interrupted',
+      source: 'transcript',
+      timestamp: now,
+      reason: `pending tool exceeded ${Math.round(CODEX_STUCK_TOOL_MS / 1000)}s without completion`,
+      details: session.pendingToolUse.details || session.pendingToolUse.tool || 'stuck tool',
+      force: false
+    }) || changed
   }
 
   if (changed) {
@@ -527,43 +814,29 @@ function detectPaneState(paneId, agentType) {
 
 function applyPaneGroundTruth(status) {
   let changed = false
-  for (const session of Object.values(status.sessions || {})) {
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (!session.tmuxPane || session.endedAt) continue
 
     const state = detectPaneState(session.tmuxPane, session.agentType)
     if (state === null) continue
 
-    let sessionChanged = false
-    switch (state) {
-      case 'needsAttention':
-        if (session.needsAttention !== 'waiting for approval') {
-          session.needsAttention = 'waiting for approval'
-          sessionChanged = true
-        }
-        break
-      case 'working':
-        if (session.needsAttention || session.pendingToolUse || session.status !== 'working') {
-          session.needsAttention = null
-          session.pendingToolUse = null
-          if (session.status !== 'working') session.status = 'working'
-          sessionChanged = true
-        }
-        break
-      case 'completed':
-        if (session.needsAttention || session.pendingToolUse || session.status !== 'completed') {
-          session.needsAttention = null
-          session.pendingToolUse = null
-          session.status = 'completed'
-          sessionChanged = true
-        }
-        break
-    }
+    const now = Date.now()
+    const phase = state === 'needsAttention' ? 'waitingForApproval'
+      : state === 'working' ? 'running'
+      : state === 'completed' ? 'completed'
+      : null
+    if (!phase) continue
 
-    if (sessionChanged) {
-      session.lastUpdated = Date.now()
-      writeJsonAtomic(sessionFilePath(session.sessionId), session)
-      changed = true
-    }
+    changed = applySessionUpdate(status, sessionId, session, {
+      type: 'pane_state',
+      source: 'pane',
+      timestamp: now,
+      phase,
+      status: state,
+      attentionReason: state === 'needsAttention' ? 'waiting for approval' : null,
+      reason: `pane ${session.tmuxPane} tail matched ${state}`,
+      details: state
+    }) || changed
   }
 
   if (changed) {
@@ -574,7 +847,26 @@ function applyPaneGroundTruth(status) {
 
 // --- Main ---
 
-function run(file) {
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return Boolean(error && error.code === 'EPERM')
+  }
+}
+
+function isWatcherRunning() {
+  const pidFile = path.join(os.homedir(), '.tmux-scout', 'watcher.pid')
+  const lock = readJson(pidFile, null)
+  const pid = Number.parseInt(lock && lock.pid, 10)
+  return isPidAlive(pid)
+}
+
+function run(file, options = {}) {
+  clearPidStateCache()
+
   if (file) {
     statusFile = file
     sessionsDir = path.join(path.dirname(file), 'sessions')
@@ -582,13 +874,14 @@ function run(file) {
   if (!statusFile) return { status: null, panes: new Map() }
   const status = readJson(statusFile, { version: 1, lastUpdated: Date.now(), sessions: {} })
   const panes = getPaneSnapshot()
-  reconcileSessions(status, panes)
-  syncCodexSessions(status, panes)
-  applyPaneGroundTruth(status)
+  if (options.reconcile !== false) reconcileSessions(status, panes)
+  syncCodexSessions(status, panes, options)
+  if (options.stuckSweep !== false) sweepStuckCodexTools(status)
+  if (options.paneGroundTruth !== false) applyPaneGroundTruth(status)
   return { status, panes }
 }
 
-module.exports = { run }
+module.exports = { run, isWatcherRunning, clearPidStateCache }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

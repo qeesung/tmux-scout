@@ -17,16 +17,20 @@ const sync = require(path.join(__dirname, 'picker', 'sync'))
 const { getActiveSessions } = require(path.join(__dirname, 'picker', 'render'))
 
 let cached
-try { cached = sync.run(STATUS_FILE) } catch (_) {}
+try {
+  const watcherRunning = sync.isWatcherRunning()
+  cached = sync.run(STATUS_FILE, watcherRunning
+    ? { reconcile: false, codexMode: 'none', paneGroundTruth: false, stuckSweep: false }
+    : {})
+} catch (_) {}
 if (!cached || !cached.status) process.exit(0)
 
 const active = getActiveSessions(cached.status, cached.panes)
 
-const now = Date.now()
 let wait = 0, busy = 0, done = 0, idle = 0
 
 for (const s of active) {
-  if (s.needsAttention || (s.pendingToolUse && s.pendingToolUse.timestamp && now - s.pendingToolUse.timestamp > 5000)) {
+  if (s.needsAttention) {
     wait++
   } else if (s.status === 'working') {
     busy++

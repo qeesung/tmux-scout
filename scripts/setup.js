@@ -2,6 +2,8 @@
 // tmux-scout unified hook setup
 // Usage: node setup.js <install|uninstall|status> [--claude] [--codex] [--quiet]
 
+const path = require('path')
+const { spawnSync } = require('child_process')
 const claude = require('./setup/claude')
 const codex = require('./setup/codex')
 
@@ -48,15 +50,20 @@ function doInstall() {
 
   if (runCodex) {
     console.log()
-    console.log(c.cyan('Codex') + c.dim(' (~/.codex/config.toml)'))
+    console.log(c.cyan('Codex') + c.dim(' (~/.codex/hooks.json + config.toml)'))
     const r = codex.install()
     if (r.skipped) {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
     } else {
-      const icon = r.action === 'ok' ? c.green('✓') : r.action === 'updated' ? c.yellow('↻') : c.green('✓')
-      const label = r.action === 'ok' ? 'already installed' : r.action === 'updated' ? 'path updated' : 'hook installed'
-      const extra = r.hasOriginalNotify ? c.dim(' (original notify preserved)') : ''
-      console.log(`  ${icon} notify ${label}${extra}`)
+      for (const { event, action } of r.modern.results) {
+        const icon = action === 'ok' ? c.green('✓') : action === 'updated' ? c.yellow('↻') : c.green('✓')
+        const label = action === 'ok' ? 'already installed' : action === 'updated' ? 'path updated' : 'hook installed'
+        console.log(`  ${icon} ${event.padEnd(17)} ${label}`)
+      }
+      const legacyIcon = r.legacy.action === 'ok' ? c.green('✓') : r.legacy.action === 'updated' ? c.yellow('↻') : c.green('✓')
+      const legacyLabel = r.legacy.action === 'ok' ? 'already installed' : r.legacy.action === 'updated' ? 'path updated' : 'fallback hook installed'
+      const extra = r.legacy.hasOriginalNotify ? c.dim(' (original notify preserved)') : ''
+      console.log(`  ${legacyIcon} ${'notify'.padEnd(17)} ${legacyLabel}${extra}`)
     }
   }
 
@@ -86,14 +93,17 @@ function doUninstall() {
 
   if (runCodex) {
     console.log()
-    console.log(c.cyan('Codex') + c.dim(' (~/.codex/config.toml)'))
+    console.log(c.cyan('Codex') + c.dim(' (~/.codex/hooks.json + config.toml)'))
     const r = codex.uninstall()
     if (r.skipped) {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
     } else {
-      const icon = r.action === 'removed' ? c.red('✗') : c.dim('·')
-      const label = r.action === 'removed' ? 'removed' : 'not installed'
-      console.log(`  ${icon} notify ${label}`)
+      const modernIcon = r.modern.action === 'removed' ? c.red('✗') : c.dim('·')
+      const modernLabel = r.modern.action === 'removed' ? 'removed' : 'not installed'
+      console.log(`  ${modernIcon} ${'event hooks'.padEnd(17)} ${modernLabel}`)
+      const legacyIcon = r.legacy.action === 'removed' ? c.red('✗') : c.dim('·')
+      const legacyLabel = r.legacy.action === 'removed' ? 'removed' : 'not installed'
+      console.log(`  ${legacyIcon} ${'notify'.padEnd(17)} ${legacyLabel}`)
     }
   }
 
@@ -132,11 +142,26 @@ function doStatus() {
     if (!r.available) {
       // Codex not installed — not a problem
       if (!quiet) console.log(c.dim('Codex: not installed'))
-    } else if (r.installed) {
-      if (!quiet) console.log(c.green('Codex') + ': hook installed ' + c.green('✓'))
+    } else if (r.modern.installed) {
+      if (!quiet) console.log(c.green('Codex') + `: ${r.modern.installedEvents}/${r.modern.totalEvents} event hooks installed ` + c.green('✓'))
+    } else if (r.modern.installedEvents === r.modern.totalEvents) {
+      allOk = false
+      if (!quiet) console.log(c.yellow('Codex') + ': event hooks installed but config/trust state is incomplete')
+    } else if (r.legacy.installed) {
+      allOk = false
+      if (!quiet) console.log(c.yellow('Codex') + ': legacy notify hook installed (event hooks missing)')
     } else {
       allOk = false
       if (!quiet) console.log(c.yellow('Codex') + ': hook not installed')
+    }
+    if (!quiet && r.available && r.modern && r.modern.missing && r.modern.missing.length > 0) {
+      console.log(c.dim('  Missing event hooks: ' + r.modern.missing.join(', ')))
+    }
+    if (!quiet && r.available && r.modern && !r.modern.featuresEnabled && r.modern.installedEvents === r.modern.totalEvents) {
+      console.log(c.dim('  Missing config: [features].hooks = true'))
+    }
+    if (!quiet && r.available && r.modern && r.modern.missingTrust && r.modern.missingTrust.length > 0) {
+      console.log(c.dim('  Missing trust state entries: ' + r.modern.missingTrust.length))
     }
   }
 
@@ -145,9 +170,20 @@ function doStatus() {
   if (!allOk) process.exit(1)
 }
 
+function doWatcher() {
+  const commandIndex = args.indexOf(command)
+  const watcherArgs = args.slice(commandIndex + 1)
+  if (watcherArgs.length === 0) watcherArgs.push('status')
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'watcher.js'), ...watcherArgs], {
+    stdio: 'inherit'
+  })
+  process.exit(result.status || 0)
+}
+
 // Main dispatch
-if (!command || !['install', 'uninstall', 'status'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status> [--claude] [--codex] [--quiet]')
+if (!command || !['install', 'uninstall', 'status', 'watcher', 'watchdog'].includes(command)) {
+  console.log('Usage: node setup.js <install|uninstall|status|watcher> [--claude] [--codex] [--quiet]')
+  console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
   process.exit(command ? 1 : 0)
 }
 
@@ -155,6 +191,7 @@ try {
   if (command === 'install') doInstall()
   else if (command === 'uninstall') doUninstall()
   else if (command === 'status') doStatus()
+  else if (command === 'watcher' || command === 'watchdog') doWatcher()
 } catch (e) {
   console.error('Error: ' + e.message)
   process.exit(1)

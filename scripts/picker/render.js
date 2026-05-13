@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Pure view layer: read status.json and output formatted lines for fzf picker.
-// All data mutation (crash detection, Codex sync) happens in sync-sessions.js.
+// All data mutation (crash detection, Codex sync) happens in sync.js.
 
 const fs = require('fs')
 const path = require('path')
@@ -10,6 +10,7 @@ let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
 
 const pidStateCache = new Map()
+const TERMINAL_DISPLAY_MS = 5 * 60 * 1000
 
 function readJson(filePath, fallback) {
   try {
@@ -23,7 +24,7 @@ function readJson(filePath, fallback) {
 function getPaneSnapshot() {
   const panes = new Map()
   try {
-    const output = execSync('tmux list-panes -a -F "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}"', {
+    const output = execSync('tmux list-panes -a -F "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_index}\t#{window_name}"', {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore']
     }).trim()
@@ -31,13 +32,16 @@ function getPaneSnapshot() {
     if (!output) return panes
 
     for (const line of output.split('\n')) {
-      const [paneId, panePid, currentCommand, paneDead] = line.split('\t')
+      const [paneId, panePid, currentCommand, paneDead, sessionName, windowIndex, windowName] = line.split('\t')
       if (paneId) {
         panes.set(paneId.trim(), {
           paneId: paneId.trim(),
           panePid: Number.parseInt(panePid, 10) || null,
           currentCommand: currentCommand || '',
-          paneDead: paneDead === '1'
+          paneDead: paneDead === '1',
+          sessionName: sessionName || '',
+          windowIndex: Number.parseInt(windowIndex, 10) || 0,
+          windowName: windowName || ''
         })
       }
     }
@@ -78,23 +82,33 @@ function canUseShellFallback(session) {
 
 function isNeedsAttention(session, now) {
   if (session.needsAttention) return true
-  if (session.pendingToolUse && session.pendingToolUse.timestamp && (now - session.pendingToolUse.timestamp > 5000)) {
-    return true
-  }
   return false
 }
 
 function groupOrder(session, now) {
   if (isNeedsAttention(session, now)) return 0
   if (session.status === 'working') return 1
-  if (session.status === 'completed') return 2
-  return 3
+  if (session.status === 'interrupted') return 2
+  if (session.status === 'completed') return 3
+  if (session.status === 'crashed' || session.status === 'stale') return 4
+  return 5
 }
 
-function isActiveSession(session, panes) {
-  if (!session || session.endedAt || session.status === 'crashed') {
-    return false
-  }
+function isTerminalSession(session) {
+  return session && (session.status === 'crashed' || session.status === 'stale' || session.status === 'interrupted')
+}
+
+function isRecentlyTerminal(session, now) {
+  if (!isTerminalSession(session)) return false
+  const ts = session.endedAt || session.lastUpdated || 0
+  return ts > 0 && now - ts < TERMINAL_DISPLAY_MS
+}
+
+function isActiveSession(session, panes, now = Date.now()) {
+  if (!session) return false
+  if (isRecentlyTerminal(session, now)) return true
+  if (session.endedAt || session.status === 'crashed' || session.status === 'stale') return false
+
   // Discovered from JSONL but hook hasn't fired yet — no pane bound
   if (!session.tmuxPane) {
     return true
@@ -115,8 +129,9 @@ function isActiveSession(session, panes) {
 function getActiveSessions(status, panes) {
   const byPane = new Map()
   const unbound = []
+  const now = Date.now()
   for (const session of Object.values(status.sessions || {})) {
-    if (!isActiveSession(session, panes)) continue
+    if (!isActiveSession(session, panes, now)) continue
     if (!session.tmuxPane) {
       unbound.push(session)
       continue
@@ -129,28 +144,41 @@ function getActiveSessions(status, panes) {
   return Array.from(byPane.values()).concat(unbound)
 }
 
+function truncatePad(value, width) {
+  const text = String(value || '?').replace(/[\r\n\t]+/g, ' ')
+  return (text.length > width ? text.slice(0, width - 1) + '~' : text).padEnd(width)
+}
+
 function formatLine(session, now, currentPane) {
   const unbound = !session.tmuxPane
+  const pane = unbound ? null : session._tmuxPaneSnapshot
 
   const tag = isNeedsAttention(session, now) ? '\x1b[31m[ WAIT ]\x1b[0m'
     : session.status === 'working' ? '\x1b[33m[ BUSY ]\x1b[0m'
+    : session.status === 'interrupted' ? '\x1b[35m[ INT  ]\x1b[0m'
+    : session.status === 'crashed' ? '\x1b[31m[CRASH]\x1b[0m'
+    : session.status === 'stale' ? '\x1b[90m[STALE]\x1b[0m'
     : session.status === 'completed' ? '\x1b[32m[ DONE ]\x1b[0m'
     : '\x1b[34m[ IDLE ]\x1b[0m'
 
   const isCurrent = !unbound && currentPane && session.tmuxPane === currentPane
   const cur = isCurrent ? '\x1b[33m*\x1b[0m' : ' '
   const agent = session.agentType === 'codex' ? '\x1b[38;5;114mcodex \x1b[0m' : '\x1b[38;5;209mclaude\x1b[0m'
-  const projectName = path.basename(session.workingDirectory || '?')
-  const project = (projectName.length > 25 ? projectName.slice(0, 24) + '~' : projectName).padEnd(25)
+  const windowName = pane && pane.windowName ? pane.windowName : session.tmuxWindowName || '-'
+  const window = truncatePad(windowName, 22)
+  const project = truncatePad(path.basename(session.workingDirectory || '?'), 25)
   const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
-  const detail = unbound
+  const terminalReason = session.crashReason || session.staleReason || session.stateReason
+  const detail = isTerminalSession(session) && terminalReason
+    ? `  \x1b[2m${String(terminalReason).replace(/[\r\n]+/g, ' ').slice(0, 55)}\x1b[0m`
+    : unbound
     ? `  \x1b[2m(pane not yet linked — waiting for first response)\x1b[0m`
     : session.pendingToolUse && session.pendingToolUse.details
       ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n]+/g, ' ').slice(0, 40)}\x1b[0m`
       : ''
 
   const paneId = session.tmuxPane || 'UNBOUND'
-  return `${paneId}\t${cur} ${tag} ${agent} ${project} ${title}${detail}`
+  return `${paneId}\t${cur} ${tag} ${agent} ${window} ${project} ${title}${detail}`
 }
 
 function run(file, pane, cached) {
@@ -163,6 +191,9 @@ function run(file, pane, cached) {
   const now = Date.now()
 
   const active = getActiveSessions(status, panes)
+  for (const session of active) {
+    session._tmuxPaneSnapshot = session.tmuxPane ? panes.get(session.tmuxPane) : null
+  }
   active.sort((left, right) => {
     const g = groupOrder(left, now) - groupOrder(right, now)
     if (g !== 0) return g
@@ -170,8 +201,9 @@ function run(file, pane, cached) {
   })
 
   const hStatus = 'STATUS '.padEnd(8)
+  const hWindow = 'WINDOW'.padEnd(22)
   const hProject = 'PROJECT'.padEnd(25)
-  console.log(`_\t  ${hStatus} AGENT  ${hProject} TITLE`)
+  console.log(`_\t  ${hStatus} AGENT  ${hWindow} ${hProject} TITLE`)
 
   if (active.length === 0) {
     console.log('NONE\tNo active sessions found.')

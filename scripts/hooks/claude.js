@@ -5,6 +5,7 @@
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const { applySessionEvent } = require('../lib/session-state')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
@@ -57,7 +58,26 @@ function updateSession(sessionId, updates) {
     }
   } catch (e) {}
 
-  Object.assign(session, updates, { lastUpdated: Date.now() })
+  const lifecycleEvent = updates.lifecycleEvent || (updates.lastEvent ? {
+    type: updates.lastEvent.type,
+    source: 'hook',
+    stateSource: updates.stateSource || 'claude-hooks',
+    timestamp: updates.lastEvent.timestamp,
+    details: updates.lastEvent.details,
+    attentionReason: updates.needsAttention || null,
+    pendingToolUse: updates.pendingToolUse,
+    endedAt: updates.endedAt,
+    force: true
+  } : null)
+  delete updates.lifecycleEvent
+
+  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'endedAt', 'stateSource', 'lastEvent'])
+  for (const [key, value] of Object.entries(updates)) {
+    if (lifecycleEvent && lifecycleFields.has(key)) continue
+    if (value !== undefined) session[key] = value
+  }
+  session.lastUpdated = Date.now()
+  if (lifecycleEvent) applySessionEvent(session, lifecycleEvent)
   writeStatusAtomic(sessionFile, session)
 
   const status = readStatus()
@@ -186,6 +206,16 @@ async function main() {
         needsAttention: needsAttention ? tool_name : null,
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
         lastEvent: { type: 'tool_use', timestamp: now, details: toolDetails },
+        lifecycleEvent: needsAttention ? {
+          type: tool_name && tool_name.includes('AskUserQuestion') ? 'question_asked' : 'permission_request',
+          source: 'hook',
+          stateSource: 'claude-hooks',
+          timestamp: now,
+          details: toolDetails,
+          attentionReason: tool_name && tool_name.includes('AskUserQuestion') ? 'waiting for answer' : 'waiting for approval',
+          pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
+          force: true
+        } : undefined,
         tmuxPane,
         pid
       }))
@@ -196,6 +226,7 @@ async function main() {
       updateSession(session_id, liveSessionState({
         status: 'working',
         pendingToolUse: null,
+        lastEvent: { type: 'post_tool_use', timestamp: now },
         tmuxPane,
         pid
       }))

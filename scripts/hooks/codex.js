@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-// tmux-scout Codex notify hook
-// Tracks Codex session status with tmux pane mapping
+// tmux-scout Codex hook
+// Handles modern Codex event hooks from stdin and legacy notify payloads from argv.
 
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const { spawnSync } = require('child_process')
+const { applySessionEvent } = require('../lib/session-state')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
@@ -37,40 +38,74 @@ function readStatus() {
     if (fs.existsSync(STATUS_FILE)) {
       return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8'))
     }
-  } catch (e) {}
+  } catch (_) {}
   return { version: 1, lastUpdated: Date.now(), sessions: {} }
+}
+
+function sessionPath(sessionId) {
+  return path.join(SESSIONS_DIR, sessionId.replace(/[/\\:]/g, '_') + '.json')
 }
 
 function updateSession(sessionId, updates) {
   ensureDirs()
 
-  const sessionFile = path.join(SESSIONS_DIR, sessionId.replace(/[/\\:]/g, '_') + '.json')
+  const sessionFile = sessionPath(sessionId)
   let session = { sessionId, agentType: 'codex', startedAt: Date.now() }
   try {
     if (fs.existsSync(sessionFile)) {
       session = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))
     }
-  } catch (e) {}
+  } catch (_) {}
 
-  Object.assign(session, updates, { lastUpdated: Date.now() })
+  const isLegacyNotify = updates.stateSource === 'notify'
+  const lifecycleEvent = updates.lifecycleEvent || (updates.lastEvent ? {
+    type: updates.lastEvent.type,
+    source: isLegacyNotify ? 'notify' : 'hook',
+    stateSource: updates.stateSource,
+    timestamp: updates.lastEvent.timestamp,
+    details: updates.lastEvent.details,
+    turnId: updates.lastEvent.turnId,
+    attentionReason: updates.needsAttention || null,
+    pendingToolUse: updates.pendingToolUse,
+    endedAt: updates.endedAt,
+    force: !isLegacyNotify
+  } : null)
+  delete updates.lifecycleEvent
+
+  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'endedAt', 'stateSource', 'lastEvent'])
+  for (const [key, value] of Object.entries(updates)) {
+    if (lifecycleEvent && lifecycleFields.has(key)) continue
+    if (value !== undefined) session[key] = value
+  }
+
+  if (lifecycleEvent) applySessionEvent(session, lifecycleEvent)
+
+  session.lastUpdated = Date.now()
   writeStatusAtomic(sessionFile, session)
 
   const status = readStatus()
   status.sessions[sessionId] = session
   status.lastUpdated = Date.now()
 
-  // Clean up old sessions (older than 24h)
   const cutoff = Date.now() - 24 * 60 * 60 * 1000
   for (const [id, sess] of Object.entries(status.sessions)) {
     if (sess.endedAt && sess.endedAt < cutoff) {
       delete status.sessions[id]
-      try {
-        fs.unlinkSync(path.join(SESSIONS_DIR, id.replace(/[/\\:]/g, '_') + '.json'))
-      } catch (e) {}
+      try { fs.unlinkSync(sessionPath(id)) } catch (_) {}
     }
   }
 
   writeStatusAtomic(STATUS_FILE, status)
+}
+
+function readStdin() {
+  return new Promise((resolve) => {
+    let input = ''
+    process.stdin.setEncoding('utf-8')
+    process.stdin.on('data', chunk => { input += chunk })
+    process.stdin.on('end', () => resolve(input))
+    process.stdin.on('error', () => resolve(input))
+  })
 }
 
 function extractSessionTitle(inputMessages) {
@@ -78,18 +113,60 @@ function extractSessionTitle(inputMessages) {
   for (const msg of inputMessages) {
     if (msg.role === 'user' && msg.content) {
       if (typeof msg.content === 'string') {
-        return msg.content.slice(0, 100).split('\n')[0].trim()
+        return cleanPrompt(msg.content).slice(0, 100).split('\n')[0].trim()
       }
       if (Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if ((part.type === 'text' || part.type === 'input_text') && part.text) {
-            return part.text.slice(0, 100).split('\n')[0].trim()
+            return cleanPrompt(part.text).slice(0, 100).split('\n')[0].trim()
           }
         }
       }
     }
   }
   return undefined
+}
+
+function cleanPrompt(prompt) {
+  if (!prompt) return ''
+  let clean = String(prompt)
+  const marker = '## My request for Codex:'
+  const idx = clean.indexOf(marker)
+  if (idx >= 0 && clean.trimStart().startsWith('# Context from my IDE setup:')) {
+    clean = clean.slice(idx + marker.length)
+  }
+  clean = clean.replace(/<system[-_]?(?:instruction|reminder)[^>]*>[\s\S]*?<\/system[-_]?(?:instruction|reminder)>/gi, '')
+  return clean.trim()
+}
+
+function titleFromPrompt(prompt) {
+  const clean = cleanPrompt(prompt)
+  return clean ? clean.slice(0, 100).split('\n')[0].trim() : undefined
+}
+
+function getToolDetails(toolName, toolInput) {
+  let toolDetails = toolName || 'unknown'
+  if (toolInput && typeof toolInput === 'object') {
+    if (toolInput.command) {
+      toolDetails += ': ' + String(toolInput.command).slice(0, 80)
+    } else if (toolInput.file_path) {
+      toolDetails += ': ' + path.basename(String(toolInput.file_path))
+    } else if (toolInput.description) {
+      toolDetails += ': ' + String(toolInput.description).slice(0, 80)
+    } else if (toolInput.url) {
+      toolDetails += ': ' + String(toolInput.url).slice(0, 80)
+    } else if (toolInput.query) {
+      toolDetails += ': ' + String(toolInput.query).slice(0, 80)
+    } else {
+      for (const value of Object.values(toolInput)) {
+        if (typeof value === 'string' && value.length > 0) {
+          toolDetails += ': ' + value.slice(0, 80)
+          break
+        }
+      }
+    }
+  }
+  return toolDetails
 }
 
 function forwardToOriginalNotify(jsonArg) {
@@ -102,27 +179,188 @@ function forwardToOriginalNotify(jsonArg) {
       stdio: 'ignore',
       timeout: 30000
     })
-  } catch (e) {}
+  } catch (_) {}
 }
 
-function main() {
-  const jsonArg = process.argv[2]
+function baseUpdates(data, now) {
+  const tmuxPane = process.env.TMUX_PANE || null
+  const payloadPid = Number.parseInt(data.pid, 10)
+  const pid = Number.isInteger(payloadPid) && payloadPid > 0
+    ? payloadPid
+    : Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null
+  return {
+    agentType: 'codex',
+    endedAt: null,
+    workingDirectory: data.cwd,
+    transcriptPath: data.transcript_path,
+    threadId: data.thread_id || data.session_id || data['thread-id'],
+    tmuxPane,
+    pid,
+    stateSource: data.hook_event_name ? 'codex-hooks' : 'notify',
+    lastHookAt: now
+  }
+}
 
-  if (!jsonArg) {
-    forwardToOriginalNotify('')
-    process.exit(0)
+function normalizeSignal(value) {
+  return String(value || '').trim().toLowerCase().replace(/[-\s]+/g, '_')
+}
+
+const TRUE_SIGNALS = new Set(['1', 'true', 'yes', 'on'])
+const INPUT_WAIT_SIGNALS = new Set([
+  'waiting_for_input',
+  'waiting_for_answer',
+  'requires_input',
+  'requires_user_input',
+  'needs_input',
+  'needs_user_input',
+  'input_required',
+  'user_input_required',
+  'input_requested',
+  'user_input_requested',
+  'awaiting_input',
+  'awaiting_user_input',
+  'awaiting_answer',
+  'question_asked'
+])
+
+function isTrueSignal(value) {
+  if (value === true) return true
+  if (value === false || value === null || value === undefined) return false
+  return TRUE_SIGNALS.has(normalizeSignal(value))
+}
+
+function hasExplicitInputWaitSignal(data) {
+  const flagFields = [
+    'waiting_for_input',
+    'waiting_for_answer',
+    'requires_input',
+    'requires_user_input',
+    'needs_input',
+    'needs_user_input',
+    'input_required',
+    'user_input_required',
+    'question_asked'
+  ]
+  for (const field of flagFields) {
+    if (isTrueSignal(data[field])) return true
   }
 
-  // Always forward first
-  forwardToOriginalNotify(jsonArg)
-
-  let data
-  try {
-    data = JSON.parse(jsonArg)
-  } catch (e) {
-    process.exit(0)
+  for (const field of ['reason', 'stop_reason', 'next_action', 'status', 'prompt_type', 'input_mode']) {
+    if (INPUT_WAIT_SIGNALS.has(normalizeSignal(data[field]))) return true
   }
 
+  return false
+}
+
+function isBypassPermission(data) {
+  return data.permission_mode === 'bypassPermissions'
+}
+
+function handleModernHook(data) {
+  const eventName = data.hook_event_name
+  const sessionId = data.session_id || data.thread_id || data['thread-id']
+  if (!eventName || !sessionId) return
+
+  const now = Date.now()
+  const base = baseUpdates(data, now)
+
+  switch (eventName) {
+    case 'SessionStart': {
+      updateSession(sessionId, Object.assign({}, base, {
+        status: 'idle',
+        startedAt: now,
+        needsAttention: null,
+        pendingToolUse: null,
+        sessionTitle: data.session_title || undefined,
+        lastEvent: { type: 'session_start', timestamp: now, details: data.source }
+      }))
+      break
+    }
+
+    case 'UserPromptSubmit': {
+      const title = titleFromPrompt(data.prompt || data.prompt_preview)
+      updateSession(sessionId, Object.assign({}, base, {
+        status: 'working',
+        needsAttention: null,
+        pendingToolUse: null,
+        sessionTitle: title,
+        lastUserPrompt: cleanPrompt(data.prompt || data.prompt_preview || ''),
+        lastTurnId: data.turn_id,
+        lastEvent: { type: 'prompt_submit', timestamp: now, details: title, turnId: data.turn_id }
+      }))
+      break
+    }
+
+    case 'PreToolUse': {
+      const toolName = data.tool_name || 'unknown'
+      const details = getToolDetails(toolName, data.tool_input)
+      updateSession(sessionId, Object.assign({}, base, {
+        status: 'working',
+        needsAttention: null,
+        pendingToolUse: { tool: toolName, details, timestamp: now },
+        lastTurnId: data.turn_id,
+        lastEvent: { type: 'tool_use', timestamp: now, details, turnId: data.turn_id }
+      }))
+      break
+    }
+
+    case 'PermissionRequest': {
+      if (isBypassPermission(data)) {
+        updateSession(sessionId, Object.assign({}, base, {
+          lastTurnId: data.turn_id,
+          lastEvent: { type: 'permission_bypassed', timestamp: now, turnId: data.turn_id }
+        }))
+        break
+      }
+      const toolName = data.tool_name || 'unknown'
+      const details = getToolDetails(toolName, data.tool_input)
+      updateSession(sessionId, Object.assign({}, base, {
+        status: 'working',
+        needsAttention: 'waiting for approval',
+        pendingToolUse: { tool: toolName, details, timestamp: now },
+        lastTurnId: data.turn_id,
+        lastEvent: { type: 'permission_request', timestamp: now, details, turnId: data.turn_id }
+      }))
+      break
+    }
+
+    case 'PostToolUse': {
+      const toolName = data.tool_name || 'unknown'
+      updateSession(sessionId, Object.assign({}, base, {
+        status: 'working',
+        needsAttention: null,
+        pendingToolUse: null,
+        lastTurnId: data.turn_id,
+        lastEvent: { type: 'post_tool_use', timestamp: now, details: toolName, turnId: data.turn_id }
+      }))
+      break
+    }
+
+    case 'Stop': {
+      const lastAssistantMessage = typeof data.last_assistant_message === 'string'
+        ? data.last_assistant_message
+        : ''
+      const wantsAnswer = hasExplicitInputWaitSignal(data)
+      updateSession(sessionId, Object.assign({}, base, {
+        status: wantsAnswer ? 'working' : 'completed',
+        needsAttention: wantsAnswer ? 'waiting for answer' : null,
+        pendingToolUse: null,
+        sessionTitle: data.session_title || undefined,
+        lastAssistantMessage,
+        lastTurnId: data.turn_id,
+        lastEvent: {
+          type: wantsAnswer ? 'question_asked' : 'stop',
+          timestamp: now,
+          details: lastAssistantMessage.slice(0, 100),
+          turnId: data.turn_id
+        }
+      }))
+      break
+    }
+  }
+}
+
+function handleLegacyNotify(data) {
   const {
     type,
     'thread-id': threadId,
@@ -132,51 +370,65 @@ function main() {
     'last-assistant-message': lastAssistantMessage
   } = data
 
-  if (type !== 'agent-turn-complete') {
-    process.exit(0)
-  }
+  if (type !== 'agent-turn-complete') return
 
   const sessionId = threadId || 'unknown'
   const now = Date.now()
-  const tmuxPane = process.env.TMUX_PANE || null
-  const pid = Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null
-
   let title = extractSessionTitle(inputMessages)
 
-  // Fallback: use last assistant message as title if no user message found
   if (!title && lastAssistantMessage && typeof lastAssistantMessage === 'string') {
     title = lastAssistantMessage.slice(0, 100).split('\n')[0].trim()
   }
 
-  let details = ''
-  if (lastAssistantMessage) {
-    details = typeof lastAssistantMessage === 'string'
-      ? lastAssistantMessage.slice(0, 100)
-      : ''
-  }
+  const details = typeof lastAssistantMessage === 'string'
+    ? lastAssistantMessage.slice(0, 100)
+    : ''
 
-  updateSession(sessionId, {
-    agentType: 'codex',
+  updateSession(sessionId, Object.assign({}, baseUpdates({
+    cwd,
+    'thread-id': threadId
+  }, now), {
     status: 'completed',
     endedAt: null,
     needsAttention: null,
     pendingToolUse: null,
-    workingDirectory: cwd,
     sessionTitle: title,
     threadId,
-    tmuxPane,
-    pid,
     lastEvent: {
       type: 'turn_complete',
       timestamp: now,
       details,
       turnId
     }
-  })
+  }))
 }
 
-try {
-  main()
-} catch (e) {
-  process.exit(0)
+async function main() {
+  const jsonArg = process.argv[2]
+
+  if (jsonArg) {
+    forwardToOriginalNotify(jsonArg)
+    try {
+      handleLegacyNotify(JSON.parse(jsonArg))
+    } catch (_) {}
+    return
+  }
+
+  const input = await readStdin()
+  if (!input.trim()) return
+
+  let data
+  try {
+    data = JSON.parse(input)
+  } catch (_) {
+    return
+  }
+
+  if (data && data.hook_event_name) {
+    handleModernHook(data)
+  } else {
+    handleLegacyNotify(data)
+  }
 }
+
+main().catch(() => process.exit(0))

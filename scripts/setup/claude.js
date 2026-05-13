@@ -48,7 +48,41 @@ function makeHookEntry() {
 }
 
 function isScoutHook(hook) {
-  return hook.command && hook.command.includes(HOOK_IDENTIFIER)
+  return Boolean(hook && typeof hook.command === 'string' && hook.command.includes(HOOK_IDENTIFIER))
+}
+
+function findScoutHook(groups) {
+  if (!Array.isArray(groups)) return null
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+    const group = groups[groupIndex]
+    if (!group || !Array.isArray(group.hooks)) continue
+    for (let hookIndex = 0; hookIndex < group.hooks.length; hookIndex++) {
+      if (isScoutHook(group.hooks[hookIndex])) {
+        return { group, groupIndex, hookIndex, hook: group.hooks[hookIndex] }
+      }
+    }
+  }
+  return null
+}
+
+function removeDuplicateScoutHooks(groups, keep) {
+  if (!Array.isArray(groups) || !keep) return false
+  let changed = false
+  for (let groupIndex = groups.length - 1; groupIndex >= 0; groupIndex--) {
+    const group = groups[groupIndex]
+    if (!group || !Array.isArray(group.hooks)) continue
+    for (let hookIndex = group.hooks.length - 1; hookIndex >= 0; hookIndex--) {
+      if (groupIndex === keep.groupIndex && hookIndex === keep.hookIndex) continue
+      if (!isScoutHook(group.hooks[hookIndex])) continue
+      group.hooks.splice(hookIndex, 1)
+      changed = true
+    }
+    if (group.hooks.length === 0) {
+      groups.splice(groupIndex, 1)
+      changed = true
+    }
+  }
+  return changed
 }
 
 function install() {
@@ -66,27 +100,25 @@ function install() {
     if (!settings.hooks[event]) settings.hooks[event] = []
 
     const groups = settings.hooks[event]
-    // Find catch-all matcher group (matcher: "")
-    let catchAll = groups.find(g => g.matcher === '')
-    if (!catchAll) {
-      catchAll = { matcher: '', hooks: [] }
-      // Prepend so catch-all runs before specific matchers
-      groups.unshift(catchAll)
-    }
-
-    const existing = catchAll.hooks.findIndex(h => isScoutHook(h))
-    if (existing >= 0) {
-      const current = catchAll.hooks[existing]
+    const existing = findScoutHook(groups)
+    if (existing) {
       const expected = makeHookEntry()
-      if (current.command === expected.command) {
+      if (existing.hook.command === expected.command) {
         results.push({ event, action: 'ok' })
       } else {
-        // Path changed — update
-        catchAll.hooks[existing] = expected
+        existing.group.hooks[existing.hookIndex] = expected
         changed = true
         results.push({ event, action: 'updated' })
       }
+      changed = removeDuplicateScoutHooks(groups, existing) || changed
     } else {
+      // Find catch-all matcher group (matcher: "")
+      let catchAll = groups.find(g => g.matcher === '')
+      if (!catchAll) {
+        catchAll = { matcher: '', hooks: [] }
+        // Prepend so catch-all runs before specific matchers
+        groups.unshift(catchAll)
+      }
       catchAll.hooks.push(makeHookEntry())
       changed = true
       results.push({ event, action: 'installed' })
@@ -159,15 +191,12 @@ function status() {
     const groups = settings.hooks[event]
     if (!groups) { missing.push(event); continue }
 
-    const catchAll = groups.find(g => g.matcher === '')
-    if (!catchAll) { missing.push(event); continue }
-
-    const hook = catchAll.hooks.find(h => isScoutHook(h))
-    if (hook) {
+    const found = findScoutHook(groups)
+    if (found) {
       installed.push(event)
       if (!currentPath) {
         // Extract path from command
-        const m = hook.command.match(/"([^"]*)"/)
+        const m = found.hook.command.match(/"([^"]*)"/)
         if (m) currentPath = m[1]
       }
     } else {

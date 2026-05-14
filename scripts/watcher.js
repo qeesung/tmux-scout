@@ -76,7 +76,10 @@ function tmuxOption(name) {
 }
 
 function optionEnabled(value) {
-  return ['1', 'on', 'true', 'yes', 'enabled'].includes(String(value || '').trim().toLowerCase())
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['0', 'off', 'false', 'no', 'disabled'].includes(normalized)) return false
+  if (['1', 'on', 'true', 'yes', 'enabled'].includes(normalized)) return true
+  return true
 }
 
 function watchdogEnabled() {
@@ -381,7 +384,9 @@ async function main() {
 module.exports = {
   runLoop,
   runTick,
-  startOptionalBridge
+  startOptionalBridge,
+  optionEnabled,
+  watchdogEnabled
 }
 
 if (require.main === module) {

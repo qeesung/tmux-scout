@@ -93,6 +93,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 | 按键 | 操作 |
 |---|---|
 | `Enter` | 跳转到选中会话的面板 |
+| `Ctrl-D` | 查看选中会话详情 |
 | `Ctrl-R` | 刷新会话列表 |
 | `Ctrl-T` | 切换自动刷新（每 2 秒） |
 | `Esc` | 关闭选择器 |
@@ -156,12 +157,12 @@ set -g @scout-status-format '{W} wait {B} busy'   # 带标签
 
 占位符：`{W}` 等待，`{B}` 工作中，`{D}` 已完成，`{I}` 空闲。
 
-### 可选 Watchdog
+### Watchdog
 
-默认情况下，tmux-scout 是被动的：hook 更新状态，picker / 状态栏刷新时做一次校正。如果希望即使不打开 picker、不刷新状态栏，也持续维护会话状态，可以启用 tmux 管理的 watchdog：
+默认情况下，tmux-scout 会启动由 tmux 管理的 watchdog，即使不打开 picker、不刷新状态栏，也会持续维护会话状态。如需关闭后台校正：
 
 ```bash
-set -g @scout-watchdog on
+set -g @scout-watchdog off
 ```
 
 这不是 launchd/systemd daemon，而是一个由 tmux 拥有的单实例 Node.js 进程；关闭选项或 tmux 不可用时会退出。watchdog 使用混合循环：
@@ -200,10 +201,10 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 ├── sessions/                        # 每个会话的 JSON 文件
 │   ├── {session-id}.json
 │   └── ...
-├── watcher.pid                      # 可选 watchdog 进程锁
-├── watcher-state.json               # 可选 watchdog JSONL offset/cache
-├── watcher.log                      # 可选 watchdog 诊断日志
-├── run/bridge.sock                  # 可选 watchdog single-writer Unix socket
+├── watcher.pid                      # watchdog 进程锁
+├── watcher-state.json               # watchdog JSONL offset/cache
+├── watcher.log                      # watchdog 诊断日志
+├── run/bridge.sock                  # watchdog single-writer Unix socket
 ├── codex-hooks-manifest.json        # tmux-scout 管理的 Codex event hook trust key
 └── codex-original-notify.json       # 备份的原始 Codex notify 命令
 ```
@@ -214,7 +215,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 
 tmux-scout 现在优先使用 Codex event hook，可以近实时同步会话开始、提示提交、工具执行、审批等待和回合完成状态。这套生命周期跟踪方式参考了 Flux Desktop App 的实现。
 
-开启 `@scout-watchdog` 后，tmux-scout 仍以 hook 作为主状态源，并增加 Flux 风格的校正机制：进程/pane 生命周期检查、带 offset 缓存的 Codex transcript 尾部增量读取、较低频的 JSONL 发现，以及周期性全量 reconcile。快速路径不会反复全量读取所有 transcript。
+在默认 watchdog 路径下，tmux-scout 仍以 hook 作为主状态源，并增加 Flux 风格的校正机制：进程/pane 生命周期检查、带 offset 缓存的 Codex transcript 尾部增量读取、较低频的 JSONL 发现，以及周期性全量 reconcile。快速路径不会反复全量读取所有 transcript。
 
 内部会把 hook、pane、transcript、PID、stale timeout 等观察结果统一交给 session-state reducer。短时间竞态里，高置信度的 hook/PID 事件会压过低置信度的 pane/transcript 观察；但 crash/stale 这类终止事件仍会关闭已经死亡的会话。
 

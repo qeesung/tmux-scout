@@ -128,7 +128,10 @@ function tmuxOption(name) {
 }
 
 function optionEnabled(value) {
-  return ['1', 'on', 'true', 'yes', 'enabled'].includes(String(value || '').trim().toLowerCase())
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['0', 'off', 'false', 'no', 'disabled'].includes(normalized)) return false
+  if (['1', 'on', 'true', 'yes', 'enabled'].includes(normalized)) return true
+  return true
 }
 
 function isPidAlive(pid) {
@@ -267,7 +270,7 @@ function checkWatcher() {
   const pid = Number.parseInt(lock && lock.pid, 10)
   const running = isPidAlive(pid)
 
-  if (enabled) ok('tmux option @scout-watchdog', String(option))
+  if (enabled) ok('tmux option @scout-watchdog', option ? String(option) : 'default on')
   else warn('tmux option @scout-watchdog', 'off; background reconciliation is disabled')
 
   if (running) {

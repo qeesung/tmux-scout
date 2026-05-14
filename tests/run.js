@@ -14,11 +14,13 @@ const { formatLine, getActiveSessions } = require('../scripts/picker/render')
 const { agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
+const { resolveAgentProcess } = require('../scripts/lib/terminal-context')
 const { startBridgeServer } = require('../scripts/lib/bridge-server')
 const { markInterrupted: markClaudeInterrupted, ClaudeTranscriptWatchManager } = require('../scripts/lib/claude-transcript-watcher')
-const { startOptionalBridge } = require('../scripts/watcher')
+const { startOptionalBridge, optionEnabled: watcherOptionEnabled } = require('../scripts/watcher')
 const { AGENT_EVENTS, normalizeAgentEventType, createAgentEvent } = require('../scripts/lib/agent-events')
 const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
+const { formatSessionDetails } = require('../scripts/picker/session-details')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
@@ -535,6 +537,44 @@ test('agent registry provides display metadata and process scoring', () => {
   assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)
 })
 
+test('hook runtime resolves the real agent pid from the hook parent chain', () => {
+  const processes = [
+    { pid: 100, ppid: 1, command: '/opt/homebrew/bin/codex', args: 'codex', commandLine: 'codex', basename: 'codex' },
+    { pid: 200, ppid: 100, command: '/bin/sh', args: 'sh -c node hook.js', commandLine: 'sh -c node hook.js', basename: 'sh' },
+    { pid: 300, ppid: 200, command: process.execPath, args: 'node scripts/hooks/codex.js', commandLine: 'node scripts/hooks/codex.js', basename: 'node' }
+  ]
+  const byPid = new Map()
+  const childrenByPpid = new Map()
+  for (const proc of processes) {
+    byPid.set(proc.pid, proc)
+    if (!childrenByPpid.has(proc.ppid)) childrenByPpid.set(proc.ppid, [])
+    childrenByPpid.get(proc.ppid).push(proc)
+  }
+
+  const resolved = resolveAgentProcess({
+    agentType: 'codex',
+    payloadPid: 300,
+    hookPid: 300,
+    parentPid: 200,
+    processTable: { byPid, childrenByPpid },
+    panePidResolver: () => null
+  })
+
+  assert.strictEqual(resolved.pid, 100)
+  assert.strictEqual(resolved.pidSource, 'parent-chain')
+  assert.strictEqual(resolved.pidCommand, 'codex')
+})
+
+test('watchdog option is enabled by default and can be explicitly disabled', () => {
+  assert.strictEqual(watcherOptionEnabled(''), true)
+  assert.strictEqual(watcherOptionEnabled(undefined), true)
+  assert.strictEqual(watcherOptionEnabled('on'), true)
+  assert.strictEqual(watcherOptionEnabled('enabled'), true)
+  assert.strictEqual(watcherOptionEnabled('off'), false)
+  assert.strictEqual(watcherOptionEnabled('0'), false)
+  assert.strictEqual(watcherOptionEnabled('disabled'), false)
+})
+
 test('bridge server serializes hook updates through the same reducer', async () => {
   const dir = tempDir()
   let bridge
@@ -588,6 +628,31 @@ test('agent events normalize source metadata for reducer evidence', () => {
   assert.strictEqual(event.timestamp, new Date('2026-01-01T00:00:00.000Z').getTime())
 })
 
+test('codex hook enriches sessions with compact session meta fields', () => {
+  const fields = codexHook.codexSessionMetaFields({
+    _session_meta: {
+      id: 'codex-session-1',
+      forked_from_id: 'parent-session',
+      agent_nickname: 'reviewer',
+      source: {
+        subagent: {
+          thread_spawn: {
+            parent_thread_id: 'fallback-parent',
+            agent_nickname: 'fallback-reviewer'
+          }
+        }
+      }
+    }
+  })
+
+  assert.deepStrictEqual(fields, {
+    codexSessionId: 'codex-session-1',
+    codexSessionSource: 'subagent:thread_spawn',
+    codexForkedFromId: 'parent-session',
+    codexAgentNickname: 'reviewer'
+  })
+})
+
 test('bridge client falls back to direct writes when no ACK is received', async () => {
   const dir = tempDir()
   let server = null
@@ -637,6 +702,63 @@ test('watcher disables the bridge without failing startup when bind fails', asyn
   assert.ok(bridge.error)
   assert.doesNotThrow(() => bridge.close())
   assert.ok(logs.some(message => message.includes('bridge disabled: bind failed')))
+})
+
+test('picker rows keep display text unchanged while carrying hidden session id', () => {
+  const session = {
+    sessionId: 'session-hidden-id',
+    agentType: 'codex',
+    status: 'working',
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    sessionTitle: 'visible title',
+    _tmuxPaneSnapshot: { windowName: 'main' }
+  }
+  const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+  const fields = line.split('\t')
+
+  assert.strictEqual(fields[0], '%1')
+  assert.ok(fields[1].includes('visible title'), fields[1])
+  assert.ok(!fields[1].includes('session-hidden-id'), fields[1])
+  assert.strictEqual(fields[2], 'session-hidden-id')
+})
+
+test('session details render as an information panel', () => {
+  const output = formatSessionDetails({
+    sessionId: 'session-1',
+    agentType: 'codex',
+    status: 'working',
+    phase: 'waitingForApproval',
+    needsAttention: 'waiting for approval',
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test' },
+    workingDirectory: '/tmp/tmux-scout',
+    tmuxPane: '%1',
+    pid: 123,
+    pidSource: 'process-tree',
+    pidCommand: 'codex',
+    terminalApp: 'Ghostty',
+    terminalTty: '/dev/ttys001',
+    hostName: 'host',
+    userName: 'user',
+    stateSource: 'codex-hooks',
+    stateConfidence: 90,
+    lastUpdated: 2000,
+    stateEvidence: [
+      { timestamp: 2000, rawEventName: 'PermissionRequest', phase: 'waitingForApproval', details: 'Bash: npm test' },
+      { timestamp: 1000, rawEventName: 'UserPromptSubmit', phase: 'running', details: 'run tests' }
+    ]
+  }, { now: 5000 })
+
+  assert.ok(/\x1b\[[0-9;]*m/.test(output))
+  const plain = stripAnsi(output)
+  assert.ok(plain.includes('tmux-scout | session'))
+  assert.ok(plain.includes('WAITING'))
+  assert.ok(plain.includes('Current'))
+  assert.ok(plain.includes('Bash: npm test'))
+  assert.ok(plain.includes('Context'))
+  assert.ok(plain.includes('source=process-tree'))
+  assert.ok(plain.includes('State Stream'))
+  assert.ok(plain.includes('PermissionRequest'))
 })
 
 test('generic hook tracks Gemini prompt, tool and completion events', () => {

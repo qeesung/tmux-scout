@@ -93,6 +93,7 @@ Press `prefix + O` (default) to open the session picker.
 | Key | Action |
 |---|---|
 | `Enter` | Jump to selected session's pane |
+| `Ctrl-D` | Show selected session details |
 | `Ctrl-R` | Refresh session list |
 | `Ctrl-T` | Toggle auto-refresh (every 2s) |
 | `Esc` | Close picker |
@@ -156,12 +157,12 @@ set -g @scout-status-format '{W} wait {B} busy'   # with labels
 
 Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle.
 
-### Optional Watchdog
+### Watchdog
 
-By default, tmux-scout stays passive: hooks update state, while the picker/status widget reconcile on refresh. To keep session state current even when the picker/status bar is not refreshing, enable the tmux-managed watchdog:
+By default, tmux-scout starts a tmux-managed watchdog so session state stays current even when the picker/status bar is not refreshing. To disable background reconciliation:
 
 ```bash
-set -g @scout-watchdog on
+set -g @scout-watchdog off
 ```
 
 This is not a launchd/systemd daemon. It is a single tmux-owned Node.js process that exits when the option is turned off or tmux is gone. The watchdog uses a hybrid loop:
@@ -200,10 +201,10 @@ Session data is stored in `~/.tmux-scout/`:
 ├── sessions/                        # Per-session JSON files
 │   ├── {session-id}.json
 │   └── ...
-├── watcher.pid                      # Optional watchdog process lock
-├── watcher-state.json               # Optional watchdog JSONL offsets/cache
-├── watcher.log                      # Optional watchdog diagnostics
-├── run/bridge.sock                  # Optional watchdog single-writer Unix socket
+├── watcher.pid                      # Watchdog process lock
+├── watcher-state.json               # Watchdog JSONL offsets/cache
+├── watcher.log                      # Watchdog diagnostics
+├── run/bridge.sock                  # Watchdog single-writer Unix socket
 ├── codex-hooks-manifest.json        # Codex event hook trust keys owned by tmux-scout
 └── codex-original-notify.json       # Backup of original Codex notify command
 ```
@@ -214,7 +215,7 @@ Sessions older than 24 hours are automatically cleaned up.
 
 tmux-scout now prefers Codex's event hook mechanism, which gives near-real-time updates for session start, prompt submission, tool activity, approval waits, and turn completion. This is the same style of lifecycle tracking used by Flux Desktop App.
 
-When `@scout-watchdog` is enabled, tmux-scout keeps hooks as the primary state source and adds Flux-style reconciliation: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, lower-frequency JSONL discovery, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
+With the default watchdog path, tmux-scout keeps hooks as the primary state source and adds Flux-style reconciliation: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, lower-frequency JSONL discovery, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
 
 Internally, hook, pane, transcript, PID, and stale-timeout observations are reduced through a shared session-state model. Higher-confidence hook/PID events win over lower-confidence pane/transcript observations for short races, while terminal crash/stale events still close dead sessions.
 

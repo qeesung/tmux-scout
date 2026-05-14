@@ -51,16 +51,17 @@ height=$((lines + 8))
 ) &
 AUTO_PID=$!
 
-selected=$(cat "$LINES_FILE" | fzf \
+fzf_output=$(cat "$LINES_FILE" | fzf \
   --listen=$LISTEN_PORT \
   --tmux "center,85%,$height,border-native" \
   --ansi \
   --no-mouse \
+  --expect='ctrl-d' \
   --prompt='> ' \
   --color='border:bright-cyan,label:bright-white' \
   --delimiter='\t' \
   --with-nth=2 \
-  --header=$'\nEnter: jump | Ctrl-R: refresh | Ctrl-T: auto-refresh | Esc: cancel' \
+  --header=$'\nEnter: jump | Ctrl-D: details | Ctrl-R: refresh | Ctrl-T: auto-refresh | Esc: cancel' \
   --header-lines=1 \
   --bind="ctrl-r:reload($RELOAD_CMD)" \
   --bind="ctrl-t:execute-silent(if [ -f $AUTO_FLAG ]; then rm -f $AUTO_FLAG; else touch $AUTO_FLAG; fi)+reload($RELOAD_CMD)+transform:if [ -f $AUTO_FLAG ]; then printf \"change-border-label( tmux-scout · auto-refresh \$(date +%H:%M:%S) )\"; else printf 'change-border-label( tmux-scout )'; fi" \
@@ -81,7 +82,26 @@ selected=$(cat "$LINES_FILE" | fzf \
 
 kill $AUTO_PID 2>/dev/null; wait $AUTO_PID 2>/dev/null
 rm -f "$LINES_FILE" "$AUTO_FLAG"
+[ -z "$fzf_output" ] && exit 0
+
+action="jump"
+selected="$fzf_output"
+first_line="${fzf_output%%$'\n'*}"
+if [ "$first_line" = "ctrl-d" ]; then
+  action="details"
+  if [ "$fzf_output" = "ctrl-d" ]; then
+    selected=""
+  else
+    selected="${fzf_output#*$'\n'}"
+  fi
+fi
 [ -z "$selected" ] && exit 0
+
+if [ "$action" = "details" ]; then
+  session_id=$(printf '%s\n' "$selected" | cut -f3)
+  bash "$SCRIPT_DIR/show-details.sh" "$STATUS_FILE" "$session_id" "$CURRENT_PANE"
+  exec "$0"
+fi
 
 pane_id=$(echo "$selected" | cut -f1)
 

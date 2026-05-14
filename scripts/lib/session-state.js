@@ -117,10 +117,15 @@ function shouldApplyPhase(session, event, nextPhase, now) {
     : (session.lastUpdated || 0)
   const currentAge = now - currentUpdatedAt
   const currentIsTerminal = TERMINAL_PHASES.has(current)
+  const currentSource = normalizeSource(lifecycle.source || session.stateSource)
 
   if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== 'session_start') return false
   if (event.force) return true
   if (nextPhase === 'interrupted') return true
+  if (event.type === 'pane_state' && nextPhase === 'running' && currentSource === 'transcript'
+    && (current === 'waitingForApproval' || current === 'waitingForAnswer')) {
+    return true
+  }
   if (incomingPriority < currentPriority && currentAge < PROTECTED_PHASE_MS) return false
   if (current === nextPhase) return true
 

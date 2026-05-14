@@ -306,6 +306,30 @@ test('session reducer does not let same-phase pane reads downgrade hook protecti
   assert.strictEqual(currentPhase(session), 'running')
 })
 
+test('session reducer lets pane busy clear transcript-inferred waits', () => {
+  const session = { sessionId: 's1c', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'transcript_status',
+    source: 'transcript',
+    timestamp: 1000,
+    phase: 'waitingForApproval',
+    status: 'needsAttention',
+    attentionReason: 'waiting for approval'
+  })
+
+  const cleared = applySessionEvent(session, {
+    type: 'pane_state',
+    source: 'pane',
+    timestamp: 2000,
+    phase: 'running',
+    status: 'working'
+  })
+
+  assert.strictEqual(cleared.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.needsAttention, null)
+})
+
 test('session reducer applies attention and terminal events', () => {
   const session = { sessionId: 's2', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
@@ -609,6 +633,76 @@ test('sync marks running Claude session interrupted from transcript marker', () 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('render prefers active sessions over newer completed sessions in the same pane', () => {
+  const now = Date.now()
+  const pane = {
+    paneId: '%1',
+    currentCommand: 'node',
+    paneDead: false,
+    windowName: 'main'
+  }
+  const active = getActiveSessions({
+    sessions: {
+      done: {
+        sessionId: 'done',
+        agentType: 'codex',
+        status: 'completed',
+        phase: 'completed',
+        tmuxPane: '%1',
+        lastUpdated: now
+      },
+      review: {
+        sessionId: 'review',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'running',
+        tmuxPane: '%1',
+        lastUpdated: now - 1000
+      }
+    }
+  }, new Map([['%1', pane]]))
+
+  assert.deepStrictEqual(active.map(session => session.sessionId), ['review'])
+})
+
+test('render prefers newer foreground busy session over stale wait in the same pane', () => {
+  const now = Date.now()
+  const pane = {
+    paneId: '%1',
+    currentCommand: 'node',
+    paneDead: false,
+    windowName: 'main'
+  }
+  const active = getActiveSessions({
+    sessions: {
+      staleWait: {
+        sessionId: 'staleWait',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'waitingForApproval',
+        needsAttention: 'waiting for approval',
+        tmuxPane: '%1',
+        lastHookAt: now - 600000,
+        lastUpdated: now,
+        lastEvent: { type: 'pane_state', timestamp: now }
+      },
+      busy: {
+        sessionId: 'busy',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'running',
+        needsAttention: null,
+        tmuxPane: '%1',
+        lastHookAt: now - 1000,
+        lastUpdated: now - 1000,
+        lastEvent: { type: 'tool_use', timestamp: now - 1000 }
+      }
+    }
+  }, new Map([['%1', pane]]))
+
+  assert.deepStrictEqual(active.map(session => session.sessionId), ['busy'])
 })
 
 test('claude transcript watcher helper marks running sessions interrupted', () => {
@@ -934,6 +1028,19 @@ test('codex classifier hides internal background prompts', () => {
   assert.strictEqual(classification.reason, 'codex-pr-metadata')
 })
 
+test('codex classifier keeps standalone review sessions visible', () => {
+  const classification = classifyCodexSession({
+    sessionMeta: {
+      id: 'codex-review',
+      source: { subagent: 'review' }
+    }
+  })
+
+  assert.strictEqual(classification.hidden, false)
+  assert.strictEqual(classification.isInternal, false)
+  assert.strictEqual(classification.isSubagent, false)
+})
+
 test('codex hook marks internal background sessions hidden', () => {
   const dir = tempDir()
   try {
@@ -952,6 +1059,53 @@ test('codex hook marks internal background sessions hidden', () => {
     assert.strictEqual(session.isInternalCodexSession, true)
     assert.strictEqual(session.hiddenReason, 'codex-pr-metadata')
     assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook keeps standalone review sessions visible and working', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-review'
+    const transcriptPath = path.join(dir, 'review-rollout.jsonl')
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      type: 'session_meta',
+      payload: {
+        id: sessionId,
+        source: { subagent: 'review' }
+      }
+    }) + '\n')
+
+    const base = {
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath
+    }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'review the current diff'
+    }), dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.notStrictEqual(session.isHiddenFromScout, true)
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.deepStrictEqual(
+      getActiveSessions(status, new Map([['%1', {
+        paneId: '%1',
+        currentCommand: 'node',
+        paneDead: false,
+        windowName: 'main'
+      }]])).map(item => item.sessionId),
+      [sessionId]
+    )
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -1106,6 +1260,49 @@ test('codex hidden subagents are summarized on parent picker rows', () => {
     status.sessions[parentId]._tmuxPaneSnapshot = pane
     assert.ok(!stripAnsi(formatLine(status.sessions[parentId], Date.now(), '%1')).includes('subagent'))
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex jsonl discovery keeps standalone review sessions visible', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const now = new Date()
+    const sessionDir = codexSessionDir(dir, now)
+    fs.mkdirSync(sessionDir, { recursive: true })
+    const threadId = '55555555-5555-4555-8555-555555555555'
+    const file = path.join(sessionDir, `rollout-${threadId}.jsonl`)
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: threadId,
+          source: { subagent: 'review' }
+        }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: now.toISOString(),
+        payload: { type: 'user_message', message: 'review the current diff' }
+      })
+    ].join('\n') + '\n')
+
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const session = result.status.sessions[threadId]
+    assert.ok(session)
+    assert.notStrictEqual(session.isHiddenFromScout, true)
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+  } finally {
+    process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })

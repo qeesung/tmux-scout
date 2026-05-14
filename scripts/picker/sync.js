@@ -10,6 +10,7 @@ const { applySessionEvent, currentPhase } = require('../lib/session-state')
 const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental: readJsonlTailIncremental } = require('../lib/jsonl-tail-reader')
 const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-tree')
 const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
+const { AGENT_EVENTS } = require('../lib/agent-events')
 
 let statusFile = process.argv[2] || ''
 let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') : ''
@@ -162,7 +163,7 @@ function isShellCommand(command) {
 function canUseShellFallback(session) {
   if (session.agentType === 'codex') return true
   const lastEventType = session && session.lastEvent ? session.lastEvent.type : null
-  return session.status === 'working' || lastEventType === 'prompt_submit' || lastEventType === 'tool_use' || Boolean(session.pendingToolUse)
+  return session.status === 'working' || lastEventType === AGENT_EVENTS.PROMPT_SUBMIT || lastEventType === AGENT_EVENTS.TOOL_USE || Boolean(session.pendingToolUse)
 }
 
 function applySessionUpdate(status, sessionId, session, event) {
@@ -210,7 +211,7 @@ function exitEventForSession(session, reason, source, now) {
   if (active) {
     session.crashReason = reason
     return {
-      type: 'process_exit_detected',
+      type: AGENT_EVENTS.PROCESS_EXIT_DETECTED,
       source,
       timestamp: now,
       reason,
@@ -221,7 +222,7 @@ function exitEventForSession(session, reason, source, now) {
 
   session.staleReason = reason
   return {
-    type: 'stale',
+    type: AGENT_EVENTS.STALE,
     source,
     timestamp: now,
     reason,
@@ -528,7 +529,7 @@ function applyCodexResultToSession(session, result, now) {
     session.needsAttention = null
     session.pendingToolUse = null
     applySessionEvent(session, {
-      type: 'session_end',
+      type: AGENT_EVENTS.SESSION_END,
       source: 'transcript',
       timestamp: now,
       endedAt: now,
@@ -566,13 +567,23 @@ function applyCodexResultToSession(session, result, now) {
     : result.status === 'completed' ? 'completed'
     : result.status === 'interrupted' ? 'interrupted'
     : null
+  const attentionReason = result.status === 'needsAttention' ? 'waiting for approval' : null
+  if (!phase) return sessionChanged
+  if (currentPhase(session) === phase && !sessionChanged && (session.needsAttention || null) === attentionReason) {
+    if (!session.tmuxPane && (phase === 'running' || phase === 'waitingForApproval')) {
+      session.lastUpdated = now
+      return true
+    }
+    return false
+  }
+
   const eventResult = applySessionEvent(session, {
-    type: result.status === 'interrupted' ? 'interrupted' : 'transcript_status',
+    type: result.status === 'interrupted' ? AGENT_EVENTS.INTERRUPTED : AGENT_EVENTS.TRANSCRIPT_STATUS,
     source: 'transcript',
     timestamp: now,
     phase,
     status: result.status,
-    attentionReason: result.status === 'needsAttention' ? 'waiting for approval' : null,
+    attentionReason,
     reason: result.status === 'interrupted' ? 'Codex transcript recorded turn_aborted/interrupted' : 'Codex transcript status',
     details: result.status,
     updates: {
@@ -608,7 +619,7 @@ function addDiscoveredCodexSession(status, threadId, filePath, fileStat, result,
     parentSessionId: result.parentSessionId || undefined,
     subagentDepth: result.subagentDepth,
     subagentNickname: result.subagentNickname || undefined,
-    lastEvent: { type: 'discovered', timestamp: now },
+    lastEvent: { type: AGENT_EVENTS.DISCOVERED, timestamp: now },
     lastUpdated: now
   }
   applyCodexResultToSession(session, result, now)
@@ -616,13 +627,13 @@ function addDiscoveredCodexSession(status, threadId, filePath, fileStat, result,
 }
 
 function markUnboundCodexStale(session, jsonlPath, now) {
-  if (session.tmuxPane || hasTrackedPid(session) || !jsonlPath) return false
+  if (session.tmuxPane || !jsonlPath) return false
   try {
     const mtime = fs.statSync(jsonlPath).mtimeMs
     if (now - mtime <= 300000) return false
     session.staleReason = 'JSONL file inactive — Codex process likely exited before hook fired'
     applySessionEvent(session, {
-      type: 'stale',
+      type: AGENT_EVENTS.STALE,
       source: 'stale',
       timestamp: now,
       reason: session.staleReason,
@@ -684,7 +695,7 @@ function syncCodexSessionsFull(status, panes, stats) {
       changed = true
     }
 
-    // Unbound sessions (no pane/PID): detect stale JSONL as process death.
+    // Unbound sessions (no tmux pane): detect stale JSONL as process death.
     // If the JSONL file hasn't been written to for over 2 minutes, the Codex
     // process is no longer running — mark crashed.
     if (markUnboundCodexStale(session, jsonlPath, now)) {
@@ -817,7 +828,7 @@ function sweepStuckCodexTools(status, stats) {
     if (phase !== 'running' || session.needsAttention) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: 'interrupted',
+      type: AGENT_EVENTS.INTERRUPTED,
       source: 'transcript',
       timestamp: now,
       reason: `pending tool exceeded ${Math.round(CODEX_STUCK_TOOL_MS / 1000)}s without completion`,
@@ -937,7 +948,7 @@ function sweepInterruptedClaudeTranscripts(status, stats) {
     if (!hit) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: 'interrupted',
+      type: AGENT_EVENTS.INTERRUPTED,
       source: 'transcript',
       timestamp: now,
       reason: 'Claude transcript recorded request interruption',
@@ -1079,7 +1090,7 @@ function applyPaneGroundTruth(status, stats) {
     if (!phase) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: 'pane_state',
+      type: AGENT_EVENTS.PANE_STATE,
       source: 'pane',
       timestamp: now,
       phase,

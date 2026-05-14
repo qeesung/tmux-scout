@@ -11,6 +11,7 @@ const { HOOK_MANAGERS, checkManagerHealth } = require('./setup/managers')
 const PROJECT_DIR = path.resolve(__dirname, '..')
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const WATCHER_PID_FILE = path.join(STATUS_DIR, 'watcher.pid')
+const BRIDGE_SOCKET = path.join(STATUS_DIR, 'run', 'bridge.sock')
 const REQUIRED = {
   node: [16, 0, 0],
   tmux: [3, 2, 0],
@@ -149,6 +150,15 @@ function readJson(filePath, fallback) {
   return fallback
 }
 
+function bridgeSocketState() {
+  try {
+    const stat = fs.statSync(BRIDGE_SOCKET)
+    return stat.isSocket() ? 'socket' : 'exists'
+  } catch (_) {
+    return 'missing'
+  }
+}
+
 function checkDependencies() {
   section('Dependencies')
 
@@ -264,16 +274,24 @@ function checkWatcher() {
     const state = readJson(path.join(STATUS_DIR, 'watcher-state.json'), {})
     const lastTick = state.lastTickAt ? new Date(state.lastTickAt).toISOString() : 'unknown'
     const summary = state.lastTickSummary || {}
+    const bridge = bridgeSocketState()
     const details = [`running pid=${pid}`, `lastTick=${lastTick}`]
     if (Number.isFinite(summary.durationMs)) details.push(`duration=${summary.durationMs}ms`)
     if (Number.isFinite(summary.changes)) details.push(`changes=${summary.changes}`)
     if (Number.isFinite(summary.codexFilesRead)) details.push(`codexRead=${summary.codexFilesRead}`)
     if (summary.codexParseErrors > 0) details.push(`codexParseErrors=${summary.codexParseErrors}`)
     ok('watcher process', details.join(', '))
+    if (bridge === 'socket') ok('bridge socket', BRIDGE_SOCKET)
+    else warn('bridge socket', `watcher is running but bridge socket is ${bridge}`)
   } else if (enabled) {
     warn('watcher process', 'option is enabled but no live watcher pid was found')
   } else {
     warn('watcher process', 'not running')
+  }
+
+  const bridge = bridgeSocketState()
+  if (!running && bridge !== 'missing') {
+    warn('bridge socket', `stale ${bridge} at ${BRIDGE_SOCKET}`)
   }
 }
 

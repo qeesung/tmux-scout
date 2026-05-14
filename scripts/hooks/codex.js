@@ -7,6 +7,7 @@ const path = require('path')
 const { spawnSync } = require('child_process')
 const { createHookContext, readStdin } = require('../lib/hook-adapter')
 const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
+const { AGENT_EVENTS } = require('../lib/agent-events')
 
 const hookContext = createHookContext({
   agentType: 'codex',
@@ -119,7 +120,7 @@ const INPUT_WAIT_SIGNALS = new Set([
   'awaiting_input',
   'awaiting_user_input',
   'awaiting_answer',
-  'question_asked'
+  AGENT_EVENTS.QUESTION_ASKED
 ])
 
 function isTrueSignal(value) {
@@ -138,7 +139,7 @@ function hasExplicitInputWaitSignal(data) {
     'needs_user_input',
     'input_required',
     'user_input_required',
-    'question_asked'
+    AGENT_EVENTS.QUESTION_ASKED
   ]
   for (const field of flagFields) {
     if (isTrueSignal(data[field])) return true
@@ -259,7 +260,7 @@ function markHiddenSession(sessionId, base, classification, now, details) {
     activeTool: null,
     endedAt: now,
     lifecycleEvent: {
-      type: 'session_end',
+      type: AGENT_EVENTS.SESSION_END,
       source: 'hook',
       stateSource: base.stateSource,
       timestamp: now,
@@ -412,7 +413,7 @@ function handleModernHook(data) {
         pendingToolUse: null,
         activeTool: null,
         sessionTitle: data.session_title || undefined,
-        lastEvent: { type: 'session_start', timestamp: now, details: data.source }
+        lastEvent: { type: AGENT_EVENTS.SESSION_START, timestamp: now, details: data.source }
       }))
       break
     }
@@ -427,7 +428,7 @@ function handleModernHook(data) {
         sessionTitle: title,
         lastUserPrompt: cleanPrompt(data.prompt || data.prompt_preview || ''),
         lastTurnId: data.turn_id,
-        lastEvent: { type: 'prompt_submit', timestamp: now, details: title, turnId: data.turn_id }
+        lastEvent: { type: AGENT_EVENTS.PROMPT_SUBMIT, timestamp: now, details: title, turnId: data.turn_id }
       }))
       break
     }
@@ -441,7 +442,7 @@ function handleModernHook(data) {
         pendingToolUse: { tool: toolName, details, timestamp: now },
         activeTool: toolName,
         lastTurnId: data.turn_id,
-        lastEvent: { type: 'tool_use', timestamp: now, details, turnId: data.turn_id }
+        lastEvent: { type: AGENT_EVENTS.TOOL_USE, timestamp: now, details, turnId: data.turn_id }
       }))
       break
     }
@@ -450,7 +451,7 @@ function handleModernHook(data) {
       if (isBypassPermission(data)) {
         updateSession(sessionId, Object.assign({}, base, {
           lastTurnId: data.turn_id,
-          lastEvent: { type: 'permission_bypassed', timestamp: now, turnId: data.turn_id }
+          lastEvent: { type: AGENT_EVENTS.PERMISSION_BYPASSED, timestamp: now, turnId: data.turn_id }
         }))
         break
       }
@@ -462,7 +463,7 @@ function handleModernHook(data) {
         pendingToolUse: { tool: toolName, details, timestamp: now },
         activeTool: toolName,
         lastTurnId: data.turn_id,
-        lastEvent: { type: 'permission_request', timestamp: now, details, turnId: data.turn_id }
+        lastEvent: { type: AGENT_EVENTS.PERMISSION_REQUEST, timestamp: now, details, turnId: data.turn_id }
       }))
       break
     }
@@ -475,7 +476,7 @@ function handleModernHook(data) {
         pendingToolUse: null,
         activeTool: null,
         lastTurnId: data.turn_id,
-        lastEvent: { type: 'post_tool_use', timestamp: now, details: toolName, turnId: data.turn_id }
+        lastEvent: { type: AGENT_EVENTS.POST_TOOL_USE, timestamp: now, details: toolName, turnId: data.turn_id }
       }))
       break
     }
@@ -494,7 +495,7 @@ function handleModernHook(data) {
         lastAssistantMessage,
         lastTurnId: data.turn_id,
         lastEvent: {
-          type: wantsAnswer ? 'question_asked' : 'stop',
+          type: wantsAnswer ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.STOP,
           timestamp: now,
           details: lastAssistantMessage.slice(0, 100),
           turnId: data.turn_id
@@ -547,7 +548,7 @@ function handleLegacyNotify(data) {
     sessionTitle: title,
     threadId,
     lastEvent: {
-      type: 'turn_complete',
+      type: AGENT_EVENTS.TURN_COMPLETE,
       timestamp: now,
       details,
       turnId
@@ -560,6 +561,7 @@ async function main() {
 
   if (jsonArg) {
     adapter.handleArg(jsonArg)
+    await hookContext.flush()
     return
   }
 
@@ -574,6 +576,7 @@ async function main() {
   }
 
   adapter.handlePayload(data)
+  await hookContext.flush()
 }
 
 const adapter = {

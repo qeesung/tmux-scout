@@ -4,6 +4,7 @@ const fs = require('fs')
 const path = require('path')
 const { applySessionEvent, currentPhase } = require('./session-state')
 const { readFileTail, splitJsonlLines } = require('./jsonl-tail-reader')
+const { AGENT_EVENTS } = require('./agent-events')
 
 const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = 128 * 1024
@@ -88,7 +89,7 @@ function markInterrupted(statusFile, sessionId) {
 
   const now = Date.now()
   const result = applySessionEvent(session, {
-    type: 'interrupted',
+    type: AGENT_EVENTS.INTERRUPTED,
     source: 'transcript',
     timestamp: now,
     reason: 'Claude transcript recorded request interruption',

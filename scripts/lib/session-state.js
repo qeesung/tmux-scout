@@ -1,5 +1,7 @@
 // Central session state reducer for tmux-scout.
 
+const { AGENT_EVENTS, normalizeAgentEventType } = require('./agent-events')
+
 const SOURCE_PRIORITY = {
   hook: 90,
   pid: 95,
@@ -64,24 +66,24 @@ function attentionForPhase(phase, reason) {
 }
 
 function phaseForEvent(event) {
-  switch (event.type) {
-    case 'session_start': return 'idle'
-    case 'prompt_submit': return 'running'
-    case 'tool_use': return 'running'
-    case 'post_tool_use': return 'running'
-    case 'post_tool_use_failure': return 'running'
-    case 'permission_bypassed': return 'running'
-    case 'permission_request': return 'waitingForApproval'
-    case 'question_asked': return 'waitingForAnswer'
-    case 'stop': return 'completed'
-    case 'stop_failure': return 'completed'
-    case 'turn_complete': return 'completed'
-    case 'session_end': return 'completed'
-    case 'interrupted': return 'interrupted'
-    case 'process_exit_detected': return 'crashed'
-    case 'stale': return 'stale'
-    case 'pane_state':
-    case 'transcript_status':
+  switch (normalizeAgentEventType(event.type)) {
+    case AGENT_EVENTS.SESSION_START: return 'idle'
+    case AGENT_EVENTS.PROMPT_SUBMIT: return 'running'
+    case AGENT_EVENTS.TOOL_USE: return 'running'
+    case AGENT_EVENTS.POST_TOOL_USE: return 'running'
+    case AGENT_EVENTS.POST_TOOL_USE_FAILURE: return 'running'
+    case AGENT_EVENTS.PERMISSION_BYPASSED: return 'running'
+    case AGENT_EVENTS.PERMISSION_REQUEST: return 'waitingForApproval'
+    case AGENT_EVENTS.QUESTION_ASKED: return 'waitingForAnswer'
+    case AGENT_EVENTS.STOP: return 'completed'
+    case AGENT_EVENTS.STOP_FAILURE: return 'completed'
+    case AGENT_EVENTS.TURN_COMPLETE: return 'completed'
+    case AGENT_EVENTS.SESSION_END: return 'completed'
+    case AGENT_EVENTS.INTERRUPTED: return 'interrupted'
+    case AGENT_EVENTS.PROCESS_EXIT_DETECTED: return 'crashed'
+    case AGENT_EVENTS.STALE: return 'stale'
+    case AGENT_EVENTS.PANE_STATE:
+    case AGENT_EVENTS.TRANSCRIPT_STATUS:
       return event.phase || event.statusPhase || currentPhaseFromStatus(event.status, event.needsAttention)
     default:
       return event.phase
@@ -119,10 +121,10 @@ function shouldApplyPhase(session, event, nextPhase, now) {
   const currentIsTerminal = TERMINAL_PHASES.has(current)
   const currentSource = normalizeSource(lifecycle.source || session.stateSource)
 
-  if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== 'session_start') return false
+  if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== AGENT_EVENTS.SESSION_START) return false
   if (event.force) return true
   if (nextPhase === 'interrupted') return true
-  if (event.type === 'pane_state' && nextPhase === 'running' && currentSource === 'transcript'
+  if (event.type === AGENT_EVENTS.PANE_STATE && nextPhase === 'running' && currentSource === 'transcript'
     && (current === 'waitingForApproval' || current === 'waitingForAnswer')) {
     return true
   }
@@ -146,7 +148,7 @@ function setPhase(session, phase, event, now) {
     session.activeTool = null
   }
 
-  if (event.type === 'session_end') {
+  if (event.type === AGENT_EVENTS.SESSION_END) {
     session.endedAt = event.endedAt || now
   } else if (TERMINAL_PHASES.has(phase)) {
     session.endedAt = event.endedAt || now
@@ -168,6 +170,7 @@ function setPhase(session, phase, event, now) {
 
 function applySessionEvent(session, event) {
   if (!session || !event || !event.type) return { changed: false, applied: false }
+  event = Object.assign({}, event, { type: normalizeAgentEventType(event.type) })
   const now = Number.isFinite(event.timestamp) ? event.timestamp : Date.now()
   const before = JSON.stringify(session)
 

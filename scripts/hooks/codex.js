@@ -16,7 +16,8 @@ const hookContext = createHookContext({
   baseFields: data => ({
     endedAt: null,
     threadId: data.thread_id || data.session_id || data['thread-id'],
-    stateSource: data.hook_event_name ? 'codex-hooks' : 'notify'
+    stateSource: data.hook_event_name ? 'codex-hooks' : 'notify',
+    ...codexSessionMetaFields(data)
   })
 })
 
@@ -237,6 +238,46 @@ function readTranscriptSessionMeta(transcriptPath) {
   } catch (_) {
     return null
   }
+}
+
+function codexSourceLabel(source) {
+  if (!source) return undefined
+  if (typeof source === 'string') return source
+  if (typeof source !== 'object' || Array.isArray(source)) return undefined
+  if (typeof source.internal === 'string') return `internal:${source.internal || 'session'}`
+  if (typeof source.subagent === 'string') return `subagent:${source.subagent}`
+  if (source.subagent && typeof source.subagent === 'object') {
+    if (source.subagent.thread_spawn) return 'subagent:thread_spawn'
+    if (source.subagent.other) return `subagent:${source.subagent.other}`
+    return 'subagent'
+  }
+  const keys = Object.keys(source).filter(Boolean)
+  return keys.length > 0 ? keys.join(',') : undefined
+}
+
+function codexSessionMetaFields(data) {
+  const meta = data && (data._session_meta || readTranscriptSessionMeta(data.transcript_path))
+  if (!meta || typeof meta !== 'object') return {}
+  const source = meta.source && typeof meta.source === 'object' && !Array.isArray(meta.source)
+    ? meta.source
+    : null
+  const subagent = source && source.subagent && typeof source.subagent === 'object' && !Array.isArray(source.subagent)
+    ? source.subagent
+    : null
+  const threadSpawn = subagent && subagent.thread_spawn && typeof subagent.thread_spawn === 'object'
+    ? subagent.thread_spawn
+    : null
+  const fields = {
+    codexSessionId: meta.id,
+    codexSessionSource: codexSourceLabel(meta.source),
+    codexForkedFromId: meta.forked_from_id || (threadSpawn && threadSpawn.parent_thread_id),
+    codexAgentNickname: meta.agent_nickname || (threadSpawn && threadSpawn.agent_nickname)
+  }
+  const compact = {}
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined && value !== null && value !== '') compact[key] = value
+  }
+  return compact
 }
 
 function classifyHookPayload(data) {
@@ -601,7 +642,8 @@ module.exports = {
   handleModernHook,
   handleLegacyNotify,
   codexStopWantsAnswer,
-  looksLikeAssistantQuestion
+  looksLikeAssistantQuestion,
+  codexSessionMetaFields
 }
 
 if (require.main === module) {

@@ -11,7 +11,9 @@ tmux run-shell -b "$restore_path; node \"$CURRENT_DIR/scripts/setup.js\" status 
 
 watchdog=$(tmux show-option -gqv "@scout-watchdog")
 case "$watchdog" in
-  on|1|true|yes|enabled)
+  off|0|false|no|disabled)
+    ;;
+  *)
     tmux run-shell -b "$restore_path; node \"$CURRENT_DIR/scripts/watcher.js\" start"
     ;;
 esac

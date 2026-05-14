@@ -53,10 +53,17 @@ function descendantsOf(rootPid, table) {
   return result
 }
 
+function isScoutHookProcess(proc) {
+  const command = String(proc && (proc.commandLine || proc.args || proc.command) || '')
+  return /(?:^|\s|\/)scripts\/hooks\/[^/\s]+\.js(?:\s|$)/.test(command)
+    || /tmux-scout[^\s]*\/scripts\/hooks\/[^/\s]+\.js(?:\s|$)/.test(command)
+}
+
 function findAgentProcessFromPane(panePid, agentType, table) {
   if (!Number.isInteger(panePid) || panePid <= 0) return null
   const processTable = table || readProcessTable()
   const candidates = descendantsOf(panePid, processTable)
+    .filter(proc => !isScoutHookProcess(proc))
     .map(proc => Object.assign({}, proc, { score: scoreAgentProcess(proc, agentType) }))
     .filter(proc => proc.score > 0)
     .sort((left, right) => right.score - left.score)

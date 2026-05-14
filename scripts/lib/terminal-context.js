@@ -1,6 +1,9 @@
-// Best-effort terminal metadata captured by hook processes.
+// Best-effort runtime and terminal metadata captured by hook processes.
 
+const os = require('os')
 const { execFileSync } = require('child_process')
+const { readProcessTable, findAgentProcessFromPane } = require('./process-tree')
+const { scoreAgentProcess } = require('./agents')
 
 function safeExec(file, args, timeout = 200) {
   try {
@@ -23,6 +26,11 @@ function normalizeTty(value) {
 function parentPid(pid) {
   const output = safeExec('/bin/ps', ['-p', String(pid), '-o', 'ppid='])
   const parsed = Number.parseInt(output, 10)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+function positiveInt(value) {
+  const parsed = Number.parseInt(value, 10)
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null
 }
 
@@ -131,9 +139,168 @@ function terminalContext(startPid) {
   return compact
 }
 
+function processSummary(proc) {
+  if (!proc) return null
+  return String(proc.commandLine || proc.args || proc.command || proc.basename || '').trim() || null
+}
+
+function isScoutHookProcess(proc) {
+  const command = processSummary(proc) || ''
+  return /(?:^|\s|\/)scripts\/hooks\/[^/\s]+\.js(?:\s|$)/.test(command)
+    || /tmux-scout[^\s]*\/scripts\/hooks\/[^/\s]+\.js(?:\s|$)/.test(command)
+}
+
+function processFromTable(table, pid) {
+  if (!table || !table.byPid || !Number.isInteger(pid) || pid <= 0) return null
+  return table.byPid.get(pid) || null
+}
+
+function parentFromTable(table, pid) {
+  const proc = processFromTable(table, pid)
+  if (proc && Number.isInteger(proc.ppid) && proc.ppid > 0) return proc.ppid
+  return parentPid(pid)
+}
+
+function findAgentAncestor(startPid, agentType, table) {
+  let pid = positiveInt(startPid)
+  if (!pid) return null
+  const seen = new Set()
+  for (let depth = 0; depth < 16 && pid && !seen.has(pid); depth++) {
+    seen.add(pid)
+    const proc = processFromTable(table, pid)
+    if (proc && !isScoutHookProcess(proc) && scoreAgentProcess(proc, agentType) > 0) return proc
+    pid = parentFromTable(table, pid)
+  }
+  return null
+}
+
+function tmuxPanePid(paneId) {
+  if (!paneId) return null
+  const output = safeExec('tmux', ['display-message', '-p', '-t', String(paneId), '#{pane_pid}'])
+  return positiveInt(output)
+}
+
+function resolveAgentProcess(options = {}) {
+  const agentType = options.agentType || 'unknown'
+  const table = options.processTable || readProcessTable()
+  const payloadPid = positiveInt(options.payloadPid)
+  const hookPid = positiveInt(options.hookPid) || process.pid
+  const parent = positiveInt(options.parentPid) || parentPid(hookPid)
+
+  const payloadProc = processFromTable(table, payloadPid)
+  if (payloadProc && !isScoutHookProcess(payloadProc) && scoreAgentProcess(payloadProc, agentType) > 0) {
+    return {
+      pid: payloadProc.pid,
+      pidSource: 'payload',
+      pidCommand: processSummary(payloadProc)
+    }
+  }
+
+  for (const startPid of [hookPid, parent, payloadPid]) {
+    const proc = findAgentAncestor(startPid, agentType, table)
+    if (proc) {
+      return {
+        pid: proc.pid,
+        pidSource: 'parent-chain',
+        pidCommand: processSummary(proc)
+      }
+    }
+  }
+
+  const panePidResolver = options.panePidResolver || tmuxPanePid
+  const panePid = positiveInt(options.panePid) || panePidResolver(options.tmuxPane)
+  const paneAgent = findAgentProcessFromPane(panePid, agentType, table)
+  if (paneAgent) {
+    return {
+      pid: paneAgent.pid,
+      pidSource: 'process-tree',
+      pidCommand: processSummary(paneAgent)
+    }
+  }
+
+  if (payloadPid) {
+    return {
+      pid: payloadPid,
+      pidSource: 'payload',
+      pidCommand: processSummary(payloadProc)
+    }
+  }
+
+  const parentProc = processFromTable(table, parent)
+  if (parent) {
+    return {
+      pid: parent,
+      pidSource: 'parent',
+      pidCommand: processSummary(parentProc)
+    }
+  }
+
+  return {
+    pid: hookPid,
+    pidSource: 'hook',
+    pidCommand: processSummary(processFromTable(table, hookPid))
+  }
+}
+
+function userName() {
+  try {
+    return os.userInfo().username || process.env.USER || null
+  } catch (_) {
+    return process.env.USER || null
+  }
+}
+
+function hostIpAddresses() {
+  const result = []
+  try {
+    const interfaces = os.networkInterfaces()
+    for (const entries of Object.values(interfaces)) {
+      for (const entry of entries || []) {
+        if (!entry || entry.internal || !entry.address) continue
+        result.push(entry.address)
+      }
+    }
+  } catch (_) {}
+  return result
+}
+
+function hookRuntimeContext(payload = {}, options = {}) {
+  const tmuxPane = options.tmuxPane || process.env.TMUX_PANE || null
+  const resolved = resolveAgentProcess({
+    agentType: options.agentType,
+    payloadPid: payload.pid,
+    hookPid: options.hookPid || process.pid,
+    parentPid: options.parentPid || process.ppid,
+    tmuxPane,
+    panePid: options.panePid,
+    processTable: options.processTable,
+    panePidResolver: options.panePidResolver
+  })
+  const pid = positiveInt(resolved.pid)
+  const context = Object.assign({
+    hookPid: positiveInt(options.hookPid || process.pid),
+    pid,
+    pidSource: resolved.pidSource,
+    pidCommand: resolved.pidCommand,
+    hostName: os.hostname() || null,
+    userName: userName(),
+    sshClient: firstEnv(['SSH_CLIENT', 'SSH_CONNECTION'], pid || process.pid, { lines: new Map(), parents: new Map() })
+  }, terminalContext(pid || process.pid))
+  const ips = hostIpAddresses()
+  if (ips.length > 0) context.hostIpAddresses = ips
+
+  const compact = {}
+  for (const [key, value] of Object.entries(context)) {
+    if (value !== null && value !== undefined && value !== '') compact[key] = value
+  }
+  return compact
+}
+
 module.exports = {
   normalizeTty,
   getTtyByPid,
   getEnvFromProcessTree,
+  resolveAgentProcess,
+  hookRuntimeContext,
   terminalContext
 }

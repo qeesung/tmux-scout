@@ -287,18 +287,18 @@ function formatLine(session, now, currentPane) {
   const projectName = path.basename(session.workingDirectory || '?')
   const window = formatField(windowName, WINDOW_WIDTH, '36')
   const project = formatField(projectName, PROJECT_WIDTH, '37')
-  const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
+  const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n\t]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
   const terminalReason = session.crashReason || session.staleReason || session.stateReason
   const subagents = subagentDetail(session)
   const evidence = evidenceDetail(session, now)
   const detail = isTerminalSession(session) && terminalReason
-    ? `  \x1b[2m${String(terminalReason).replace(/[\r\n]+/g, ' ').slice(0, 55)}\x1b[0m`
+    ? `  \x1b[2m${String(terminalReason).replace(/[\r\n\t]+/g, ' ').slice(0, 55)}\x1b[0m`
     : isNeedsAttention(session, now)
     ? `  \x1b[31m${attentionDetail(session).slice(0, 55)}\x1b[0m`
     : unbound
     ? `  \x1b[2m(pane not yet linked — waiting for first response)\x1b[0m`
     : session.pendingToolUse && session.pendingToolUse.details
-      ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n]+/g, ' ').slice(0, 40)}\x1b[0m`
+      ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n\t]+/g, ' ').slice(0, 40)}\x1b[0m`
       : subagents
         ? `  \x1b[35m${subagents.slice(0, 55)}\x1b[0m`
       : evidence
@@ -306,7 +306,8 @@ function formatLine(session, now, currentPane) {
       : ''
 
   const paneId = session.tmuxPane || 'UNBOUND'
-  return `${paneId}\t${cur} ${tag} ${agent} ${window} ${project} ${title}${detail}`
+  const sessionId = String(session.sessionId || '').replace(/[\r\n\t]+/g, '_')
+  return `${paneId}\t${cur} ${tag} ${agent} ${window} ${project} ${title}${detail}\t${sessionId}`
 }
 
 function run(file, pane, cached) {
@@ -332,10 +333,10 @@ function run(file, pane, cached) {
   const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)
   const hWindow = 'WINDOW'.padEnd(WINDOW_WIDTH)
   const hProject = 'PROJECT'.padEnd(PROJECT_WIDTH)
-  console.log(`_\t  ${hStatus} ${hAgent} ${hWindow} ${hProject} TITLE`)
+  console.log(`_\t  ${hStatus} ${hAgent} ${hWindow} ${hProject} TITLE\t_`)
 
   if (active.length === 0) {
-    console.log('NONE\tNo active sessions found.')
+    console.log('NONE\tNo active sessions found.\t')
     return
   }
 

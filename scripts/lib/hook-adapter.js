@@ -6,7 +6,7 @@ const os = require('os')
 const net = require('net')
 const { applySessionEvent } = require('./session-state')
 const { createAgentEvent } = require('./agent-events')
-const { terminalContext } = require('./terminal-context')
+const { hookRuntimeContext } = require('./terminal-context')
 
 const LIFECYCLE_FIELDS = new Set([
   'status',
@@ -286,19 +286,24 @@ function createHookContext(config) {
 
   function baseUpdates(data, now) {
     const payload = data || {}
-    const pid = resolvePid(payload)
+    const tmuxPane = process.env.TMUX_PANE || payload.tmux_pane || payload.tmuxPane || null
+    const runtime = hookRuntimeContext(payload, {
+      agentType: adapterConfig.agentType,
+      tmuxPane
+    })
+    const pid = runtime.pid || resolvePid(payload)
     const base = Object.assign({
       agentType: adapterConfig.agentType,
-      workingDirectory: payload.cwd,
+      workingDirectory: payload.cwd || process.cwd(),
       transcriptPath: payload.transcript_path,
-      tmuxPane: process.env.TMUX_PANE || null,
+      tmuxPane,
       pid,
       lastHookAt: now,
       lastHookEventName: payload.hook_event_name || payload.event_type || payload.type || null
-    }, terminalContext(pid))
+    }, runtime)
 
     if (typeof adapterConfig.baseFields === 'function') {
-      Object.assign(base, adapterConfig.baseFields(payload, now, pid))
+      Object.assign(base, adapterConfig.baseFields(payload, now, pid, runtime))
     }
 
     return base

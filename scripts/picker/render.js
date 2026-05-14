@@ -137,6 +137,31 @@ function getActiveSessions(status, panes) {
   const byPane = new Map()
   const unbound = []
   const now = Date.now()
+
+  function paneActivityRank(session) {
+    if (isNeedsAttention(session, now) || session.status === 'working') return 0
+    if (session.status === 'completed' || session.status === 'idle') return 1
+    if (session.status === 'interrupted') return 2
+    if (session.status === 'crashed' || session.status === 'stale') return 3
+    return 4
+  }
+
+  function foregroundTimestamp(session) {
+    if (Number.isFinite(session.lastHookAt) && session.lastHookAt > 0) return session.lastHookAt
+    if (session.lastEvent && session.lastEvent.type !== 'pane_state'
+      && Number.isFinite(session.lastUpdated) && session.lastUpdated > 0) {
+      return session.lastUpdated
+    }
+    return session.startedAt || session.lastUpdated || 0
+  }
+
+  function shouldReplacePaneSession(existing, candidate) {
+    if (!existing) return true
+    const rankDelta = paneActivityRank(candidate) - paneActivityRank(existing)
+    if (rankDelta !== 0) return rankDelta < 0
+    return foregroundTimestamp(candidate) > foregroundTimestamp(existing)
+  }
+
   for (const session of Object.values(status.sessions || {})) {
     if (!isActiveSession(session, panes, now)) continue
     if (!session.tmuxPane) {
@@ -144,7 +169,7 @@ function getActiveSessions(status, panes) {
       continue
     }
     const existing = byPane.get(session.tmuxPane)
-    if (!existing || (session.lastUpdated || 0) > (existing.lastUpdated || 0)) {
+    if (shouldReplacePaneSession(existing, session)) {
       byPane.set(session.tmuxPane, session)
     }
   }

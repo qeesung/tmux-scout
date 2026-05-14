@@ -88,8 +88,9 @@ function subagentInfo(meta) {
     : null
   const src = sourceObject(meta)
   const parentSessionId = meta.forked_from_id || (threadSpawn && threadSpawn.parent_thread_id)
-  const hasSubagentSource = Boolean(src && src.subagent)
-  if (!parentSessionId && !hasSubagentSource) return null
+  // Standalone Codex review sessions use source.subagent = "review"
+  // without a parent thread; those should remain visible.
+  if (!parentSessionId) return null
 
   return {
     parentSessionId: parentSessionId || null,

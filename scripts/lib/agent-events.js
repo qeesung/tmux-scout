@@ -51,8 +51,62 @@ function normalizeAgentEventType(type) {
   return AGENT_EVENT_ALIASES[type] || type
 }
 
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null) return value
+  }
+  return undefined
+}
+
+function normalizeTimestamp(value, fallback = Date.now()) {
+  if (Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = new Date(value).getTime()
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
+}
+
+function normalizeAgentEvent(event, defaults = {}) {
+  const input = event && typeof event === 'object' ? event : { type: event }
+  const base = defaults && typeof defaults === 'object' ? defaults : {}
+  const timestamp = normalizeTimestamp(firstDefined(input.timestamp, base.timestamp))
+  const type = normalizeAgentEventType(firstDefined(input.type, base.type))
+
+  const normalized = Object.assign({}, base, input, {
+    type,
+    timestamp,
+    source: firstDefined(input.source, base.source, 'unknown'),
+    stateSource: firstDefined(input.stateSource, base.stateSource),
+    rawEventName: firstDefined(
+      input.rawEventName,
+      input.hookEventName,
+      input.hook_event_name,
+      base.rawEventName,
+      base.hookEventName,
+      base.hook_event_name
+    ),
+    turnId: firstDefined(input.turnId, input.turn_id, base.turnId, base.turn_id),
+    transcriptPath: firstDefined(input.transcriptPath, input.transcript_path, base.transcriptPath, base.transcript_path),
+    tmuxPane: firstDefined(input.tmuxPane, base.tmuxPane),
+    pid: firstDefined(input.pid, base.pid)
+  })
+
+  if (normalized.rawEventName === undefined && type) {
+    normalized.rawEventName = type
+  }
+  return normalized
+}
+
+function createAgentEvent(type, fields = {}) {
+  if (type && typeof type === 'object') return normalizeAgentEvent(type, fields)
+  return normalizeAgentEvent(Object.assign({}, fields, { type }))
+}
+
 module.exports = {
   AGENT_EVENTS,
   AGENT_EVENT_ALIASES,
-  normalizeAgentEventType
+  normalizeAgentEventType,
+  normalizeAgentEvent,
+  createAgentEvent
 }

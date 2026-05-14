@@ -8,6 +8,8 @@ const { AGENT_EVENTS } = require('./agent-events')
 
 const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = 128 * 1024
+const ATTACH_RETRY_INTERVAL_MS = 250
+const ATTACH_RETRY_MAX_ATTEMPTS = 24
 
 function writeJsonAtomic(filePath, data) {
   const tempPath = filePath + '.tmp.' + process.pid
@@ -30,6 +32,19 @@ function readJson(filePath, fallback) {
 
 function sessionFilePath(statusFile, sessionId) {
   return path.join(path.dirname(statusFile), 'sessions', sessionId.replace(/[/\\:]/g, '_') + '.json')
+}
+
+function readFileRange(filePath, start, endExclusive) {
+  const length = Math.max(0, endExclusive - start)
+  if (length === 0) return ''
+  const fd = fs.openSync(filePath, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(length)
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start)
+    return buffer.toString('utf-8', 0, bytesRead)
+  } finally {
+    fs.closeSync(fd)
+  }
 }
 
 function eventTimestampMs(obj) {
@@ -111,6 +126,7 @@ class ClaudeTranscriptWatchManager {
     this.log = typeof log === 'function' ? log : () => {}
     this.watches = new Map()
     this.timers = new Map()
+    this.retryTimers = new Map()
   }
 
   reconcile(status) {
@@ -126,14 +142,32 @@ class ClaudeTranscriptWatchManager {
       if (desired.get(sessionId) === watch.transcriptPath) continue
       this.closeOne(sessionId)
     }
+    for (const [sessionId, retry] of Array.from(this.retryTimers.entries())) {
+      if (desired.get(sessionId) === retry.transcriptPath) continue
+      this.closeOne(sessionId)
+    }
 
     for (const [sessionId, transcriptPath] of desired.entries()) {
       if (this.watches.has(sessionId)) continue
+      const retry = this.retryTimers.get(sessionId)
+      if (retry && retry.transcriptPath === transcriptPath) continue
       this.openOne(sessionId, transcriptPath)
     }
   }
 
   openOne(sessionId, transcriptPath) {
+    this.tryOpenOne(sessionId, transcriptPath, 0)
+  }
+
+  tryOpenOne(sessionId, transcriptPath, attempt) {
+    let initialOffset = 0
+    try {
+      initialOffset = fs.statSync(transcriptPath).size
+    } catch (_) {
+      initialOffset = 0
+    }
+    if (attempt > 0) initialOffset = 0
+
     try {
       const watcher = fs.watch(transcriptPath, { persistent: false }, () => {
         this.scheduleCheck(sessionId)
@@ -142,10 +176,67 @@ class ClaudeTranscriptWatchManager {
         this.log(`claude transcript watch error session=${sessionId}: ${error.message}`)
         this.closeOne(sessionId)
       })
-      this.watches.set(sessionId, { watcher, transcriptPath })
+      this.watches.set(sessionId, {
+        watcher,
+        transcriptPath,
+        lastOffset: initialOffset,
+        partialLine: ''
+      })
+      if (attempt > 0) this.scheduleCheck(sessionId)
     } catch (error) {
+      if (error && error.code === 'ENOENT' && attempt + 1 < ATTACH_RETRY_MAX_ATTEMPTS) {
+        const timer = setTimeout(() => {
+          const retry = this.retryTimers.get(sessionId)
+          if (!retry || retry.transcriptPath !== transcriptPath) return
+          this.retryTimers.delete(sessionId)
+          this.tryOpenOne(sessionId, transcriptPath, attempt + 1)
+        }, ATTACH_RETRY_INTERVAL_MS)
+        if (timer && typeof timer.unref === 'function') timer.unref()
+        this.retryTimers.set(sessionId, { timer, transcriptPath })
+        return
+      }
       this.log(`claude transcript watch unavailable session=${sessionId}: ${error.message}`)
     }
+  }
+
+  scanWatch(sessionId) {
+    const watch = this.watches.get(sessionId)
+    if (!watch) return false
+
+    let stat
+    try {
+      stat = fs.statSync(watch.transcriptPath)
+    } catch (_) {
+      return false
+    }
+
+    if (!Number.isFinite(watch.lastOffset) || stat.size < watch.lastOffset) {
+      watch.lastOffset = 0
+      watch.partialLine = ''
+    }
+    if (stat.size === watch.lastOffset) return false
+
+    const chunk = readFileRange(watch.transcriptPath, watch.lastOffset, stat.size)
+    watch.lastOffset = stat.size
+    const text = String(watch.partialLine || '') + chunk
+    const lastNewline = text.lastIndexOf('\n')
+    if (lastNewline < 0) {
+      watch.partialLine = text
+      return false
+    }
+
+    const complete = text.slice(0, lastNewline + 1)
+    watch.partialLine = text.slice(lastNewline + 1)
+    for (const line of splitJsonlLines(complete)) {
+      let obj = null
+      try {
+        obj = JSON.parse(line)
+      } catch (_) {}
+      if (obj ? containsInterruptText(obj) : /request interrupted by user/i.test(line)) {
+        return true
+      }
+    }
+    return false
   }
 
   scheduleCheck(sessionId) {
@@ -153,7 +244,9 @@ class ClaudeTranscriptWatchManager {
     const timer = setTimeout(() => {
       this.timers.delete(sessionId)
       try {
-        if (markInterrupted(this.statusFile, sessionId)) this.closeOne(sessionId)
+        if (this.scanWatch(sessionId) && markInterrupted(this.statusFile, sessionId)) {
+          this.closeOne(sessionId)
+        }
       } catch (error) {
         this.log(`claude transcript watch check failed session=${sessionId}: ${error.message}`)
       }
@@ -163,6 +256,9 @@ class ClaudeTranscriptWatchManager {
   }
 
   closeOne(sessionId) {
+    const retry = this.retryTimers.get(sessionId)
+    if (retry) clearTimeout(retry.timer)
+    this.retryTimers.delete(sessionId)
     const timer = this.timers.get(sessionId)
     if (timer) clearTimeout(timer)
     this.timers.delete(sessionId)
@@ -177,6 +273,8 @@ class ClaudeTranscriptWatchManager {
     for (const sessionId of Array.from(this.watches.keys())) this.closeOne(sessionId)
     for (const timer of this.timers.values()) clearTimeout(timer)
     this.timers.clear()
+    for (const retry of this.retryTimers.values()) clearTimeout(retry.timer)
+    this.retryTimers.clear()
   }
 }
 
@@ -184,5 +282,7 @@ module.exports = {
   CLAUDE_INTERRUPT_MARKER,
   findLatestClaudeInterrupt,
   markInterrupted,
-  ClaudeTranscriptWatchManager
+  ClaudeTranscriptWatchManager,
+  ATTACH_RETRY_INTERVAL_MS,
+  ATTACH_RETRY_MAX_ATTEMPTS
 }

@@ -15,9 +15,10 @@ const { agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
 const { startBridgeServer } = require('../scripts/lib/bridge-server')
-const { markInterrupted: markClaudeInterrupted } = require('../scripts/lib/claude-transcript-watcher')
+const { markInterrupted: markClaudeInterrupted, ClaudeTranscriptWatchManager } = require('../scripts/lib/claude-transcript-watcher')
 const { startOptionalBridge } = require('../scripts/watcher')
-const { AGENT_EVENTS, normalizeAgentEventType } = require('../scripts/lib/agent-events')
+const { AGENT_EVENTS, normalizeAgentEventType, createAgentEvent } = require('../scripts/lib/agent-events')
+const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
@@ -184,6 +185,40 @@ test('jsonl reader exposes reusable tail and line splitting helpers', () => {
     assert.ok(tail)
     assert.ok(tail.text.includes('"index":3'))
     assert.ok(Number.isFinite(tail.mtimeMs))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex transcript detector matches interrupted turns by id or timestamp', () => {
+  const dir = tempDir()
+  try {
+    const file = path.join(dir, 'codex.jsonl')
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(1000).toISOString(),
+        payload: { type: 'turn_aborted', turn_id: 'old-turn', reason: 'interrupted' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(3000).toISOString(),
+        payload: { type: 'turn_aborted', turn_id: 'current-turn', reason: 'interrupted' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(4000).toISOString(),
+        payload: { type: 'turn_aborted', turn_id: 'ignored', reason: 'other' }
+      })
+    ].join('\n') + '\n')
+
+    const byTurn = findLatestCodexInterrupt(file, { expectTurnId: 'current-turn' })
+    assert.strictEqual(byTurn.turnId, 'current-turn')
+    assert.strictEqual(byTurn.abortedAtMs, 3000)
+
+    const byTime = findLatestCodexInterrupt(file, { minTimestampMs: 2000 })
+    assert.strictEqual(byTime.turnId, 'current-turn')
+    assert.strictEqual(findLatestCodexInterrupt(file, { expectTurnId: 'missing' }), null)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -535,6 +570,24 @@ test('agent event aliases normalize to persisted event names', () => {
   assert.strictEqual(normalizeAgentEventType(AGENT_EVENTS.PERMISSION_REQUEST), AGENT_EVENTS.PERMISSION_REQUEST)
 })
 
+test('agent events normalize source metadata for reducer evidence', () => {
+  const event = createAgentEvent('toolUseStarted', {
+    source: 'codex-hooks',
+    hook_event_name: 'PreToolUse',
+    timestamp: '2026-01-01T00:00:00.000Z',
+    turn_id: 'turn-1',
+    transcript_path: '/tmp/codex.jsonl',
+    tmuxPane: '%1',
+    pid: 123
+  })
+
+  assert.strictEqual(event.type, AGENT_EVENTS.TOOL_USE)
+  assert.strictEqual(event.rawEventName, 'PreToolUse')
+  assert.strictEqual(event.turnId, 'turn-1')
+  assert.strictEqual(event.transcriptPath, '/tmp/codex.jsonl')
+  assert.strictEqual(event.timestamp, new Date('2026-01-01T00:00:00.000Z').getTime())
+})
+
 test('bridge client falls back to direct writes when no ACK is received', async () => {
   const dir = tempDir()
   let server = null
@@ -691,6 +744,51 @@ test('session reducer protects recent high-confidence hook state', () => {
 
   assert.strictEqual(applied.applied, true)
   assert.strictEqual(currentPhase(session), 'completed')
+})
+
+test('session reducer records applied and blocked state evidence', () => {
+  const session = { sessionId: 'evidence-session', agentType: 'codex', startedAt: 1000 }
+  const first = applySessionEvent(session, {
+    type: 'prompt_submit',
+    source: 'hook',
+    rawEventName: 'UserPromptSubmit',
+    timestamp: 1000,
+    transcriptPath: '/tmp/session.jsonl',
+    tmuxPane: '%1',
+    pid: 123,
+    turnId: 'turn-a'
+  })
+
+  assert.strictEqual(first.applied, true)
+  assert.strictEqual(first.evidenceChanged, true)
+  assert.strictEqual(session.stateEvidence.length, 1)
+  assert.strictEqual(session.stateEvidence[0].rawEventName, 'UserPromptSubmit')
+  assert.strictEqual(session.stateEvidence[0].applied, true)
+  assert.strictEqual(session.stateEvidence[0].turnId, 'turn-a')
+
+  const blocked = applySessionEvent(session, {
+    type: 'pane_state',
+    source: 'pane',
+    timestamp: 2000,
+    phase: 'completed',
+    status: 'completed'
+  })
+
+  assert.strictEqual(blocked.applied, false)
+  assert.strictEqual(blocked.evidenceChanged, true)
+  assert.strictEqual(session.stateEvidence[0].applied, false)
+  assert.ok(/priority/.test(session.stateEvidence[0].blockedReason))
+  assert.strictEqual(currentPhase(session), 'running')
+
+  const duplicate = applySessionEvent(session, {
+    type: 'pane_state',
+    source: 'pane',
+    timestamp: 3000,
+    phase: 'completed',
+    status: 'completed'
+  })
+  assert.strictEqual(duplicate.evidenceChanged, false)
+  assert.strictEqual(session.stateEvidence.length, 2)
 })
 
 test('session reducer does not let same-phase pane reads downgrade hook protection', () => {
@@ -1257,6 +1355,166 @@ test('codex full sync refreshes unchanged same-phase active unbound sessions', (
   }
 })
 
+test('codex sync marks matching current turn interrupted from transcript', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '36363636-3636-4636-8636-363636363636'
+    const jsonl = path.join(dir, 'codex-interrupted.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(Date.now() - 2000).toISOString(),
+        payload: { type: 'user_message', message: 'keep working', turn_id: 'turn-current' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(Date.now() - 1000).toISOString(),
+        payload: { type: 'turn_aborted', turn_id: 'turn-current', reason: 'interrupted' }
+      })
+    ].join('\n') + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-current',
+      lastUpdated: Date.now() - 3000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'interrupted')
+    assert.strictEqual(updated.lastEvent.turnId, 'turn-current')
+    assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
+    assert.strictEqual(result.stats.codex.interrupted, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync accepts current turn interrupted transcript without turn id', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '38383838-3838-4838-8838-383838383838'
+    const jsonl = path.join(dir, 'codex-interrupted-no-turn.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(Date.now() - 2000).toISOString(),
+        payload: { type: 'user_message', message: 'keep working', turn_id: 'turn-current' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(Date.now() - 1000).toISOString(),
+        payload: { type: 'turn_aborted', reason: 'interrupted' }
+      })
+    ].join('\n') + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-current',
+      lastUpdated: Date.now() - 3000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'interrupted')
+    assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
+    assert.strictEqual(result.stats.codex.interrupted, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync ignores stale interrupted transcript events for newer turns', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '37373737-3737-4737-8737-373737373737'
+    const jsonl = path.join(dir, 'codex-stale-interrupt.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(Date.now() - 2000).toISOString(),
+        payload: { type: 'user_message', message: 'current work', turn_id: 'turn-current' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(Date.now() - 1000).toISOString(),
+        payload: { type: 'turn_aborted', turn_id: 'turn-old', reason: 'interrupted' }
+      })
+    ].join('\n') + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-current',
+      lastUpdated: Date.now() - 3000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'running')
+    assert.strictEqual(updated.status, 'working')
+    assert.strictEqual(result.stats.codex.interrupted, 0)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('codex sync marks stale unbound sessions even when a stale pid is present', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
@@ -1343,6 +1601,54 @@ test('claude transcript watcher helper marks running sessions interrupted', () =
     assert.strictEqual(updated.status, 'interrupted')
     assert.strictEqual(updated.endedAt, null)
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude transcript watcher retries missing files and preserves partial lines', () => {
+  const dir = tempDir()
+  let manager
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    const sessionsDir = path.join(scoutDir, 'sessions')
+    fs.mkdirSync(sessionsDir, { recursive: true })
+    const sessionId = 'claude-watch-partial'
+    const transcriptPath = path.join(dir, 'claude-partial.jsonl')
+    const now = Date.now()
+    const session = {
+      sessionId,
+      agentType: 'claude',
+      status: 'working',
+      phase: 'running',
+      startedAt: now - 1000,
+      lastUpdated: now,
+      endedAt: null,
+      transcriptPath
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: { [sessionId]: session }
+    }, null, 2))
+    fs.writeFileSync(path.join(sessionsDir, `${sessionId}.json`), JSON.stringify(session, null, 2))
+
+    manager = new ClaudeTranscriptWatchManager(statusFile)
+    manager.openOne('missing-session', path.join(dir, 'missing.jsonl'))
+    assert.strictEqual(manager.retryTimers.has('missing-session'), true)
+    manager.closeOne('missing-session')
+
+    fs.writeFileSync(transcriptPath, '')
+    manager.openOne(sessionId, transcriptPath)
+    fs.appendFileSync(transcriptPath, '{"timestamp":"' + new Date(now + 1000).toISOString() + '","message":{"content":[{"type":"text","text":"[Request interrupted')
+    assert.strictEqual(manager.scanWatch(sessionId), false)
+    fs.appendFileSync(transcriptPath, ' by user]"}]}}\n')
+    assert.strictEqual(manager.scanWatch(sessionId), true)
+    assert.strictEqual(markClaudeInterrupted(statusFile, sessionId), true)
+    const updated = JSON.parse(fs.readFileSync(statusFile, 'utf-8')).sessions[sessionId]
+    assert.strictEqual(currentPhase(updated), 'interrupted')
+  } finally {
+    if (manager) manager.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -1638,6 +1944,36 @@ test('codex hook treats question-like Stop messages as waiting for answer', () =
     assert.strictEqual(session.needsAttention, 'waiting for answer')
     assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastEvent.type, 'question_asked')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook persists event evidence with hook metadata', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-evidence'
+    const transcriptPath = path.join(dir, 'codex-evidence.jsonl')
+    fs.writeFileSync(transcriptPath, '')
+    runHook('scripts/hooks/codex.js', {
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath,
+      turn_id: 'turn-hook',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }, dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.ok(Array.isArray(session.stateEvidence))
+    assert.strictEqual(session.stateEvidence[0].type, AGENT_EVENTS.TOOL_USE)
+    assert.strictEqual(session.stateEvidence[0].rawEventName, 'PreToolUse')
+    assert.strictEqual(session.stateEvidence[0].turnId, 'turn-hook')
+    assert.strictEqual(session.stateEvidence[0].transcriptPath, transcriptPath)
+    assert.strictEqual(session.stateEvidence[0].tmuxPane, '%1')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

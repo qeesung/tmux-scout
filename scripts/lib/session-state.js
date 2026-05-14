@@ -1,6 +1,6 @@
 // Central session state reducer for tmux-scout.
 
-const { AGENT_EVENTS, normalizeAgentEventType } = require('./agent-events')
+const { AGENT_EVENTS, normalizeAgentEvent } = require('./agent-events')
 
 const SOURCE_PRIORITY = {
   hook: 90,
@@ -15,6 +15,8 @@ const SOURCE_PRIORITY = {
 }
 
 const PROTECTED_PHASE_MS = 120000
+const MAX_STATE_EVIDENCE = 20
+const EVIDENCE_DEDUPE_MS = 10000
 const TERMINAL_PHASES = new Set(['crashed', 'stale'])
 const NON_TERMINAL_END_PHASES = new Set(['completed', 'interrupted'])
 const ACTIVE_TOOL_PHASES = new Set(['running', 'waitingForApproval'])
@@ -66,7 +68,7 @@ function attentionForPhase(phase, reason) {
 }
 
 function phaseForEvent(event) {
-  switch (normalizeAgentEventType(event.type)) {
+  switch (event.type) {
     case AGENT_EVENTS.SESSION_START: return 'idle'
     case AGENT_EVENTS.PROMPT_SUBMIT: return 'running'
     case AGENT_EVENTS.TOOL_USE: return 'running'
@@ -102,10 +104,10 @@ function currentPhaseFromStatus(status, needsAttention) {
   return null
 }
 
-function shouldApplyPhase(session, event, nextPhase, now) {
-  if (!nextPhase) return false
+function phaseDecision(session, event, nextPhase, now) {
+  if (!nextPhase) return { apply: false, blockedReason: 'no phase change' }
   const current = currentPhase(session)
-  if (TERMINAL_PHASES.has(nextPhase)) return true
+  if (TERMINAL_PHASES.has(nextPhase)) return { apply: true }
 
   const incomingPriority = Number.isFinite(event.priority)
     ? event.priority
@@ -121,17 +123,28 @@ function shouldApplyPhase(session, event, nextPhase, now) {
   const currentIsTerminal = TERMINAL_PHASES.has(current)
   const currentSource = normalizeSource(lifecycle.source || session.stateSource)
 
-  if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== AGENT_EVENTS.SESSION_START) return false
-  if (event.force) return true
-  if (nextPhase === 'interrupted') return true
+  if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== AGENT_EVENTS.SESSION_START) {
+    return { apply: false, blockedReason: `current phase ${current} is terminal` }
+  }
+  if (event.force) return { apply: true }
+  if (nextPhase === 'interrupted') return { apply: true }
   if (event.type === AGENT_EVENTS.PANE_STATE && nextPhase === 'running' && currentSource === 'transcript'
     && (current === 'waitingForApproval' || current === 'waitingForAnswer')) {
-    return true
+    return { apply: true }
   }
-  if (incomingPriority < currentPriority && currentAge < PROTECTED_PHASE_MS) return false
-  if (current === nextPhase) return true
+  if (incomingPriority < currentPriority && currentAge < PROTECTED_PHASE_MS) {
+    return {
+      apply: false,
+      blockedReason: `source priority ${incomingPriority} below ${currentPriority} within ${PROTECTED_PHASE_MS}ms protection window`
+    }
+  }
+  if (current === nextPhase) return { apply: true }
 
-  return true
+  return { apply: true }
+}
+
+function shouldApplyPhase(session, event, nextPhase, now) {
+  return phaseDecision(session, event, nextPhase, now).apply
 }
 
 function setPhase(session, phase, event, now) {
@@ -168,11 +181,88 @@ function setPhase(session, phase, event, now) {
   }
 }
 
+function compactEvidenceText(value, max = 160) {
+  if (value === undefined || value === null) return undefined
+  const text = String(value).replace(/[\r\n\t]+/g, ' ').trim()
+  if (!text) return undefined
+  return text.length > max ? text.slice(0, max - 1) + '~' : text
+}
+
+function evidenceForEvent(session, event, nextPhase, previousPhase, applied, blockedReason, now) {
+  const pendingTool = event.pendingToolUse && event.pendingToolUse.tool
+    ? event.pendingToolUse.tool
+    : undefined
+  const explicitToolCleared = event.pendingToolUse === null || event.activeTool === null
+  const activeTool = event.activeTool !== undefined
+    ? event.activeTool
+    : explicitToolCleared ? undefined : pendingTool || session.activeTool || undefined
+  return {
+    type: event.type,
+    source: normalizeSource(event.source),
+    rawEventName: event.rawEventName || event.type,
+    timestamp: now,
+    phase: nextPhase || event.phase || previousPhase,
+    previousPhase,
+    applied: Boolean(applied),
+    blockedReason: applied ? undefined : compactEvidenceText(blockedReason),
+    reason: compactEvidenceText(event.reason || event.details || event.type),
+    details: compactEvidenceText(event.details),
+    turnId: event.turnId,
+    transcriptPath: event.transcriptPath || session.transcriptPath,
+    tmuxPane: event.tmuxPane || session.tmuxPane,
+    pid: Number.isInteger(event.pid) ? event.pid : session.pid,
+    activeTool
+  }
+}
+
+function evidenceKey(evidence) {
+  return [
+    evidence.type,
+    evidence.source,
+    evidence.rawEventName,
+    evidence.phase,
+    evidence.applied ? '1' : '0',
+    evidence.blockedReason || '',
+    evidence.reason || '',
+    evidence.details || '',
+    evidence.turnId || '',
+    evidence.transcriptPath || '',
+    evidence.tmuxPane || '',
+    evidence.pid || '',
+    evidence.activeTool || ''
+  ].join('\u0001')
+}
+
+function appendStateEvidence(session, evidence) {
+  if (!evidence || !evidence.type) return false
+  const entries = Array.isArray(session.stateEvidence)
+    ? session.stateEvidence.filter(Boolean)
+    : []
+  const last = entries[0]
+  if (last && evidenceKey(last) === evidenceKey(evidence)
+    && Number.isFinite(last.timestamp)
+    && Math.abs(evidence.timestamp - last.timestamp) <= EVIDENCE_DEDUPE_MS) {
+    return false
+  }
+
+  const clean = {}
+  for (const [key, value] of Object.entries(evidence)) {
+    if (value !== undefined && value !== null) clean[key] = value
+  }
+  session.stateEvidence = [clean].concat(entries).slice(0, MAX_STATE_EVIDENCE)
+  return true
+}
+
 function applySessionEvent(session, event) {
   if (!session || !event || !event.type) return { changed: false, applied: false }
-  event = Object.assign({}, event, { type: normalizeAgentEventType(event.type) })
+  event = normalizeAgentEvent(event, {
+    transcriptPath: session.transcriptPath,
+    tmuxPane: session.tmuxPane,
+    pid: session.pid
+  })
   const now = Number.isFinite(event.timestamp) ? event.timestamp : Date.now()
   const before = JSON.stringify(session)
+  const previousPhase = currentPhase(session)
 
   if (event.updates && typeof event.updates === 'object') {
     for (const [key, value] of Object.entries(event.updates)) {
@@ -181,8 +271,14 @@ function applySessionEvent(session, event) {
   }
 
   const nextPhase = phaseForEvent(event)
-  const applied = shouldApplyPhase(session, event, nextPhase, now)
+  const decision = phaseDecision(session, event, nextPhase, now)
+  const applied = decision.apply
   if (applied) setPhase(session, nextPhase, event, now)
+
+  const evidenceChanged = appendStateEvidence(
+    session,
+    evidenceForEvent(session, event, nextPhase, previousPhase, applied, decision.blockedReason, now)
+  )
 
   if (applied || !nextPhase) {
     if (event.pendingToolUse !== undefined) session.pendingToolUse = event.pendingToolUse
@@ -197,7 +293,12 @@ function applySessionEvent(session, event) {
       type: event.type,
       timestamp: now,
       details: event.details,
-      turnId: event.turnId
+      turnId: event.turnId,
+      source: normalizeSource(event.source),
+      rawEventName: event.rawEventName,
+      transcriptPath: event.transcriptPath,
+      tmuxPane: event.tmuxPane,
+      pid: event.pid
     }
     if (event.lastEvent) {
       session.lastEvent = Object.assign({}, session.lastEvent, event.lastEvent)
@@ -209,7 +310,7 @@ function applySessionEvent(session, event) {
     session.lastUpdated = now
   }
 
-  return { changed: before !== JSON.stringify(session), applied }
+  return { changed: before !== JSON.stringify(session), applied, evidenceChanged }
 }
 
 module.exports = {
@@ -217,5 +318,7 @@ module.exports = {
   currentPhase,
   sourcePriority,
   normalizeSource,
-  PROTECTED_PHASE_MS
+  PROTECTED_PHASE_MS,
+  MAX_STATE_EVIDENCE,
+  EVIDENCE_DEDUPE_MS
 }

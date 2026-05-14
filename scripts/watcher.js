@@ -147,6 +147,7 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     + (reconcile.paneShellExits || 0)
     + (reconcile.pidBindings || 0)
   const codexChanges = (codex.discovered || 0) + (codex.updated || 0) + (codex.stale || 0)
+  const evidence = stats && stats.evidence ? stats.evidence : {}
   const paneUpdates = paneGroundTruth.updates || 0
   const stuckInterruptions = stuckTools.interrupted || 0
   const claudeInterruptions = claudeTranscript.interrupted || 0
@@ -163,6 +164,7 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     pidBindings: reconcile.pidBindings || 0,
     codexDiscovered: codex.discovered || 0,
     codexUpdated: codex.updated || 0,
+    codexInterrupted: codex.interrupted || 0,
     codexStale: codex.stale || 0,
     codexFilesRead: codex.filesRead || 0,
     codexEventsParsed: codex.eventsParsed || 0,
@@ -171,7 +173,8 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     claudeTranscriptParseErrors: claudeTranscript.parseErrors || 0,
     claudeInterrupted: claudeInterruptions,
     paneUpdates,
-    stuckToolInterruptions: stuckInterruptions
+    stuckToolInterruptions: stuckInterruptions,
+    evidenceWritten: evidence.written || 0
   }
 }
 
@@ -197,9 +200,11 @@ function formatTickDiagnostics(summary) {
   if (summary.claudeInterrupted > 0) parts.push(`claudeInterrupted=${summary.claudeInterrupted}`)
   if (summary.codexDiscovered > 0) parts.push(`codexDiscovered=${summary.codexDiscovered}`)
   if (summary.codexUpdated > 0) parts.push(`codexUpdated=${summary.codexUpdated}`)
+  if (summary.codexInterrupted > 0) parts.push(`codexInterrupted=${summary.codexInterrupted}`)
   if (summary.codexStale > 0) parts.push(`codexStale=${summary.codexStale}`)
   if (summary.paneUpdates > 0) parts.push(`paneUpdates=${summary.paneUpdates}`)
   if (summary.stuckToolInterruptions > 0) parts.push(`stuckTools=${summary.stuckToolInterruptions}`)
+  if (summary.evidenceWritten > 0) parts.push(`evidence=${summary.evidenceWritten}`)
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
 

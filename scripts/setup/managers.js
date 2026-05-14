@@ -2,6 +2,10 @@
 
 const claude = require('./claude')
 const codex = require('./codex')
+const gemini = require('./gemini')
+const kimi = require('./kimi')
+const copilotCli = require('./copilot-cli')
+const opencode = require('./opencode')
 
 const HOOK_MANAGERS = [
   {
@@ -17,6 +21,34 @@ const HOOK_MANAGERS = [
     label: 'Codex',
     detail: '(~/.codex/hooks.json + config.toml)',
     module: codex
+  },
+  {
+    id: 'gemini',
+    flag: '--gemini',
+    label: 'Gemini CLI',
+    detail: '(~/.gemini/settings.json)',
+    module: gemini
+  },
+  {
+    id: 'kimi',
+    flag: '--kimi',
+    label: 'Kimi CLI',
+    detail: '(~/.kimi/config.toml)',
+    module: kimi
+  },
+  {
+    id: 'copilot-cli',
+    flag: '--copilot-cli',
+    label: 'GitHub Copilot CLI',
+    detail: '(~/.copilot/settings.json)',
+    module: copilotCli
+  },
+  {
+    id: 'opencode',
+    flag: '--opencode',
+    label: 'OpenCode',
+    detail: '(~/.config/opencode)',
+    module: opencode
   }
 ]
 
@@ -105,14 +137,27 @@ function codexHealth(manager, status) {
 }
 
 function genericHealth(manager, status) {
-  const installed = Boolean(status && status.installed)
+  let installed = Boolean(status && status.installed)
+  let partial = installed
+  let summary = installed ? 'installed' : 'not installed'
+  const issues = []
+
+  if (status && Number.isFinite(status.total) && Number.isFinite(status.installed)) {
+    installed = status.installed === status.total
+    partial = status.installed > 0
+    summary = `${status.installed}/${status.total} hooks installed`
+    if (!installed && Array.isArray(status.missing) && status.missing.length > 0) {
+      issues.push('Missing hooks: ' + status.missing.join(', '))
+    }
+  }
+
   return {
     id: manager.id,
     label: manager.label,
     installed,
-    partial: installed,
-    summary: installed ? 'installed' : 'not installed',
-    issues: installed ? [] : ['Hook not installed'],
+    partial,
+    summary,
+    issues: installed ? [] : (issues.length > 0 ? issues : ['Hook not installed']),
     raw: status
   }
 }

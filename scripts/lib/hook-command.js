@@ -10,8 +10,11 @@ function wrapWithInstallCheck(command, hookPath) {
   return `[ -e ${shellQuote(hookPath)} ] || exit 0; ${command}`
 }
 
-function buildNodeHookCommand(hookPath) {
-  return wrapWithInstallCheck(`node ${shellQuote(hookPath)}`, hookPath)
+function buildNodeHookCommand(hookPath, args = []) {
+  const suffix = Array.isArray(args) && args.length > 0
+    ? ' ' + args.map(shellQuote).join(' ')
+    : ''
+  return wrapWithInstallCheck(`node ${shellQuote(hookPath)}${suffix}`, hookPath)
 }
 
 function extractHookPathFromCommand(command, expectedBasename) {

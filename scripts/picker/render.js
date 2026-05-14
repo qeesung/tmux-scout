@@ -7,6 +7,7 @@ const path = require('path')
 const { execSync } = require('child_process')
 const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { agentDisplay } = require('../lib/agents')
+const { AGENT_EVENTS } = require('../lib/agent-events')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
@@ -83,7 +84,7 @@ function isShellCommand(command) {
 function canUseShellFallback(session) {
   if (session.agentType === 'codex') return true
   const lastEventType = session && session.lastEvent ? session.lastEvent.type : null
-  return session.status === 'working' || lastEventType === 'prompt_submit' || lastEventType === 'tool_use' || Boolean(session.pendingToolUse)
+  return session.status === 'working' || lastEventType === AGENT_EVENTS.PROMPT_SUBMIT || lastEventType === AGENT_EVENTS.TOOL_USE || Boolean(session.pendingToolUse)
 }
 
 function isNeedsAttention(session, now) {
@@ -118,6 +119,10 @@ function isActiveSession(session, panes, now = Date.now()) {
 
   // Discovered from JSONL but hook hasn't fired yet — no pane bound
   if (!session.tmuxPane) {
+    if (session.status === 'completed') return false
+    if (String(session.stateSource || '').endsWith('-hooks')) return false
+    const lastSeen = session.lastUpdated || session.startedAt || 0
+    if (lastSeen && now - lastSeen > TERMINAL_DISPLAY_MS) return false
     return session.status !== 'idle'
   }
   const pane = panes.get(session.tmuxPane)
@@ -148,7 +153,7 @@ function getActiveSessions(status, panes) {
 
   function foregroundTimestamp(session) {
     if (Number.isFinite(session.lastHookAt) && session.lastHookAt > 0) return session.lastHookAt
-    if (session.lastEvent && session.lastEvent.type !== 'pane_state'
+    if (session.lastEvent && session.lastEvent.type !== AGENT_EVENTS.PANE_STATE
       && Number.isFinite(session.lastUpdated) && session.lastUpdated > 0) {
       return session.lastUpdated
     }

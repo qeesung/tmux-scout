@@ -1,0 +1,1236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tmux-scout 与 Flux Desktop Agent 状态同步对比</title>
+<style>
+  :root {
+    --canvas: #faf9f5;
+    --surface-soft: #f5f0e8;
+    --surface-card: #efe9de;
+    --surface-cream-strong: #e8e0d2;
+    --surface-dark: #181715;
+    --surface-dark-elevated: #252320;
+    --surface-dark-soft: #1f1e1b;
+    --paper: #fffaf1;
+    --ink: #141413;
+    --body-strong: #252523;
+    --body: #3d3d3a;
+    --muted: #6c6a64;
+    --muted-soft: #8e8b82;
+    --primary: #cc785c;
+    --primary-active: #a9583e;
+    --teal: #5db8a6;
+    --amber: #e8a55a;
+    --success: #5f7d4f;
+    --warning: #b4782d;
+    --error: #b04a3f;
+    --hairline: #e6dfd8;
+    --hairline-strong: #d8cec0;
+    --shadow-lift: 0 16px 42px rgba(20, 20, 19, 0.10);
+    --serif: Georgia, "Songti SC", "Noto Serif CJK SC", "Source Han Serif SC", "SimSun", serif;
+    --sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    --mono: "SF Mono", ui-monospace, Menlo, Monaco, Consolas, monospace;
+    --border: 1px solid var(--hairline);
+    --radius-sm: 8px;
+    --radius: 12px;
+    --radius-lg: 16px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --canvas: #1a1917;
+      --surface-soft: #22201d;
+      --surface-card: #2b2823;
+      --surface-cream-strong: #383229;
+      --paper: #24221f;
+      --ink: #f5f0e8;
+      --body-strong: #eee8dc;
+      --body: #d6d0c5;
+      --muted: #aaa299;
+      --muted-soft: #8c857d;
+      --hairline: #454039;
+      --hairline-strong: #5a5147;
+      --surface-dark: #0f0f0e;
+      --surface-dark-elevated: #1b1a18;
+      --surface-dark-soft: #151411;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--canvas);
+    color: var(--body);
+    font-family: var(--sans);
+    font-size: 15.5px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+      linear-gradient(rgba(20, 20, 19, 0.028) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(20, 20, 19, 0.02) 1px, transparent 1px);
+    background-size: 28px 28px;
+    opacity: 0.28;
+  }
+  a { color: var(--primary-active); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  code, .path, .metric, .mono { font-family: var(--mono); }
+  code {
+    padding: 1px 5px;
+    border: var(--border);
+    border-radius: 5px;
+    background: rgba(230, 223, 216, 0.46);
+    color: var(--body-strong);
+    font-size: 0.92em;
+  }
+  h1, h2, h3 {
+    margin: 0;
+    color: var(--ink);
+    font-family: var(--serif);
+    font-weight: 400;
+    letter-spacing: 0;
+  }
+  h1 {
+    max-width: 880px;
+    font-size: 56px;
+    line-height: 1.14;
+  }
+  h2 {
+    font-size: 30px;
+    line-height: 1.22;
+  }
+  h3 {
+    font-size: 21px;
+    line-height: 1.25;
+  }
+  p { margin: 0; max-width: 760px; }
+  ul, ol { margin: 0; padding-left: 1.2em; }
+  li + li { margin-top: 6px; }
+  button, a { touch-action: manipulation; }
+  button:focus-visible,
+  a:focus-visible,
+  summary:focus-visible {
+    outline: 3px solid rgba(204, 120, 92, 0.28);
+    outline-offset: 3px;
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .page {
+    position: relative;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 36px 28px 92px;
+  }
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    margin: -36px 0 40px;
+    padding: 13px 0;
+    background: color-mix(in srgb, var(--canvas) 88%, transparent);
+    border-bottom: var(--border);
+    backdrop-filter: blur(14px);
+  }
+  .topbar-inner {
+    max-width: 1180px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .spike {
+    width: 18px;
+    height: 18px;
+    color: var(--primary);
+  }
+  .nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+  .nav a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 34px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+  }
+  .nav a:hover { background: var(--surface-card); color: var(--ink); }
+
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+    gap: 34px;
+    align-items: stretch;
+    padding: 26px 0 34px;
+  }
+  .eyebrow {
+    margin-bottom: 14px;
+    color: var(--primary-active);
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .lead {
+    margin-top: 20px;
+    color: var(--body-strong);
+    font-size: 18px;
+    line-height: 1.72;
+  }
+  .hero-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+    margin-top: 24px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 31px;
+    padding: 5px 10px;
+    border: var(--border);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--paper) 85%, transparent);
+    color: var(--body);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .chip strong { color: var(--ink); font-weight: 600; }
+  .dot {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--muted-soft);
+  }
+  .dot.clay { background: var(--primary); }
+  .dot.olive { background: var(--success); }
+  .dot.amber { background: var(--amber); }
+  .dot.teal { background: var(--teal); }
+  .dot.rust { background: var(--error); }
+
+  .mockup {
+    display: flex;
+    flex-direction: column;
+    min-height: 100%;
+    border-radius: var(--radius-lg);
+    background: var(--surface-dark);
+    color: #faf9f5;
+    overflow: hidden;
+  }
+  .mockup-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 18px;
+    border-bottom: 1px solid rgba(250, 249, 245, 0.12);
+  }
+  .window-dots {
+    display: flex;
+    gap: 7px;
+  }
+  .window-dots i {
+    display: block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--primary);
+  }
+  .window-dots i:nth-child(2) { background: var(--amber); }
+  .window-dots i:nth-child(3) { background: var(--teal); }
+  .mockup-title {
+    color: rgba(250, 249, 245, 0.70);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .mockup-body {
+    display: grid;
+    gap: 12px;
+    padding: 18px;
+  }
+  .terminal-line {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+    padding: 10px 12px;
+    border: 1px solid rgba(250, 249, 245, 0.10);
+    border-radius: var(--radius-sm);
+    background: var(--surface-dark-soft);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .terminal-line .tag { color: var(--primary); }
+  .terminal-line .text { color: rgba(250, 249, 245, 0.84); overflow-wrap: anywhere; }
+  .terminal-line .muted { color: rgba(250, 249, 245, 0.52); }
+  .terminal-line.hot {
+    border-color: rgba(204, 120, 92, 0.42);
+    background: color-mix(in srgb, var(--surface-dark-soft) 78%, var(--primary) 22%);
+  }
+
+  section { margin-top: 70px; }
+  .section-head {
+    display: grid;
+    gap: 11px;
+    margin-bottom: 20px;
+  }
+  .section-head p { color: var(--muted); }
+  .callout {
+    border: var(--border);
+    border-left: 4px solid var(--primary);
+    border-radius: var(--radius);
+    background: var(--paper);
+    padding: 18px 20px;
+  }
+  .callout strong { color: var(--ink); }
+  .callout.success { border-left-color: var(--success); }
+  .callout.warning { border-left-color: var(--warning); }
+  .callout.dark {
+    border-color: rgba(250, 249, 245, 0.10);
+    background: var(--surface-dark);
+    color: rgba(250, 249, 245, 0.82);
+  }
+  .callout.dark strong { color: #faf9f5; }
+  .callout.dark code {
+    background: rgba(250, 249, 245, 0.08);
+    border-color: rgba(250, 249, 245, 0.12);
+    color: #faf9f5;
+  }
+
+  .grid { display: grid; gap: 16px; }
+  .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .card, .panel {
+    margin: 0;
+    border: var(--border);
+    border-radius: var(--radius);
+    background: var(--paper);
+    padding: 20px;
+  }
+  .card {
+    display: grid;
+    gap: 12px;
+  }
+  .card h3 { font-size: 20px; }
+  .card .meta {
+    color: var(--muted);
+    font-size: 13px;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    width: fit-content;
+    min-height: 25px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--surface-card);
+    color: var(--body-strong);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge.mono {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge.clay { background: rgba(204, 120, 92, 0.16); color: var(--primary-active); }
+  .badge.olive { background: rgba(95, 125, 79, 0.16); color: var(--success); }
+  .badge.amber { background: rgba(232, 165, 90, 0.20); color: #8a5b18; }
+  .badge.rust { background: rgba(176, 74, 63, 0.13); color: var(--error); }
+  .badge.teal { background: rgba(93, 184, 166, 0.16); color: #317869; }
+
+  .dark-band {
+    border-radius: var(--radius-lg);
+    background: var(--surface-dark);
+    color: rgba(250, 249, 245, 0.78);
+    padding: 26px;
+  }
+  .dark-band h2,
+  .dark-band h3 { color: #faf9f5; }
+  .dark-band .section-head p,
+  .dark-band .muted { color: rgba(250, 249, 245, 0.58); }
+  .dark-band .card {
+    border-color: rgba(250, 249, 245, 0.10);
+    background: var(--surface-dark-elevated);
+  }
+  .dark-band code {
+    border-color: rgba(250, 249, 245, 0.12);
+    background: rgba(250, 249, 245, 0.08);
+    color: #faf9f5;
+  }
+
+  .diagram-wrap {
+    overflow: hidden;
+    border: var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--paper);
+  }
+  .diagram {
+    display: block;
+    width: 100%;
+    min-height: 360px;
+  }
+  .diagram text {
+    font-family: var(--sans);
+    fill: var(--body);
+  }
+  .diagram .label {
+    fill: var(--ink);
+    font-weight: 700;
+  }
+  .diagram .mono {
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .diagram .box {
+    fill: var(--surface-soft);
+    stroke: var(--hairline-strong);
+    stroke-width: 1.5;
+  }
+  .diagram .hot {
+    fill: rgba(204, 120, 92, 0.12);
+    stroke: var(--primary);
+  }
+  .diagram .darkbox {
+    fill: var(--surface-dark);
+    stroke: var(--surface-dark);
+  }
+  .diagram .darktext { fill: #faf9f5; }
+  .diagram .subtle { fill: var(--muted); }
+  .diagram .arrow {
+    stroke: var(--muted-soft);
+    stroke-width: 2;
+    fill: none;
+    marker-end: url(#arrow);
+  }
+  .diagram .arrow.hotline {
+    stroke: var(--primary);
+    marker-end: url(#arrow-hot);
+  }
+
+  .filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+    margin: 18px 0;
+    padding: 8px;
+    border: var(--border);
+    border-radius: var(--radius);
+    background: var(--surface-soft);
+  }
+  .filter-bar button {
+    min-height: 34px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    font: 600 13px/1 var(--sans);
+    padding: 8px 11px;
+    cursor: pointer;
+  }
+  .filter-bar button[aria-pressed="true"] {
+    background: var(--primary);
+    color: #fff;
+  }
+  .table-wrap {
+    overflow-x: auto;
+    border: var(--border);
+    border-radius: var(--radius);
+    background: var(--paper);
+  }
+  table {
+    width: 100%;
+    min-width: 880px;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  th, td {
+    vertical-align: top;
+    text-align: left;
+    padding: 14px 15px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface-card);
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 700;
+  }
+  tr:last-child td { border-bottom: 0; }
+  tr[data-hidden="true"] { display: none; }
+  td:first-child {
+    color: var(--ink);
+    font-weight: 700;
+  }
+  .impact {
+    color: var(--body-strong);
+    font-weight: 600;
+  }
+  .score {
+    display: grid;
+    grid-template-columns: 116px 1fr;
+    gap: 8px 12px;
+    align-items: center;
+    margin-top: 4px;
+  }
+  .meter {
+    height: 9px;
+    border-radius: 999px;
+    background: var(--hairline);
+    overflow: hidden;
+  }
+  .meter > span {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    background: var(--primary);
+  }
+  .meter.olive > span { background: var(--success); }
+  .meter.teal > span { background: var(--teal); }
+  .meter.amber > span { background: var(--amber); }
+  .meter.rust > span { background: var(--error); }
+
+  details {
+    border: var(--border);
+    border-radius: var(--radius);
+    background: var(--paper);
+    overflow: hidden;
+  }
+  details + details { margin-top: 12px; }
+  summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    cursor: pointer;
+    color: var(--ink);
+    font-weight: 700;
+    list-style: none;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: "›";
+    color: var(--primary);
+    font-family: var(--mono);
+    font-size: 18px;
+    transform-origin: center;
+  }
+  details[open] summary {
+    border-bottom: var(--border);
+    background: var(--surface-soft);
+  }
+  details[open] summary::before { transform: rotate(90deg); }
+  .details-body {
+    padding: 16px;
+    display: grid;
+    gap: 14px;
+  }
+  .evidence-list {
+    display: grid;
+    gap: 9px;
+  }
+  .evidence-item {
+    display: grid;
+    grid-template-columns: minmax(210px, 0.75fr) minmax(0, 1.25fr);
+    gap: 10px 16px;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .evidence-item:last-child { border-bottom: 0; }
+  .evidence-item .path {
+    color: var(--primary-active);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .evidence-item .why { color: var(--body); }
+
+  .copy-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    margin-top: 18px;
+  }
+  .btn {
+    appearance: none;
+    min-height: 38px;
+    border: 1px solid var(--primary);
+    border-radius: var(--radius-sm);
+    background: var(--primary);
+    color: #fff;
+    cursor: pointer;
+    font: 700 13px/1 var(--sans);
+    padding: 10px 14px;
+  }
+  .btn:hover { background: var(--primary-active); border-color: var(--primary-active); }
+  .btn.secondary {
+    background: transparent;
+    color: var(--body-strong);
+    border-color: var(--hairline-strong);
+  }
+  .btn.secondary:hover { background: var(--surface-card); }
+  .copy-status {
+    color: var(--success);
+    font-size: 13px;
+    min-height: 22px;
+  }
+
+  .footer {
+    margin-top: 74px;
+    border-radius: var(--radius-lg);
+    background: var(--surface-dark);
+    color: rgba(250, 249, 245, 0.64);
+    padding: 28px;
+  }
+  .footer strong { color: #faf9f5; }
+  .footer .path { color: #f0b09b; }
+
+  @media (max-width: 900px) {
+    .page { padding: 28px 18px 72px; }
+    .topbar { margin: -28px 0 28px; padding: 12px 0; }
+    .topbar-inner { align-items: flex-start; flex-direction: column; }
+    .nav { justify-content: flex-start; }
+    .hero { grid-template-columns: 1fr; }
+    h1 { font-size: 40px; line-height: 1.18; }
+    .grid.two, .grid.three { grid-template-columns: 1fr; }
+    .dark-band { padding: 20px; }
+    .diagram { min-width: 900px; }
+    .diagram-wrap { overflow-x: auto; }
+    .evidence-item { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 520px) {
+    h1 { font-size: 34px; }
+    h2 { font-size: 25px; }
+    section { margin-top: 54px; }
+    .terminal-line { grid-template-columns: 1fr; }
+    .score { grid-template-columns: 1fr; }
+    .chip { white-space: normal; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .card, .nav a, .btn, .filter-bar button {
+      transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+    }
+    .card:hover { transform: translateY(-1px); box-shadow: var(--shadow-lift); }
+  }
+  @media print {
+    body { background: #fff; color: #1a1a1a; }
+    body::before, .topbar, .filter-bar, .copy-row { display: none !important; }
+    .page { max-width: none; padding: 0; }
+    .mockup, .dark-band, .footer { background: #fff; color: #1a1a1a; border: 1px solid #bbb; }
+    .mockup *, .dark-band *, .footer * { color: #1a1a1a !important; }
+    .card, .panel, details, .diagram-wrap, .callout { break-inside: avoid; }
+    table { min-width: 0; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <svg class="spike" viewBox="0 0 24 24" aria-hidden="true">
+          <path fill="currentColor" d="M11 1h2v8.1l5.7-5.7 1.4 1.4-5.7 5.7H23v2h-8.6l5.7 5.7-1.4 1.4-5.7-5.7V23h-2v-9.1l-5.7 5.7-1.4-1.4 5.7-5.7H1v-2h8.6L3.9 4.8l1.4-1.4L11 9.1V1Z"/>
+        </svg>
+        <span>Agent 状态同步对比</span>
+      </div>
+      <nav class="nav" aria-label="页面导航">
+        <a href="#summary">结论</a>
+        <a href="#architecture">数据流</a>
+        <a href="#matrix">差异矩阵</a>
+        <a href="#subagent">Subagent</a>
+        <a href="#impact">用户影响</a>
+        <a href="#evidence">证据</a>
+      </nav>
+    </div>
+  </div>
+
+  <main class="page">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">Technical research / local code comparison / 2026-05-14</div>
+        <h1>tmux-scout 与 Flux Desktop 的 agent 状态同步：同一类事件，两种产品边界</h1>
+        <p class="lead">
+          这份对比基于当前本地代码：`/Users/bytedance/repos/tmux-scout` 与
+          `/Users/bytedance/repos/flux-desktop-app`。核心结论是：`tmux-scout` 是 tmux 内的轻量
+          agent 状态索引器，优先解决「看见、排序、跳转、发现崩溃」；`Flux Desktop` 是桌面端状态中枢，
+          把同样的 hook 信号扩展成审批、问答、通知、远程、统计和 UI 生命周期。
+        </p>
+        <div class="hero-meta" aria-label="阅读摘要">
+          <span class="chip"><span class="dot clay"></span><strong>范围</strong> hook、reducer、subagent、UI、远程</span>
+          <span class="chip"><span class="dot olive"></span><strong>证据</strong> 31 处代码/文档引用</span>
+          <span class="chip"><span class="dot teal"></span><strong>产物</strong> single page HTML</span>
+        </div>
+      </div>
+
+      <aside class="mockup" aria-label="核心差异摘要">
+        <div class="mockup-head">
+          <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+          <div class="mockup-title">state-sync.readout</div>
+        </div>
+        <div class="mockup-body">
+          <div class="terminal-line hot">
+            <span class="tag">TL;DR</span>
+            <span class="text">tmux-scout 把状态压缩成 fzf/status-bar 里的可信索引；Flux 把状态提升成可交互的产品状态机。</span>
+          </div>
+          <div class="terminal-line">
+            <span class="tag">tmux</span>
+            <span class="text">hook → optional bridge → JSON files → picker/status；subagent 多数作为父会话摘要，用户仍回终端处理。</span>
+          </div>
+          <div class="terminal-line">
+            <span class="tag">Flux</span>
+            <span class="text">hook/pull → BridgeServer → AgentEvent → SessionState → IPC；可阻塞 hook 并回写 approval/question directive。</span>
+          </div>
+          <div class="terminal-line">
+            <span class="tag">impact</span>
+            <span class="text">tmux-scout 更少打扰、更少依赖；Flux 更强可视化与远程/通知能力，但一致性边界和竞态处理明显更复杂。</span>
+          </div>
+        </div>
+      </aside>
+    </header>
+
+    <section id="summary">
+      <div class="section-head">
+        <h2>一句话结论</h2>
+        <p>两边现在已经在「hook 优先、reducer 归一、JSON/transcript 兜底、隐藏内部子会话」这些方向上趋同，但产品目标不同导致取舍不同。</p>
+      </div>
+      <div class="grid three">
+        <article class="card">
+          <span class="badge clay">定位差异</span>
+          <h3>tmux-scout 是导航层</h3>
+          <p>它不试图接管 agent 交互，只把多 agent、多 pane、多状态变成可扫视的索引。用户看见 `WAIT` / `BUSY` / `DONE` 后跳回 tmux pane。</p>
+        </article>
+        <article class="card">
+          <span class="badge olive">状态差异</span>
+          <h3>Flux 是产品状态层</h3>
+          <p>它把原始 hook 变成 `AgentEvent`，再变成 `AgentSession`。这个 session 直接驱动 Island、Pet、审批卡、问答卡、通知和统计。</p>
+        </article>
+        <article class="card">
+          <span class="badge teal">Subagent 差异</span>
+          <h3>同样隐藏子会话，颗粒度不同</h3>
+          <p>两者都避免 subagent 污染顶层列表。Flux 对 Claude/Codex/Coco/Hermes 的父子关系和工具活动更完整；tmux-scout 目前 Codex/Kimi 较完整，Claude 只记录事件。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <div class="section-head">
+        <h2>两条状态同步链路</h2>
+        <p>下面的图把两个系统放在同一个坐标里。左侧都是 agent hook，右侧是用户真正看到的状态。</p>
+      </div>
+      <figure class="diagram-wrap">
+        <svg class="diagram" viewBox="0 0 1100 520" role="img" aria-labelledby="diagram-title diagram-desc">
+          <title id="diagram-title">tmux-scout 与 Flux Desktop 状态流对比图</title>
+          <desc id="diagram-desc">tmux-scout 通过 hook 或 watcher 写入本地 JSON 并渲染 tmux picker；Flux 通过 BridgeServer 归一为 AgentEvent，再通过 SessionState 和 IPC 渲染 Island。</desc>
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#8e8b82"></path>
+            </marker>
+            <marker id="arrow-hot" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#cc785c"></path>
+            </marker>
+          </defs>
+
+          <rect x="28" y="30" width="1044" height="208" rx="16" fill="#f5f0e8" stroke="#d8cec0"/>
+          <rect x="28" y="282" width="1044" height="208" rx="16" fill="#efe9de" stroke="#d8cec0"/>
+          <text x="56" y="65" class="label" font-size="20">tmux-scout</text>
+          <text x="56" y="316" class="label" font-size="20">Flux Desktop App</text>
+
+          <rect class="box" x="58" y="96" width="160" height="82" rx="12"/>
+          <text x="76" y="126" class="label" font-size="15">Agent hooks</text>
+          <text x="76" y="150" class="mono subtle">Claude / Codex</text>
+          <text x="76" y="169" class="mono subtle">Kimi / OpenCode</text>
+
+          <rect class="box hot" x="280" y="96" width="170" height="82" rx="12"/>
+          <text x="298" y="124" class="label" font-size="15">hook-adapter</text>
+          <text x="298" y="148" class="mono subtle">applySessionEvent</text>
+          <text x="298" y="167" class="mono subtle">priority reducer</text>
+
+          <rect class="box" x="510" y="82" width="160" height="55" rx="12"/>
+          <text x="528" y="114" class="label" font-size="15">bridge.sock</text>
+          <text x="528" y="132" class="mono subtle">optional writer</text>
+          <rect class="box" x="510" y="156" width="160" height="55" rx="12"/>
+          <text x="528" y="188" class="label" font-size="15">watchdog</text>
+          <text x="528" y="206" class="mono subtle">pid / pane / jsonl</text>
+
+          <rect class="box" x="730" y="96" width="142" height="82" rx="12"/>
+          <text x="748" y="126" class="label" font-size="15">status.json</text>
+          <text x="748" y="150" class="mono subtle">sessions/*.json</text>
+          <text x="748" y="169" class="mono subtle">24h cleanup</text>
+
+          <rect class="darkbox" x="924" y="96" width="118" height="82" rx="12"/>
+          <text x="942" y="126" class="label darktext" font-size="15">tmux UI</text>
+          <text x="942" y="150" class="mono darktext" opacity=".72">fzf picker</text>
+          <text x="942" y="169" class="mono darktext" opacity=".72">status-right</text>
+
+          <path class="arrow hotline" d="M222 137 C240 137 255 137 274 137"/>
+          <path class="arrow" d="M454 128 C476 119 487 112 504 110"/>
+          <path class="arrow" d="M454 154 C476 168 487 178 504 184"/>
+          <path class="arrow hotline" d="M674 137 C696 137 708 137 724 137"/>
+          <path class="arrow hotline" d="M876 137 C896 137 906 137 918 137"/>
+
+          <rect class="box" x="58" y="348" width="160" height="82" rx="12"/>
+          <text x="76" y="378" class="label" font-size="15">Hook / Pull</text>
+          <text x="76" y="402" class="mono subtle">CLI + cloud</text>
+          <text x="76" y="421" class="mono subtle">remote payload</text>
+
+          <rect class="box hot" x="280" y="348" width="170" height="82" rx="12"/>
+          <text x="298" y="377" class="label" font-size="15">BridgeServer</text>
+          <text x="298" y="401" class="mono subtle">pending maps</text>
+          <text x="298" y="420" class="mono subtle">directive / ACK</text>
+
+          <rect class="box hot" x="510" y="348" width="160" height="82" rx="12"/>
+          <text x="528" y="378" class="label" font-size="15">AgentEvent</text>
+          <text x="528" y="402" class="mono subtle">typed contract</text>
+          <text x="528" y="421" class="mono subtle">subagent events</text>
+
+          <rect class="box" x="730" y="348" width="142" height="82" rx="12"/>
+          <text x="748" y="378" class="label" font-size="15">SessionState</text>
+          <text x="748" y="402" class="mono subtle">AgentSession</text>
+          <text x="748" y="421" class="mono subtle">visible filter</text>
+
+          <rect class="darkbox" x="924" y="348" width="118" height="82" rx="12"/>
+          <text x="942" y="378" class="label darktext" font-size="15">Island UI</text>
+          <text x="942" y="402" class="mono darktext" opacity=".72">approval</text>
+          <text x="942" y="421" class="mono darktext" opacity=".72">IPC / Pet</text>
+
+          <path class="arrow hotline" d="M222 389 C240 389 255 389 274 389"/>
+          <path class="arrow hotline" d="M454 389 C475 389 489 389 504 389"/>
+          <path class="arrow hotline" d="M674 389 C697 389 711 389 724 389"/>
+          <path class="arrow hotline" d="M876 389 C897 389 907 389 918 389"/>
+
+          <text x="56" y="228" class="mono subtle">用户模型：看状态 → 跳 pane。状态尽量轻，失败时可回退到直接写 JSON。</text>
+          <text x="56" y="480" class="mono subtle">用户模型：状态即产品 UI。Bridge 可保持 pending、阻塞 hook、回写 directive，并广播到多个 surface。</text>
+        </svg>
+      </figure>
+    </section>
+
+    <section id="matrix">
+      <div class="section-head">
+        <h2>差异矩阵</h2>
+        <p>可以按视角筛选。默认展示全部维度，重点列出「状态同步差异」如何变成用户体验差异。</p>
+      </div>
+      <div class="filter-bar" role="toolbar" aria-label="筛选差异维度">
+        <button type="button" data-filter="all" aria-pressed="true">全部</button>
+        <button type="button" data-filter="subagent" aria-pressed="false">Subagent</button>
+        <button type="button" data-filter="interaction" aria-pressed="false">审批/问答</button>
+        <button type="button" data-filter="failure" aria-pressed="false">失败恢复</button>
+        <button type="button" data-filter="persistence" aria-pressed="false">持久化</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>维度</th>
+              <th>tmux-scout</th>
+              <th>Flux Desktop App</th>
+              <th>对用户的影响</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr data-tags="all">
+              <td>产品边界</td>
+              <td>tmux 插件，面向 fzf picker 和 status bar。状态是「索引」和「跳转线索」。</td>
+              <td>Electron 桌面应用，面向 Island / Pet / Settings。状态是驱动 UI 和外部行为的中心事实。</td>
+              <td class="impact">tmux-scout 不会打断终端工作流；Flux 能主动提醒和处理，但用户会感受到更多 UI 状态变化。</td>
+            </tr>
+            <tr data-tags="all">
+              <td>入口协议</td>
+              <td>各 agent hook 脚本直接写 `~/.tmux-scout/status.json` 和 `sessions/*.json`，watchdog 可启动 `bridge.sock` 串行化写入。</td>
+              <td>所有 hook 通过 `BridgeServer` 的 Unix socket 进入，协议有 `hello`、`processHook`、`resolvePermission`、`answerQuestion`。</td>
+              <td class="impact">tmux-scout 即使后台 bridge 不在也能继续记录；Flux 依赖主应用 socket，但能对 hook 返回可执行 directive。</td>
+            </tr>
+            <tr data-tags="all">
+              <td>状态模型</td>
+              <td>统一 reducer 有 `idle`、`running`、`waitingForApproval`、`waitingForAnswer`、`completed`、`interrupted`、`crashed`、`stale`，并保留 legacy `status`。</td>
+              <td>`AgentSession.phase` 更少，只有 `running`、`waitingForApproval`、`waitingForAnswer`、`completed`，其余靠 `isSessionEnded`、`isProcessAlive`、`completionDismissed`、`isRemote` 等 flag 表达。</td>
+              <td class="impact">tmux-scout 的状态标签更适合终端列表；Flux 的状态更适合组合 UI 卡片，但 flag 之间的一致性更难维护。</td>
+            </tr>
+            <tr data-tags="subagent">
+              <td>Subagent 顶层可见性</td>
+              <td>Codex 子会话会被标记 `isHiddenFromScout`，不进入 picker 顶层；父会话写 `activeSubagents` 摘要。Kimi 也维护父会话子列表。</td>
+              <td>子会话写 `parentSessionId`，`isVisibleInIsland()` 对子会话返回 false；父会话渲染 `SubagentList`。</td>
+              <td class="impact">两边都减少「子 agent 刷屏」。Flux 给用户可展开列表和耗时；tmux-scout 给用户一行摘要，更省空间。</td>
+            </tr>
+            <tr data-tags="subagent">
+              <td>Claude Subagent</td>
+              <td>安装 `SubagentStart` / `SubagentStop` hook，但当前 Claude hook 仅写 `lastEvent`，不维护 `activeSubagents` 明细。</td>
+              <td>ClaudeAdapter 过滤子进程 hook，缓存 `Agent` / `Task` 描述，`SubagentStart` 写 `SubagentInfo`，子进程工具活动回写父会话。</td>
+              <td class="impact">Claude 多 Task 场景下，Flux 用户能看到子任务列表和最近工具；tmux-scout 用户主要看到父会话状态，子任务细节仍靠回 pane。</td>
+            </tr>
+            <tr data-tags="subagent failure">
+              <td>Codex Subagent</td>
+              <td>读取 transcript 首行 `session_meta` 或 hook payload 元信息，按 `forked_from_id` / `thread_spawn.parent_thread_id` 判定子会话；隐藏子会话并汇总到父会话。</td>
+              <td>SessionStart 同步/异步读取 `session_meta`，`UserPromptSubmit` 再兜底；建立 `parentSessionMap`，子会话 Stop 时向父会话发 `subagentStopped`。</td>
+              <td class="impact">两者都能避开 Codex 内部线程噪音。Flux 对异步 meta 晚到、Stop 竞态和父会话 UI 清理做得更细，用户更少看到闪烁占位。</td>
+            </tr>
+            <tr data-tags="interaction">
+              <td>审批与问答</td>
+              <td>只记录 `needsAttention` 和 `pendingToolUse`，picker 显示 `W:APP` / `W:ANS` 等。用户需要跳到终端处理。</td>
+              <td>BridgeServer 维护 `pendingPermissions` / `pendingQuestions`，可从 Island 或 Feishu 回写；也支持 terminal-native 模式保留卡片。</td>
+              <td class="impact">tmux-scout 更忠实、更少误操作面；Flux 能显著减少切回终端，但 pending 清理、断线策略和审批模式会影响信任感。</td>
+            </tr>
+            <tr data-tags="failure">
+              <td>崩溃与中断</td>
+              <td>watchdog/picker sync 做 tmux pane、PID、process tree、Codex JSONL、Claude transcript 的校正；高置信源有优先级保护。</td>
+              <td>AppCoordinator 每 2 秒做 Claude ESC、Codex transcript、Codex idle 兜底，并结合 PidWatcher / RemotePidWatcher。</td>
+              <td class="impact">tmux-scout 更适合回答「哪个 pane 卡住了」；Flux 更适合让 UI 计时停表、隐藏过期卡片、对远程断连给出反馈。</td>
+            </tr>
+            <tr data-tags="persistence">
+              <td>持久化策略</td>
+              <td>状态文件长期作为主数据源，`status.json` 聚合，`sessions/*.json` 分片，24 小时清理。</td>
+              <td>主状态在内存 Map；`saveSessions` 最多写 50 条、24 小时内本地 session，云端会话不落盘；启动时主动清空旧保存。</td>
+              <td class="impact">tmux-scout 重启后更容易保留最近上下文；Flux 更少陈旧历史和隐私残留，但 app 重启后需要 hook/poll 重新填充 UI。</td>
+            </tr>
+            <tr data-tags="all">
+              <td>远程场景</td>
+              <td>主要锚定 tmux pane 与本机文件。hook 会采集终端上下文，但没有完整远端隧道/远程 PID 状态模型。</td>
+              <td>通过 hook payload 的主机/IP/SSH client 识别远程，管理远程 host 状态、远端 PID 轮询、远程跳转和断连事件。</td>
+              <td class="impact">在纯 tmux/SSH 内，tmux-scout 低成本；在 IDE Remote-SSH、桌面通知、远端进程探活场景，Flux 用户得到更完整的跨机器体验。</td>
+            </tr>
+            <tr data-tags="all interaction">
+              <td>UI 输出</td>
+              <td>一行列表和 status-right 计数，信息密度高：状态、agent、window、project、title、tool/subagent 详情。</td>
+              <td>渲染 `AgentSession[]`，支持 SessionRow、ApprovalCard、QuestionCard、CompletionCard、SubagentList、usage row。</td>
+              <td class="impact">tmux-scout 适合键盘快速扫视；Flux 适合把状态变成可读、可点、可通知的「任务面板」。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="subagent">
+      <div class="section-head">
+        <h2>Subagent 深入对比</h2>
+        <p>Subagent 是两边最能体现产品边界差异的地方：同样是「别让子会话污染顶层」，tmux-scout 选择压缩，Flux 选择建模。</p>
+      </div>
+      <div class="grid two">
+        <article class="card">
+          <span class="badge mono clay">tmux-scout</span>
+          <h3>把子会话折叠为父会话的一行状态</h3>
+          <ul>
+            <li>Codex 子会话：`classifyCodexSession()` 识别 `forked_from_id` 与 `thread_spawn`，`markHiddenSession()` 标记隐藏，并 `upsertParentSubagent()`。</li>
+            <li>picker 渲染时用 `subagentDetail()` 取最新一个子 agent，展示类似 `1 subagent · reviewer: Bash: npm test`。</li>
+            <li>Kimi 的 `SubagentStart` / `SubagentStop` 通过 generic hook 维护 `activeSubagents`。</li>
+            <li>Claude 虽安装 subagent hooks，但当前 handler 只记录 `subagent_start` / `subagent_stop` 事件，不维护子列表。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <span class="badge mono olive">Flux Desktop</span>
+          <h3>把子 Agent 作为父 session 的一等展示对象</h3>
+          <ul>
+            <li>`SubagentInfo` 是共享类型，包含 `agentId`、`agentType`、`taskDescription`、`transcriptPath`、`startedAt`、`lastToolActivity`。</li>
+            <li>ClaudeAdapter 会过滤子进程普通 hook，只把工具活动写回父会话，避免子进程独立上岛。</li>
+            <li>CodexAdapter 建立 `parentSessionMap`，子 session 自己有 `parentSessionId`，但 Island 不独立展示。</li>
+            <li>UI 层 `SubagentList` 显示最多 3 条、支持展开，并实时显示 elapsed 与最近工具活动。</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="dark-band" style="margin-top:16px">
+        <div class="section-head" style="margin-bottom:16px">
+          <h2>Subagent 对用户的实际差别</h2>
+          <p>这不是简单的信息多少问题，而是「用户是否需要理解多 agent 拓扑」。</p>
+        </div>
+        <div class="grid three">
+          <article class="card">
+            <span class="badge clay">噪音控制</span>
+            <h3>两边都做了隐藏</h3>
+            <p>Codex 内部 title generation、ambient suggestions、memory writing、guardian reviewer 等后台会话不会作为独立任务打扰用户。</p>
+          </article>
+          <article class="card">
+            <span class="badge teal">进度解释</span>
+            <h3>Flux 更能解释「为什么还在跑」</h3>
+            <p>当父 agent 长时间没有主输出，但子 agent 在跑搜索或验证，Flux 的 `SubagentList` 能解释等待原因；tmux-scout 目前只给短摘要。</p>
+          </article>
+          <article class="card">
+            <span class="badge amber">交互边界</span>
+            <h3>tmux-scout 更不接管</h3>
+            <p>子 agent 的审批/问题在 tmux-scout 里仍回终端处理。Flux 对主会话审批更强，但对 Claude 子进程权限会选择静默 ACK，不把所有子进程交互都搬到 Island。</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="impact">
+      <div class="section-head">
+        <h2>用户影响汇总</h2>
+        <p>把工程差异翻译成用户语言，可以归纳成四个体验轴。</p>
+      </div>
+      <div class="grid two">
+        <article class="card">
+          <h3>1. 可预期性</h3>
+          <p>`tmux-scout` 更像被动仪表盘：它告诉你哪里需要看，但不改变 agent 行为。对重度 tmux 用户，这种可预期性很高。</p>
+          <div class="score">
+            <span class="mono">tmux-scout</span><div class="meter olive"><span style="width:88%"></span></div>
+            <span class="mono">Flux</span><div class="meter amber"><span style="width:70%"></span></div>
+          </div>
+        </article>
+        <article class="card">
+          <h3>2. 可操作性</h3>
+          <p>`Flux` 的优势是把「待审批」「待回答」「完成」「远程断开」直接变成卡片、按钮、声音和 Feishu 通知。</p>
+          <div class="score">
+            <span class="mono">tmux-scout</span><div class="meter amber"><span style="width:46%"></span></div>
+            <span class="mono">Flux</span><div class="meter teal"><span style="width:91%"></span></div>
+          </div>
+        </article>
+        <article class="card">
+          <h3>3. 多 agent 可解释性</h3>
+          <p>Flux 对 subagent、cloud agent、remote agent 建模更多，用户更容易理解系统在并行做什么。tmux-scout 适合把这些压成可扫视的短行。</p>
+          <div class="score">
+            <span class="mono">tmux-scout</span><div class="meter amber"><span style="width:62%"></span></div>
+            <span class="mono">Flux</span><div class="meter olive"><span style="width:86%"></span></div>
+          </div>
+        </article>
+        <article class="card">
+          <h3>4. 故障表面积</h3>
+          <p>tmux-scout 的依赖链短，坏了通常只是状态不刷新；Flux 的链路更长，坏了可能表现为卡片不消失、审批失效、通知误报或远程状态不准。</p>
+          <div class="score">
+            <span class="mono">tmux-scout</span><div class="meter olive"><span style="width:82%"></span></div>
+            <span class="mono">Flux</span><div class="meter rust"><span style="width:58%"></span></div>
+          </div>
+        </article>
+      </div>
+
+      <div class="callout warning" style="margin-top:18px">
+        <strong>设计判断：</strong>
+        如果要让 `tmux-scout` 继续向 Flux 对齐，最值得借鉴的是「更完整的 Claude subagent 汇总」和「typed event contract」；
+        最不应该照搬的是「从 UI 直接接管审批/问答 directive」。后者会改变 tmux-scout 的产品边界，让它从导航插件变成交互代理。
+      </div>
+    </section>
+
+    <section id="recommendations">
+      <div class="section-head">
+        <h2>面向 tmux-scout 的改进建议</h2>
+        <p>如果目标是提升状态同步质量，同时保持 tmux 插件的轻量边界，建议按收益和复杂度分层。</p>
+      </div>
+      <div class="grid three">
+        <article class="card">
+          <span class="badge olive">高收益</span>
+          <h3>补齐 Claude subagent 摘要</h3>
+          <p>复用 Flux 的思路：在 `PreToolUse(Agent/Task)` 缓存 description，`SubagentStart` 写 `activeSubagents`，子进程工具活动回写父会话。UI 仍只显示一行摘要。</p>
+        </article>
+        <article class="card">
+          <span class="badge teal">中收益</span>
+          <h3>收敛通用 AgentEvent 命名</h3>
+          <p>当前 tmux-scout 已有 `lastEvent` 与 `lifecycleEvent`，可以逐步把 hook adapter 的输出收敛为更显式的内部事件对象，减少各 hook 自己拼状态字段。</p>
+        </article>
+        <article class="card">
+          <span class="badge amber">谨慎</span>
+          <h3>不要急着加 UI 审批</h3>
+          <p>一旦要从 picker 回写 approval/question，就需要 pending map、socket 生命周期、directive schema、断线策略和安全边界。这已经是 Flux 的产品复杂度。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="section-head">
+        <h2>代码证据板</h2>
+        <p>下列引用是本页结论的主要依据。路径和行号均来自本地仓库当前状态。</p>
+      </div>
+      <details open>
+        <summary>tmux-scout 证据</summary>
+        <div class="details-body">
+          <div class="evidence-list">
+            <div class="evidence-item">
+              <div class="path">scripts/lib/session-state.js:3-18, 66-86, 103-166</div>
+              <div class="why">定义 source priority、phase 归一和 120s 保护窗口，解释为何 hook/PID 可以压过低置信 pane/transcript 观察。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/lib/hook-adapter.js:123-164, 217-258</div>
+              <div class="why">hook update 先尝试 bridge，再回退 direct atomic write；状态落到 per-session JSON 和 status 聚合。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/lib/bridge-server.js:44-58, 61-103</div>
+              <div class="why">本地 single-writer bridge 只支持 `update_session`，职责是串行写状态，不参与 UI 交互。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/watcher.js:218-281, 300-315</div>
+              <div class="why">watchdog 在 full/incremental 之间切换，启动 optional bridge，并以 2s 左右快路径持续 reconcile。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/picker/sync.js:176-282, 286-340</div>
+              <div class="why">tmux pane、PID、process-tree 与 Codex JSONL tail 是刷新 picker/status 前的校正来源。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/hooks/codex.js:247-384, 387-505</div>
+              <div class="why">Codex 子会话被隐藏，并把子会话运行/工具/停止状态汇总到父会话 `activeSubagents`。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/lib/codex-session-classifier.js:83-147</div>
+              <div class="why">通过 `forked_from_id`、`thread_spawn`、internal source 与 prompt 模板区分真实会话、内部会话、subagent。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/hooks/generic.js:258-334</div>
+              <div class="why">Kimi 的 `SubagentStart` / `SubagentStop` 已会更新父会话子列表。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/hooks/claude.js:210-224</div>
+              <div class="why">Claude 的 Subagent hook 目前只写 `lastEvent`，没有像 Flux 那样维护 `SubagentInfo`。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">scripts/picker/render.js:113-180, 227-268</div>
+              <div class="why">隐藏 Codex child session、按 pane 选最重要 session，并把 subagent 压成一行详情。</div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Flux Desktop App 证据</summary>
+        <div class="details-body">
+          <div class="evidence-list">
+            <div class="evidence-item">
+              <div class="path">src/island/shared/types/AgentEvent.ts:1-9, 16-68, 126-134</div>
+              <div class="why">明确 `hook payload → AgentEvent → SessionState.apply() → AgentSession` 的中间契约，subagent 有专门事件。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/shared/types/AgentSession.ts:13-100, 102-132</div>
+              <div class="why">`AgentSession` 是 renderer 唯一跨 IPC 的 session 数据；`parentSessionId` 会让子 session 不上岛。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/shared/types/SubagentInfo.ts:1-40</div>
+              <div class="why">Flux 把子 agent 作为共享类型，保留 transcript、任务描述、运行阶段和最近工具活动。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/main/session/SessionState.ts:74-439</div>
+              <div class="why">纯函数 reducer 维护 phase、pending、activeTool、subagent start/stop/tool activity，并同步子 session 字段到父会话。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/main/bridge/BridgeServer.ts:354-410, 431-575</div>
+              <div class="why">BridgeServer 分发 hook 到 adapter，维护 pending permission/question，统一更新 jump target、远程连接和 response。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/main/bridge/adapters/ClaudeAdapter.ts:233-285, 560-620</div>
+              <div class="why">Claude 子进程 hook 被过滤并回写父会话；SubagentStart/Stop 生成 `SubagentInfo`。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/main/bridge/adapters/CodexAdapter.ts:477-561, 618-750, 888-920</div>
+              <div class="why">CodexAdapter 识别 internal/background session、建立 parentSessionMap，并在子 session Stop 时收尾。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/main/coordinator/AppCoordinator.ts:595-670, 1919-1979, 1982-2176</div>
+              <div class="why">AgentEvent 进入 AppCoordinator 后 apply、广播、通知、保存；2s reconcile 兜底 Claude/Codex 中断。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/main/remote/RemoteConnectionManager.ts:35-91, 115-154</div>
+              <div class="why">Flux 有远程 host 状态、重连窗口、session 集合和 directive cache，属于 tmux-scout 没有的同步面。</div>
+            </div>
+            <div class="evidence-item">
+              <div class="path">src/island/renderer/src/island/components/SubagentList/index.tsx:85-119</div>
+              <div class="why">父会话的 subagent 作为 UI 列表展示，支持计数、展开和 elapsed。</div>
+            </div>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <section id="copy">
+      <div class="section-head">
+        <h2>可复制摘要</h2>
+        <p>用于同步给团队时，可以直接复制下面的短版结论。</p>
+      </div>
+      <div class="callout success">
+        <strong>短版：</strong>
+        `tmux-scout` 和 `Flux Desktop` 都在走 hook-first 状态同步，并都需要处理 Codex/Claude 这类 agent 的内部线程、subagent、审批等待和中断兜底。
+        但 `tmux-scout` 的边界是 tmux 导航索引，所以状态最终被压缩成 fzf/status-bar 的短行，用户仍回终端处理；
+        `Flux` 的边界是桌面产品状态中枢，所以状态会进入 typed `AgentEvent`/`AgentSession`、IPC、UI 卡片、通知、远程探活和 directive 回写。
+        对用户来说，tmux-scout 更轻、更可预期；Flux 更可操作、更能解释复杂多 agent/远程状态，但也承担更多竞态和 stale pending 风险。
+      </div>
+      <div class="copy-row">
+        <button class="btn" type="button" id="copySummary">复制短版结论</button>
+        <a class="btn secondary" href="#evidence">查看代码证据</a>
+        <span class="copy-status" id="copyStatus" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <p>
+        <strong>生成位置：</strong>
+        <span class="path">/Users/bytedance/repos/tmux-scout/agent-state-sync-comparison.html</span>
+      </p>
+      <p style="margin-top:8px">
+        本页只依赖内联 CSS、SVG 和少量原生 JavaScript；没有外部资源。分析基于 2026-05-14 本地代码快照。
+      </p>
+    </footer>
+  </main>
+
+<script>
+  const filterButtons = Array.from(document.querySelectorAll("[data-filter]"));
+  const rows = Array.from(document.querySelectorAll("tbody tr[data-tags]"));
+
+  filterButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const filter = button.dataset.filter || "all";
+      filterButtons.forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+      rows.forEach((row) => {
+        const tags = (row.dataset.tags || "").split(/\s+/);
+        row.dataset.hidden = String(filter !== "all" && !tags.includes(filter));
+      });
+    });
+  });
+
+  const summaryText = "`tmux-scout` 和 `Flux Desktop` 都在走 hook-first 状态同步，并都需要处理 Codex/Claude 这类 agent 的内部线程、subagent、审批等待和中断兜底。但 `tmux-scout` 的边界是 tmux 导航索引，所以状态最终被压缩成 fzf/status-bar 的短行，用户仍回终端处理；`Flux` 的边界是桌面产品状态中枢，所以状态会进入 typed `AgentEvent`/`AgentSession`、IPC、UI 卡片、通知、远程探活和 directive 回写。对用户来说，tmux-scout 更轻、更可预期；Flux 更可操作、更能解释复杂多 agent/远程状态，但也承担更多竞态和 stale pending 风险。";
+  const copyButton = document.getElementById("copySummary");
+  const copyStatus = document.getElementById("copyStatus");
+
+  copyButton?.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(summaryText);
+      copyStatus.textContent = "已复制";
+      copyButton.textContent = "已复制";
+      window.setTimeout(() => {
+        copyStatus.textContent = "";
+        copyButton.textContent = "复制短版结论";
+      }, 1800);
+    } catch {
+      copyStatus.textContent = "浏览器未允许剪贴板访问";
+    }
+  });
+</script>
+</body>
+</html>

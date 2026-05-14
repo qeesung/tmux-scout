@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // tmux-scout unified hook setup
-// Usage: node setup.js <install|uninstall|status> [--claude] [--codex] [--quiet]
+// Usage: node setup.js <install|uninstall|status> [--claude] [--codex] [--quiet] [--any]
 
 const path = require('path')
 const { spawnSync } = require('child_process')
@@ -33,6 +33,26 @@ function shouldRun(id) {
 function printManagerHeader(id) {
   const manager = managerById[id]
   console.log(c.cyan(manager.label) + c.dim(' ' + manager.detail))
+}
+
+function otherSelectedManagers() {
+  return selectedManagers.filter(manager => manager.id !== 'claude' && manager.id !== 'codex')
+}
+
+function printActionRows(results) {
+  for (const { event, action } of results || []) {
+    const icon = action === 'ok' ? c.green('✓')
+      : action === 'updated' ? c.yellow('↻')
+      : action === 'removed' || action === 'removed_legacy' ? c.red('✗')
+      : action === 'not_found' ? c.dim('·')
+      : c.green('✓')
+    const label = action === 'ok' ? 'already installed'
+      : action === 'updated' ? 'path updated'
+      : action === 'removed' || action === 'removed_legacy' ? 'removed'
+      : action === 'not_found' ? 'not installed'
+      : 'hook installed'
+    console.log(`  ${icon} ${String(event).padEnd(17)} ${label}`)
+  }
 }
 
 function doInstall() {
@@ -81,6 +101,17 @@ function doInstall() {
     }
   }
 
+  for (const manager of otherSelectedManagers()) {
+    console.log()
+    printManagerHeader(manager.id)
+    const r = manager.module.install()
+    if (r.skipped) {
+      console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
+    } else {
+      printActionRows(r.results || [{ event: manager.id, action: r.action || 'installed' }])
+    }
+  }
+
   console.log()
   console.log(ok ? 'Done.' : 'Done with warnings.')
 }
@@ -121,11 +152,34 @@ function doUninstall() {
     }
   }
 
+  for (const manager of otherSelectedManagers()) {
+    console.log()
+    printManagerHeader(manager.id)
+    const r = manager.module.uninstall()
+    if (r.skipped) {
+      console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
+    } else {
+      printActionRows(r.results || [{ event: manager.id, action: r.action || 'removed' }])
+    }
+  }
+
   console.log()
   console.log('Done.')
 }
 
 function doStatus() {
+  if (flags.has('--any')) {
+    const { checkManagerHealth } = require('./setup/managers')
+    const anyInstalled = selectedManagers.some(manager => {
+      const report = checkManagerHealth(manager)
+      return report.installed || report.partial
+    })
+    if (!anyInstalled && !quiet) {
+      console.log(c.yellow('tmux-scout') + ': no agent hooks installed')
+    }
+    process.exit(anyInstalled ? 0 : 1)
+  }
+
   let allOk = true
 
   if (!quiet) console.log()
@@ -179,6 +233,21 @@ function doStatus() {
     }
   }
 
+  for (const manager of otherSelectedManagers()) {
+    const report = require('./setup/managers').checkManagerHealth(manager)
+    if (report.installed) {
+      if (!quiet) console.log(c.green(manager.label) + `: ${report.summary} ` + c.green('✓'))
+    } else {
+      allOk = false
+      if (!quiet) {
+        console.log(c.yellow(manager.label) + `: ${report.summary}`)
+        for (const issue of report.issues || []) {
+          console.log(c.dim('  ' + issue))
+        }
+      }
+    }
+  }
+
   if (!quiet) console.log()
 
   if (!allOk) process.exit(1)
@@ -203,7 +272,7 @@ function doDoctor() {
 
 // Main dispatch
 if (!command || !['install', 'uninstall', 'status', 'doctor', 'watcher', 'watchdog'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status|doctor|watcher> [--claude] [--codex] [--quiet]')
+  console.log('Usage: node setup.js <install|uninstall|status|doctor|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--quiet] [--any]')
   console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
   process.exit(command ? 1 : 0)
 }

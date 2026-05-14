@@ -1,6 +1,6 @@
 # tmux-scout
 
-A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex](https://github.com/openai/codex) sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
+A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), Gemini CLI, Kimi CLI, GitHub Copilot CLI, and OpenCode sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
 
 [中文文档](README_CN.md)
 
@@ -54,7 +54,7 @@ Reload tmux: `tmux source ~/.tmux.conf`
 
 ## Hook Setup
 
-tmux-scout needs hooks installed in Claude Code and/or Codex to track sessions. Run the setup command after installation:
+tmux-scout needs hooks installed in the agent CLIs you want to track. Run the setup command after installation:
 
 ```bash
 # SCOUT_DIR is set automatically when the plugin loads — these commands can be copy-pasted directly
@@ -63,17 +63,26 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install
 # Other operations
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --claude   # Claude Code only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --codex    # Codex only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --gemini   # Gemini CLI only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --kimi     # Kimi CLI only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --copilot-cli  # GitHub Copilot CLI only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --opencode # OpenCode only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" uninstall          # Remove all hooks
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status             # Check installation status
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor             # Run environment diagnostics
 ```
 
 The installer is **idempotent** — running it multiple times is safe. If you move the repository, re-running install will automatically update hook paths.
+Without an agent flag, `install`, `uninstall`, and `status` operate on all supported integrations. Use an agent flag to scope the operation.
 
 ### What gets modified
 
 - **Claude Code**: Adds a hook entry to each of the 9 supported Claude hook event types in `~/.claude/settings.json`
 - **Codex**: Adds event hooks for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, and `Stop` in `~/.codex/hooks.json`, enables Codex hook features/trust state in `~/.codex/config.toml`, and keeps the legacy `notify` hook as a fallback for older Codex builds (original notify command is backed up and chained)
+- **Gemini CLI**: Adds command hooks in `~/.gemini/settings.json`
+- **Kimi CLI**: Appends managed `[[hooks]]` blocks to `~/.kimi/config.toml` while preserving unrelated TOML content
+- **GitHub Copilot CLI**: Adds command hooks in `~/.copilot/settings.json`
+- **OpenCode**: Writes `~/.config/opencode/plugins/tmux-scout-opencode-plugin.js` and registers it in the OpenCode JSON config
 
 ## Usage
 
@@ -98,7 +107,7 @@ Each line shows:
 - `W:APP` / `W:ANS` / `W:PLAN` — waiting for approval, answer, or plan confirmation
 - `BUSY` / `DONE` / `IDLE` — session status
 - `INT` / `CRASH` / `STALE` — recently interrupted, crashed, or stale sessions
-- Agent type (claude / codex)
+- Agent type (claude / codex / gemini / kimi / copilot-cli / opencode)
 - tmux window name (`-` when no window is linked)
 - Project directory name
 - Session title (first prompt)
@@ -161,6 +170,8 @@ This is not a launchd/systemd daemon. It is a single tmux-owned Node.js process 
 - Codex JSONL discovery every 30s
 - full reconcile every 60s
 
+When the watchdog is running, it also starts a local single-writer bridge at `~/.tmux-scout/run/bridge.sock`. Agent hooks prefer sending updates to that Unix socket so one process serializes status writes; if the socket is unavailable, hooks fall back to direct atomic file writes.
+
 Optional intervals, in seconds:
 
 ```bash
@@ -177,7 +188,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher on
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher stop
 ```
 
-`watcher status` includes the latest tick mode, duration, reconcile change count, Codex JSONL files read, parsed event count, and JSONL parse errors when present.
+`watcher status` includes the bridge state, latest tick mode, duration, reconcile change count, Codex JSONL files read, parsed event count, and JSONL parse errors when present.
 
 ## Data Storage
 
@@ -192,13 +203,14 @@ Session data is stored in `~/.tmux-scout/`:
 ├── watcher.pid                      # Optional watchdog process lock
 ├── watcher-state.json               # Optional watchdog JSONL offsets/cache
 ├── watcher.log                      # Optional watchdog diagnostics
+├── run/bridge.sock                  # Optional watchdog single-writer Unix socket
 ├── codex-hooks-manifest.json        # Codex event hook trust keys owned by tmux-scout
 └── codex-original-notify.json       # Backup of original Codex notify command
 ```
 
 Sessions older than 24 hours are automatically cleaned up.
 
-## Codex Compatibility Notes
+## Agent Compatibility Notes
 
 tmux-scout now prefers Codex's event hook mechanism, which gives near-real-time updates for session start, prompt submission, tool activity, approval waits, and turn completion. This is the same style of lifecycle tracking used by Flux Desktop App.
 
@@ -207,6 +219,8 @@ When `@scout-watchdog` is enabled, tmux-scout keeps hooks as the primary state s
 Internally, hook, pane, transcript, PID, and stale-timeout observations are reduced through a shared session-state model. Higher-confidence hook/PID events win over lower-confidence pane/transcript observations for short races, while terminal crash/stale events still close dead sessions.
 
 For older Codex versions that only support `notify`, tmux-scout still installs and chains the legacy notify hook. In that fallback mode, first-turn discovery may still depend on JSONL polling until Codex emits a completion notification.
+
+Gemini CLI, Kimi CLI, GitHub Copilot CLI, and OpenCode are tracked through a generic hook adapter. It maps their hook/plugin events onto the same session lifecycle model, so support quality depends on the payloads those CLIs expose for prompts, tool calls, approvals, and completion.
 
 ## Development
 

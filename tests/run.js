@@ -3,6 +3,7 @@
 const assert = require('assert')
 const { execFileSync } = require('child_process')
 const fs = require('fs')
+const net = require('net')
 const os = require('os')
 const path = require('path')
 
@@ -12,7 +13,11 @@ const { classifyCodexSession } = require('../scripts/lib/codex-session-classifie
 const { formatLine, getActiveSessions } = require('../scripts/picker/render')
 const { agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
+const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
+const { startBridgeServer } = require('../scripts/lib/bridge-server')
 const { markInterrupted: markClaudeInterrupted } = require('../scripts/lib/claude-transcript-watcher')
+const { startOptionalBridge } = require('../scripts/watcher')
+const { AGENT_EVENTS, normalizeAgentEventType } = require('../scripts/lib/agent-events')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
@@ -31,6 +36,17 @@ function tempDir() {
 
 function runHook(scriptRelativePath, payload, homeDir) {
   execFileSync(process.execPath, [path.join(__dirname, '..', scriptRelativePath)], {
+    input: JSON.stringify(payload),
+    env: Object.assign({}, process.env, {
+      HOME: homeDir,
+      TMUX_PANE: '%1'
+    }),
+    stdio: ['pipe', 'ignore', 'pipe']
+  })
+}
+
+function runGenericHook(agent, payload, homeDir, extraArgs = []) {
+  execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts/hooks/generic.js'), '--agent', agent, ...extraArgs], {
     input: JSON.stringify(payload),
     env: Object.assign({}, process.env, {
       HOME: homeDir,
@@ -190,10 +206,11 @@ test('hook scripts expose lightweight adapters', () => {
 })
 
 test('setup manager registry selects agent managers by flags', () => {
-  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), ['claude', 'codex'])
-  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), ['claude', 'codex'])
+  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode'])
+  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode'])
   assert.deepStrictEqual(selectManagers(new Set(['--claude'])).map(manager => manager.id), ['claude'])
   assert.deepStrictEqual(selectManagers(new Set(['--codex', '--quiet'])).map(manager => manager.id), ['codex'])
+  assert.deepStrictEqual(selectManagers(new Set(['--copilot-cli'])).map(manager => manager.id), ['copilot-cli'])
 })
 
 test('setup manager health normalizes partial hook states', () => {
@@ -234,11 +251,413 @@ test('setup manager health normalizes partial hook states', () => {
   assert.ok(codexReport.issues.includes('Missing trust state entries: 1'))
 })
 
+test('Gemini and Copilot setup managers install guarded generic hooks', () => {
+  const dir = tempDir()
+  try {
+    runScript('scripts/setup/gemini.js', ['install'], dir)
+    const geminiSettings = JSON.parse(fs.readFileSync(path.join(dir, '.gemini', 'settings.json'), 'utf-8'))
+    assert.ok(geminiSettings.hooks.BeforeAgent[0].hooks[0].command.includes('scripts/hooks/generic.js'))
+    assert.ok(geminiSettings.hooks.BeforeAgent[0].hooks[0].command.includes('--agent'))
+    assert.ok(geminiSettings.hooks.BeforeAgent[0].hooks[0].command.includes('gemini'))
+    assert.strictEqual(geminiSettings.hooks.BeforeAgent[0].hooks[0].timeout, 5000)
+
+    runScript('scripts/setup/copilot-cli.js', ['install'], dir)
+    const copilotSettings = JSON.parse(fs.readFileSync(path.join(dir, '.copilot', 'settings.json'), 'utf-8'))
+    assert.strictEqual(copilotSettings.version, 1)
+    assert.ok(copilotSettings.hooks.preToolUse[0].bash.includes('--event'))
+    assert.ok(copilotSettings.hooks.preToolUse[0].bash.includes('preToolUse'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Gemini setup preserves non-Scout hooks in shared matcher groups', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.gemini', 'settings.json')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      hooks: {
+        BeforeAgent: [
+          {
+            matcher: '*',
+            hooks: [
+              { type: 'command', command: 'echo keep', timeout: 1 },
+              { type: 'command', command: 'node /old/tmux-scout/scripts/hooks/generic.js --agent gemini', timeout: 5 }
+            ]
+          }
+        ]
+      }
+    }, null, 2) + '\n')
+
+    runScript('scripts/setup/gemini.js', ['install'], dir)
+    let settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+    let beforeAgentHooks = settings.hooks.BeforeAgent.flatMap(group => group.hooks || [])
+    assert.ok(beforeAgentHooks.some(hook => hook.command === 'echo keep'))
+    assert.strictEqual(beforeAgentHooks.filter(hook => String(hook.command || '').includes('scripts/hooks/generic.js')).length, 1)
+    assert.strictEqual(beforeAgentHooks.find(hook => String(hook.command || '').includes('scripts/hooks/generic.js')).timeout, 5000)
+
+    runScript('scripts/setup/gemini.js', ['uninstall'], dir)
+    settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+    beforeAgentHooks = settings.hooks.BeforeAgent.flatMap(group => group.hooks || [])
+    assert.ok(beforeAgentHooks.some(hook => hook.command === 'echo keep'))
+    assert.ok(!beforeAgentHooks.some(hook => String(hook.command || '').includes('scripts/hooks/generic.js')))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Gemini setup surfaces invalid existing settings instead of overwriting', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.gemini', 'settings.json')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, '{ invalid json')
+
+    let error = null
+    try {
+      runScript('scripts/setup/gemini.js', ['install'], dir)
+    } catch (caught) {
+      error = caught
+    }
+
+    assert.ok(error, 'install should fail on invalid existing settings')
+    assert.ok(String(error.stderr || '').includes('Failed to read'))
+    assert.strictEqual(fs.readFileSync(settingsPath, 'utf-8'), '{ invalid json')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Copilot setup surfaces invalid existing settings instead of overwriting', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.copilot', 'settings.json')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, '{ invalid json')
+
+    let error = null
+    try {
+      runScript('scripts/setup/copilot-cli.js', ['install'], dir)
+    } catch (caught) {
+      error = caught
+    }
+
+    assert.ok(error, 'install should fail on invalid existing settings')
+    assert.ok(String(error.stderr || '').includes('Failed to read'))
+    assert.strictEqual(fs.readFileSync(settingsPath, 'utf-8'), '{ invalid json')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Kimi setup manager appends and removes managed TOML hook blocks', () => {
+  const dir = tempDir()
+  try {
+    const configPath = path.join(dir, '.kimi', 'config.toml')
+    fs.mkdirSync(path.dirname(configPath), { recursive: true })
+    fs.writeFileSync(configPath, [
+      'model = "kimi"',
+      '',
+      '[[hooks]]',
+      'event = "UserPromptSubmit"',
+      'command = "echo keep"',
+      '',
+      '[[hooks]]',
+      'event = "Stop"',
+      'command = "node /old/tmux-scout/scripts/hooks/generic.js --agent kimi"',
+      '',
+      '[ui]',
+      'theme = "dark"',
+      ''
+    ].join('\n'))
+
+    runScript('scripts/setup/kimi.js', ['install'], dir)
+    let content = fs.readFileSync(configPath, 'utf-8')
+    assert.ok(content.includes('command = "echo keep"'))
+    assert.ok(content.includes('[ui]'))
+    assert.ok(content.includes('theme = "dark"'))
+    assert.ok(content.includes('scripts/hooks/generic.js'))
+    assert.ok(content.includes('event = "PreToolUse"'))
+
+    runScript('scripts/setup/kimi.js', ['uninstall'], dir)
+    content = fs.readFileSync(configPath, 'utf-8')
+    assert.ok(content.includes('command = "echo keep"'))
+    assert.ok(content.includes('[ui]'))
+    assert.ok(content.includes('theme = "dark"'))
+    assert.ok(!content.includes('scripts/hooks/generic.js'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode setup status rejects stale plugin hook paths', () => {
+  const dir = tempDir()
+  try {
+    runScript('scripts/setup/opencode.js', ['install'], dir)
+    const pluginFile = path.join(dir, '.config', 'opencode', 'plugins', 'tmux-scout-opencode-plugin.js')
+    const pluginContent = fs.readFileSync(pluginFile, 'utf-8')
+    const stalePluginContent = pluginContent.replace(
+      /const HOOK_PATH = .*;/,
+      'const HOOK_PATH = "/missing/tmux-scout/scripts/hooks/generic.js";'
+    )
+    assert.notStrictEqual(stalePluginContent, pluginContent)
+    fs.writeFileSync(pluginFile, stalePluginContent)
+
+    const output = runScriptOutput('scripts/setup/opencode.js', ['status'], dir)
+    assert.ok(output.includes('plugin not installed'))
+
+    let error = null
+    try {
+      runScript('scripts/setup.js', ['status', '--opencode', '--quiet', '--any'], dir)
+    } catch (caught) {
+      error = caught
+    }
+    assert.ok(error, 'broken OpenCode plugin should not satisfy --any status')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode setup status rejects stale plugin config refs', () => {
+  const dir = tempDir()
+  try {
+    runScript('scripts/setup/opencode.js', ['install'], dir)
+    const configPath = path.join(dir, '.config', 'opencode', 'opencode.json')
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+    config.plugin = [`file://${path.join(dir, 'old', 'tmux-scout-opencode-plugin.js')}`]
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n')
+
+    const output = runScriptOutput('scripts/setup/opencode.js', ['status'], dir)
+    assert.ok(output.includes('plugin not installed'))
+
+    let error = null
+    try {
+      runScript('scripts/setup.js', ['status', '--opencode', '--quiet', '--any'], dir)
+    } catch (caught) {
+      error = caught
+    }
+    assert.ok(error, 'stale OpenCode plugin ref should not satisfy --any status')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode setup surfaces invalid existing config instead of overwriting', () => {
+  const dir = tempDir()
+  try {
+    const configPath = path.join(dir, '.config', 'opencode', 'opencode.json')
+    fs.mkdirSync(path.dirname(configPath), { recursive: true })
+    fs.writeFileSync(configPath, '{ invalid json')
+
+    let error = null
+    try {
+      runScript('scripts/setup/opencode.js', ['install'], dir)
+    } catch (caught) {
+      error = caught
+    }
+
+    assert.ok(error, 'install should fail on invalid existing config')
+    assert.ok(String(error.stderr || '').includes('Failed to read'))
+    assert.strictEqual(fs.readFileSync(configPath, 'utf-8'), '{ invalid json')
+    assert.ok(!fs.existsSync(path.join(dir, '.config', 'opencode', 'plugins', 'tmux-scout-opencode-plugin.js')))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('new setup managers do not report standalone uninstall as installed', () => {
+  const dir = tempDir()
+  try {
+    for (const script of [
+      'scripts/setup/gemini.js',
+      'scripts/setup/kimi.js',
+      'scripts/setup/copilot-cli.js',
+      'scripts/setup/opencode.js'
+    ]) {
+      const output = runScriptOutput(script, ['uninstall'], dir)
+      assert.ok(!/hook installed|plugin installed/.test(output), `${script} reported installed after uninstall`)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('unified quiet any status accepts new-agent-only installs', () => {
+  const dir = tempDir()
+  try {
+    runScript('scripts/setup/gemini.js', ['install'], dir)
+    runScript('scripts/setup.js', ['status', '--quiet', '--any'], dir)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('agent registry provides display metadata and process scoring', () => {
   assert.deepStrictEqual(agentDisplay('codex'), { label: 'codex', color: '38;5;114' })
   assert.strictEqual(scoreAgentProcess({ basename: 'opencode', commandLine: '/usr/bin/opencode' }, 'opencode'), 100)
   assert.strictEqual(scoreAgentProcess({ basename: 'gh', commandLine: 'gh copilot suggest' }, 'copilot-cli'), 70)
   assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)
+})
+
+test('bridge server serializes hook updates through the same reducer', async () => {
+  const dir = tempDir()
+  let bridge
+  try {
+    const paths = defaultPaths(dir)
+    bridge = await startBridgeServer({ paths })
+    const context = createHookContext({
+      agentType: 'gemini',
+      defaultStateSource: 'gemini-hooks',
+      paths
+    })
+    context.updateSession('bridge-session', {
+      status: 'working',
+      lastEvent: { type: 'prompt_submit', timestamp: 1000, details: 'hello' }
+    })
+    await context.flush()
+
+    const status = JSON.parse(fs.readFileSync(paths.statusFile, 'utf-8'))
+    const session = status.sessions['bridge-session']
+    assert.strictEqual(session.agentType, 'gemini')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.stateSource, 'gemini-hooks')
+  } finally {
+    if (bridge) bridge.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agent event aliases normalize to persisted event names', () => {
+  assert.strictEqual(normalizeAgentEventType('sessionStarted'), AGENT_EVENTS.SESSION_START)
+  assert.strictEqual(normalizeAgentEventType('toolUseStarted'), AGENT_EVENTS.TOOL_USE)
+  assert.strictEqual(normalizeAgentEventType('subagentStarted'), AGENT_EVENTS.SUBAGENT_START)
+  assert.strictEqual(normalizeAgentEventType(AGENT_EVENTS.PERMISSION_REQUEST), AGENT_EVENTS.PERMISSION_REQUEST)
+})
+
+test('bridge client falls back to direct writes when no ACK is received', async () => {
+  const dir = tempDir()
+  let server = null
+  try {
+    const paths = defaultPaths(dir)
+    fs.mkdirSync(paths.runDir, { recursive: true })
+    server = net.createServer(socket => {
+      socket.on('data', () => socket.end())
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(paths.bridgeSocket, () => {
+        server.off('error', reject)
+        resolve()
+      })
+    })
+
+    const context = createHookContext({
+      agentType: 'gemini',
+      defaultStateSource: 'gemini-hooks',
+      paths
+    })
+    context.updateSession('no-ack-session', {
+      status: 'working',
+      lastEvent: { type: 'prompt_submit', timestamp: 1000, details: 'hello' }
+    })
+    await context.flush()
+
+    const status = JSON.parse(fs.readFileSync(paths.statusFile, 'utf-8'))
+    const session = status.sessions['no-ack-session']
+    assert.strictEqual(session.agentType, 'gemini')
+    assert.strictEqual(session.stateSource, 'gemini-hooks')
+    assert.strictEqual(currentPhase(session), 'running')
+  } finally {
+    if (server) await new Promise(resolve => server.close(resolve))
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('watcher disables the bridge without failing startup when bind fails', async () => {
+  const logs = []
+  const bridge = await startOptionalBridge(async () => {
+    throw new Error('bind failed')
+  }, message => logs.push(message))
+
+  assert.strictEqual(bridge.disabled, true)
+  assert.ok(bridge.error)
+  assert.doesNotThrow(() => bridge.close())
+  assert.ok(logs.some(message => message.includes('bridge disabled: bind failed')))
+})
+
+test('generic hook tracks Gemini prompt, tool and completion events', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'gemini-session'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'BeforeAgent',
+      prompt: 'explain the repository'
+    }), dir)
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'BeforeTool',
+      tool_name: 'Shell',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'AfterAgent',
+      prompt_response: 'done'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'gemini')
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.sessionTitle, 'explain the repository')
+    assert.strictEqual(session.lastAssistantMessage, 'done')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('generic hook treats capitalized Kimi tools as permission requests', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'kimi-session'
+    runGenericHook('kimi', {
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      tool_name: 'Shell',
+      tool_input: { command: 'npm test' }
+    }, dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'kimi')
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.pendingToolUse.tool, 'Shell')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('generic hook treats mutating Copilot tools as permission requests', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'copilot-session'
+    runGenericHook('copilot-cli', {
+      hook_event_name: 'preToolUse',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }, dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'copilot-cli')
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.strictEqual(session.lastEvent.type, 'permission_request')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('session reducer protects recent high-confidence hook state', () => {
@@ -635,6 +1054,39 @@ test('sync marks running Claude session interrupted from transcript marker', () 
   }
 })
 
+test('render hides completed sessions that never linked to a tmux pane', () => {
+  const active = getActiveSessions({
+    sessions: {
+      done: {
+        sessionId: 'done',
+        agentType: 'codex',
+        status: 'completed',
+        phase: 'completed',
+        tmuxPane: null,
+        lastUpdated: Date.now()
+      },
+      working: {
+        sessionId: 'working',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'running',
+        tmuxPane: null,
+        lastUpdated: Date.now()
+      },
+      hookOutsideTmux: {
+        sessionId: 'hookOutsideTmux',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'running',
+        tmuxPane: null,
+        stateSource: 'codex-hooks',
+        lastUpdated: Date.now()
+      }
+    }
+  }, new Map())
+  assert.deepStrictEqual(active.map(session => session.sessionId), ['working'])
+})
+
 test('render prefers active sessions over newer completed sessions in the same pane', () => {
   const now = Date.now()
   const pane = {
@@ -703,6 +1155,152 @@ test('render prefers newer foreground busy session over stale wait in the same p
   }, new Map([['%1', pane]]))
 
   assert.deepStrictEqual(active.map(session => session.sessionId), ['busy'])
+})
+
+test('codex full sync does not refresh unchanged same-phase transcript state', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '33333333-3333-4333-8333-333333333333'
+    const jsonl = path.join(dir, 'codex-session.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(1000).toISOString(),
+        payload: { type: 'user_message', message: 'done already' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(2000).toISOString(),
+        payload: { type: 'task_complete' }
+      })
+    ].join('\n') + '\n')
+    const oldUpdated = 12345
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'completed',
+      phase: 'completed',
+      stateSource: 'transcript',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastUpdated: oldUpdated,
+      sessionTitle: 'done already'
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, lastUpdated: oldUpdated, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    assert.strictEqual(result.status.sessions[threadId].lastUpdated, oldUpdated)
+    assert.strictEqual(result.stats.codex.updated, 0)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex full sync refreshes unchanged same-phase active unbound sessions', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '35353535-3535-4535-8535-353535353535'
+    const jsonl = path.join(dir, 'codex-running.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(Date.now() - 1000).toISOString(),
+      payload: { type: 'user_message', message: 'still running' }
+    }) + '\n')
+    const oldUpdated = Date.now() - 600000
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      stateSource: 'transcript',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastUpdated: oldUpdated,
+      sessionTitle: 'still running'
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, lastUpdated: oldUpdated, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    assert.ok(result.status.sessions[threadId].lastUpdated > oldUpdated)
+    assert.strictEqual(result.status.sessions[threadId].status, 'working')
+    assert.strictEqual(result.stats.codex.updated, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync marks stale unbound sessions even when a stale pid is present', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '44444444-4444-4444-8444-444444444444'
+    const jsonl = path.join(dir, 'codex-stale.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(Date.now() - 600000).toISOString(),
+      payload: { type: 'user_message', message: 'still running?' }
+    }) + '\n')
+    const staleTime = new Date(Date.now() - 600000)
+    fs.utimesSync(jsonl, staleTime, staleTime)
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      pid: process.pid,
+      lastUpdated: Date.now() - 600000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    assert.strictEqual(result.status.sessions[threadId].status, 'stale')
+    assert.strictEqual(result.stats.codex.stale, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('claude transcript watcher helper marks running sessions interrupted', () => {
@@ -948,6 +1546,69 @@ test('claude hook records metadata-only official events without changing active 
     assert.strictEqual(session.lastNotification, 'Permission prompt shown')
     assert.strictEqual(session.lastCompactReason, 'manual')
     assert.strictEqual(session.lastEvent.type, 'pre_compact')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude hook summarizes active subagents on parent picker rows', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-parent'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'review the branch'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Task',
+      tool_input: { description: 'review tests', prompt: 'run the test review' }
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'SubagentStart',
+      sub_agent: { id: 'claude-child-1', type: 'reviewer', transcript_path: '/tmp/demo/child.jsonl' }
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      agent_id: 'claude-child-1',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.activeSubagents.length, 1)
+    assert.strictEqual(session.activeSubagents[0].agentId, 'claude-child-1')
+    assert.strictEqual(session.activeSubagents[0].agentType, 'reviewer')
+    assert.strictEqual(session.activeSubagents[0].taskDescription, 'review tests')
+    assert.strictEqual(session.activeSubagents[0].lastToolActivity, 'Bash: npm test')
+    assert.deepStrictEqual(session._pendingSubagentDescriptions, [])
+
+    const pane = {
+      paneId: '%1',
+      currentCommand: 'node',
+      paneDead: false,
+      windowName: 'main'
+    }
+    session._tmuxPaneSnapshot = pane
+    const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+    assert.ok(/1 subagent · reviewer: Bash: npm test/.test(line), line)
+
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'SubagentStop',
+      sub_agent: { id: 'claude-child-1', type: 'reviewer' }
+    }), dir)
+
+    status = readScoutStatus(dir)
+    assert.deepStrictEqual(status.sessions[sessionId].activeSubagents, [])
+    status.sessions[sessionId]._tmuxPaneSnapshot = pane
+    assert.ok(!stripAnsi(formatLine(status.sessions[sessionId], Date.now(), '%1')).includes('subagent'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

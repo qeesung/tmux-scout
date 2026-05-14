@@ -9,12 +9,14 @@ const os = require('os')
 const { execFileSync } = require('child_process')
 const sync = require('./picker/sync')
 const { ClaudeTranscriptWatchManager } = require('./lib/claude-transcript-watcher')
+const { startBridgeServer } = require('./lib/bridge-server')
 
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
 const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
 const PID_FILE = path.join(STATUS_DIR, 'watcher.pid')
 const STATE_FILE = path.join(STATUS_DIR, 'watcher-state.json')
 const LOG_FILE = path.join(STATUS_DIR, 'watcher.log')
+const BRIDGE_SOCKET = path.join(STATUS_DIR, 'run', 'bridge.sock')
 
 const DEFAULT_FAST_INTERVAL_MS = 2000
 const DEFAULT_DISCOVERY_INTERVAL_MS = 30000
@@ -201,6 +203,18 @@ function formatTickDiagnostics(summary) {
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
 
+function bridgeStatus(running) {
+  let exists = false
+  let isSocket = false
+  try {
+    const stat = fs.statSync(BRIDGE_SOCKET)
+    exists = true
+    isSocket = stat.isSocket()
+  } catch (_) {}
+  if (running) return isSocket ? 'ready' : 'missing'
+  return exists ? 'stale' : 'off'
+}
+
 function runTick(state, forceFull = false, transcriptWatchManager = null) {
   const startedAt = Date.now()
   const now = startedAt
@@ -240,6 +254,20 @@ function runTick(state, forceFull = false, transcriptWatchManager = null) {
   return result
 }
 
+async function startOptionalBridge(start = startBridgeServer, log = appendLog) {
+  try {
+    return await start({ log })
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error)
+    if (log) log(`bridge disabled: ${message}`)
+    return {
+      disabled: true,
+      error,
+      close() {}
+    }
+  }
+}
+
 async function runLoop({ requireTmuxOption }) {
   ensureDir()
 
@@ -249,13 +277,17 @@ async function runLoop({ requireTmuxOption }) {
   if (existing && existing.pid !== process.pid && isPidAlive(existing.pid)) return
 
   writeLock()
+  process.env.TMUX_SCOUT_BRIDGE_SERVER = '1'
+  const bridge = await startOptionalBridge()
   const transcriptWatchManager = new ClaudeTranscriptWatchManager(STATUS_FILE, appendLog)
   process.on('exit', () => {
+    bridge.close()
     transcriptWatchManager.close()
     removeOwnLock()
   })
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signal, () => {
+      bridge.close()
       transcriptWatchManager.close()
       removeOwnLock()
       process.exit(0)
@@ -283,6 +315,7 @@ async function runLoop({ requireTmuxOption }) {
   }
 
   appendLog(`stopped pid=${process.pid}`)
+  bridge.close()
   transcriptWatchManager.close()
   removeOwnLock()
 }
@@ -294,11 +327,13 @@ function status() {
   const lastTick = state.lastTickAt ? new Date(state.lastTickAt).toISOString() : 'never'
   const error = state.lastError ? ` error=${JSON.stringify(state.lastError)}` : ''
   const diagnostics = formatTickDiagnostics(state.lastTickSummary)
-  if (lock && isPidAlive(lock.pid)) {
-    console.log(`running pid=${lock.pid} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
+  const running = Boolean(lock && isPidAlive(lock.pid))
+  const bridge = bridgeStatus(running)
+  if (running) {
+    console.log(`running pid=${lock.pid} bridge=${bridge} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
     return
   }
-  console.log(`stopped lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
+  console.log(`stopped bridge=${bridge} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
 }
 
 function stop(quiet) {
@@ -338,8 +373,16 @@ async function main() {
   }
 }
 
-main().catch(error => {
-  appendLog(`fatal: ${error && error.message ? error.message : String(error)}`)
-  removeOwnLock()
-  process.exit(1)
-})
+module.exports = {
+  runLoop,
+  runTick,
+  startOptionalBridge
+}
+
+if (require.main === module) {
+  main().catch(error => {
+    appendLog(`fatal: ${error && error.message ? error.message : String(error)}`)
+    removeOwnLock()
+    process.exit(1)
+  })
+}

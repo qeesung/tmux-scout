@@ -11,6 +11,7 @@ const { DEFAULT_TAIL_BYTES, readJsonlFile, readJsonlIncremental: readJsonlTailIn
 const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-tree')
 const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { AGENT_EVENTS } = require('../lib/agent-events')
+const { parseTurnAbortedEvent, findLatestCodexInterrupt } = require('../lib/codex-transcript-detector')
 
 let statusFile = process.argv[2] || ''
 let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') : ''
@@ -34,6 +35,7 @@ function createStats(options = {}) {
     codex: {
       discovered: 0,
       updated: 0,
+      interrupted: 0,
       stale: 0,
       filesRead: 0,
       eventsParsed: 0,
@@ -49,6 +51,9 @@ function createStats(options = {}) {
       interrupted: 0,
       filesRead: 0,
       parseErrors: 0
+    },
+    evidence: {
+      written: 0
     }
   }
 }
@@ -56,7 +61,7 @@ function createStats(options = {}) {
 function ensureStats(options = {}) {
   const defaults = createStats(options)
   const stats = options.stats || defaults
-  for (const key of ['reconcile', 'codex', 'paneGroundTruth', 'stuckTools', 'claudeTranscript']) {
+  for (const key of ['reconcile', 'codex', 'paneGroundTruth', 'stuckTools', 'claudeTranscript', 'evidence']) {
     stats[key] = Object.assign({}, defaults[key], stats[key] || {})
   }
   if (!stats.mode) stats.mode = defaults.mode
@@ -166,9 +171,18 @@ function canUseShellFallback(session) {
   return session.status === 'working' || lastEventType === AGENT_EVENTS.PROMPT_SUBMIT || lastEventType === AGENT_EVENTS.TOOL_USE || Boolean(session.pendingToolUse)
 }
 
-function applySessionUpdate(status, sessionId, session, event) {
-  const result = applySessionEvent(session, event)
+function enrichSessionEvent(session, event) {
+  return Object.assign({
+    transcriptPath: session && session.transcriptPath,
+    tmuxPane: session && session.tmuxPane,
+    pid: session && session.pid
+  }, event || {})
+}
+
+function applySessionUpdate(status, sessionId, session, event, stats) {
+  const result = applySessionEvent(session, enrichSessionEvent(session, event))
   if (!result.changed) return false
+  if (result.evidenceChanged && stats && stats.evidence) stats.evidence.written++
   status.sessions[sessionId] = session
   writeJsonAtomic(sessionFilePath(sessionId), session)
   return true
@@ -242,7 +256,7 @@ function sweepDeadProcesses(status, panes, stats) {
     if (getPidState(session.pid) !== 'dead') continue
 
     const reason = `pid ${session.pid} exited while pane ${session.tmuxPane} remained open`
-    const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pid', now))
+    const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pid', now), stats)
     if (updated && stats) stats.reconcile.processExits++
     changed = updated || changed
   }
@@ -264,7 +278,7 @@ function sweepPaneReturnedToShell(status, panes, stats) {
     if (!canUseShellFallback(session) || !isShellCommand(pane.currentCommand || '')) continue
 
     const reason = `pane ${session.tmuxPane} returned to shell ${pane.currentCommand}`
-    const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pane', now))
+    const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pane', now), stats)
     if (updated && stats) stats.reconcile.paneShellExits++
     changed = updated || changed
   }
@@ -336,6 +350,7 @@ function createCodexAccumulator(seed) {
     sessionMeta: seed && seed.sessionMeta,
     lastCompletedTs: Number.isFinite(seed && seed.lastCompletedTs) ? seed.lastCompletedTs : 0,
     lastInterruptedTs: Number.isFinite(seed && seed.lastInterruptedTs) ? seed.lastInterruptedTs : 0,
+    lastInterruptedTurnId: seed && seed.lastInterruptedTurnId,
     lastUserTs: Number.isFinite(seed && seed.lastUserTs) ? seed.lastUserTs : 0,
     cwd: seed && seed.cwd,
     waitingForPlanConfirmation: Boolean(seed && seed.waitingForPlanConfirmation),
@@ -376,11 +391,12 @@ function applyCodexEvent(accumulator, ev) {
   // Codex does not always emit Stop hooks on Ctrl-C / ESC interruption.
   // The transcript records that as turn_aborted; treat it as a completed
   // turn so interrupted sessions do not remain BUSY forever.
-  if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'turn_aborted'
-    && ev.payload.reason === 'interrupted') {
-    const interruptedTs = eventTimestamp(ev, Date.now())
+  const interruptHit = parseTurnAbortedEvent(ev)
+  if (interruptHit) {
+    const interruptedTs = interruptHit.abortedAtMs
     accumulator.lastCompletedTs = interruptedTs
     accumulator.lastInterruptedTs = interruptedTs
+    accumulator.lastInterruptedTurnId = interruptHit.turnId
   }
 
   // Detect plan mode completion — Codex is waiting for user to confirm/reject.
@@ -442,6 +458,11 @@ function codexResultFromAccumulator(accumulator) {
     parentSessionId: classification.parentSessionId,
     subagentDepth: classification.subagentDepth,
     subagentNickname: classification.subagentNickname,
+    interruptHit: acc.lastInterruptedTs > 0 ? {
+      turnId: acc.lastInterruptedTurnId,
+      abortedAtMs: acc.lastInterruptedTs,
+      rawEventName: 'turn_aborted'
+    } : null,
     hasTimeline: Boolean(acc.lastUserTs || acc.lastCompletedTs || acc.lastInterruptedTs || pendingCount || acc.waitingForPlanConfirmation)
   }
 }
@@ -513,7 +534,36 @@ function discoverCodexJsonlFiles(now) {
   return Array.from(filesByThread, ([threadId, filePath]) => ({ threadId, filePath }))
 }
 
-function applyCodexResultToSession(session, result, now) {
+function codexInterruptForSession(session, result) {
+  const transcriptPath = session && session.transcriptPath
+  const expectedTurnId = session && session.lastTurnId
+  const minTimestampMs = Math.max(0, (session.lastUpdated || session.startedAt || 0) - 1000)
+
+  function matchesExpectedTurn(hit) {
+    if (!hit) return false
+    return !expectedTurnId || !hit.turnId || hit.turnId === expectedTurnId
+  }
+
+  if (transcriptPath) {
+    if (expectedTurnId) {
+      const exactHit = findLatestCodexInterrupt(transcriptPath, { expectTurnId: expectedTurnId })
+      if (exactHit) return exactHit
+    }
+
+    const timestampHit = findLatestCodexInterrupt(transcriptPath, { minTimestampMs })
+    if (matchesExpectedTurn(timestampHit)) return timestampHit
+  }
+
+  if (result && result.interruptHit) {
+    if (!matchesExpectedTurn(result.interruptHit)) {
+      return null
+    }
+    return result.interruptHit
+  }
+  return null
+}
+
+function applyCodexResultToSession(session, result, now, stats) {
   if (!session || !result) return false
   let sessionChanged = false
 
@@ -569,6 +619,12 @@ function applyCodexResultToSession(session, result, now) {
     : null
   const attentionReason = result.status === 'needsAttention' ? 'waiting for approval' : null
   if (!phase) return sessionChanged
+
+  const interruptHit = phase === 'interrupted' ? codexInterruptForSession(session, result) : null
+  if (phase === 'interrupted' && !interruptHit) {
+    return sessionChanged
+  }
+
   if (currentPhase(session) === phase && !sessionChanged && (session.needsAttention || null) === attentionReason) {
     if (!session.tmuxPane && (phase === 'running' || phase === 'waitingForApproval')) {
       session.lastUpdated = now
@@ -580,16 +636,21 @@ function applyCodexResultToSession(session, result, now) {
   const eventResult = applySessionEvent(session, {
     type: result.status === 'interrupted' ? AGENT_EVENTS.INTERRUPTED : AGENT_EVENTS.TRANSCRIPT_STATUS,
     source: 'transcript',
-    timestamp: now,
+    timestamp: interruptHit ? interruptHit.abortedAtMs : now,
     phase,
     status: result.status,
     attentionReason,
     reason: result.status === 'interrupted' ? 'Codex transcript recorded turn_aborted/interrupted' : 'Codex transcript status',
     details: result.status,
+    rawEventName: interruptHit ? interruptHit.rawEventName : 'codex_jsonl_status',
+    turnId: interruptHit ? interruptHit.turnId : undefined,
+    transcriptPath: session.transcriptPath,
     updates: {
       stateSource: session.stateSource || 'codex-jsonl'
     }
   })
+  if (eventResult.evidenceChanged && stats && stats.evidence) stats.evidence.written++
+  if (eventResult.changed && phase === 'interrupted' && stats && stats.codex) stats.codex.interrupted++
   sessionChanged = eventResult.changed || sessionChanged
 
   return sessionChanged
@@ -708,7 +769,7 @@ function syncCodexSessionsFull(status, panes, stats) {
     const result = jsonlResultCache.get(jsonlPath) || readCodexJsonl(jsonlPath, stats)
     if (!result) continue
 
-    if (applyCodexResultToSession(session, result, now)) {
+    if (applyCodexResultToSession(session, result, now, stats)) {
       writeJsonAtomic(sessionFilePath(session.sessionId), session)
       if (stats) stats.codex.updated++
       changed = true
@@ -792,7 +853,7 @@ function syncCodexSessionsIncremental(status, panes, options = {}, stats) {
     filesState[jsonlPath] = fileState
     if (!delta || !delta.changed || !delta.result) continue
 
-    if (applyCodexResultToSession(session, delta.result, now)) {
+    if (applyCodexResultToSession(session, delta.result, now, stats)) {
       writeJsonAtomic(sessionFilePath(session.sessionId), session)
       if (stats) stats.codex.updated++
       changed = true
@@ -834,7 +895,7 @@ function sweepStuckCodexTools(status, stats) {
       reason: `pending tool exceeded ${Math.round(CODEX_STUCK_TOOL_MS / 1000)}s without completion`,
       details: session.pendingToolUse.details || session.pendingToolUse.tool || 'stuck tool',
       force: false
-    })
+    }, stats)
     if (updated && stats) stats.stuckTools.interrupted++
     changed = updated || changed
   }
@@ -954,7 +1015,7 @@ function sweepInterruptedClaudeTranscripts(status, stats) {
       reason: 'Claude transcript recorded request interruption',
       details: CLAUDE_INTERRUPT_MARKER,
       force: false
-    })
+    }, stats)
     if (updated && stats) stats.claudeTranscript.interrupted++
     changed = updated || changed
   }
@@ -1098,7 +1159,7 @@ function applyPaneGroundTruth(status, stats) {
       attentionReason: state === 'needsAttention' ? attentionReason : null,
       reason: `pane ${session.tmuxPane} tail matched ${state}`,
       details: state
-    })
+    }, stats)
     if (updated && stats) stats.paneGroundTruth.updates++
     changed = updated || changed
   }

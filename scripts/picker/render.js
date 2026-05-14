@@ -240,6 +240,40 @@ function subagentDetail(session) {
   return activity ? `${count} · ${label}: ${activity}` : `${count} · ${label}`
 }
 
+function latestEvidence(session) {
+  const entries = Array.isArray(session.stateEvidence)
+    ? session.stateEvidence.filter(Boolean)
+    : []
+  return entries[0] || null
+}
+
+function shortAge(now, timestamp) {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return ''
+  const seconds = Math.max(0, Math.floor((now - timestamp) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  return `${Math.floor(minutes / 60)}h`
+}
+
+function evidenceDetail(session, now) {
+  const evidence = latestEvidence(session)
+  if (!evidence) return ''
+  if (evidence.type === AGENT_EVENTS.SUBAGENT_START
+    || evidence.type === AGENT_EVENTS.SUBAGENT_STOP
+    || evidence.type === AGENT_EVENTS.SUBAGENT_TOOL_ACTIVITY) {
+    return ''
+  }
+  const source = cleanText(evidence.source, 'unknown')
+  const raw = cleanText(evidence.rawEventName || evidence.type, '')
+  const age = shortAge(now, evidence.timestamp)
+  const suffix = evidence.applied === false && evidence.blockedReason ? ' blocked' : ''
+  const pieces = [source]
+  if (age) pieces.push(age)
+  if (raw) pieces.push(raw)
+  return `${pieces.join(' · ')}${suffix}`
+}
+
 function formatLine(session, now, currentPane) {
   const unbound = !session.tmuxPane
   const pane = unbound ? null : session._tmuxPaneSnapshot
@@ -256,6 +290,7 @@ function formatLine(session, now, currentPane) {
   const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
   const terminalReason = session.crashReason || session.staleReason || session.stateReason
   const subagents = subagentDetail(session)
+  const evidence = evidenceDetail(session, now)
   const detail = isTerminalSession(session) && terminalReason
     ? `  \x1b[2m${String(terminalReason).replace(/[\r\n]+/g, ' ').slice(0, 55)}\x1b[0m`
     : isNeedsAttention(session, now)
@@ -266,6 +301,8 @@ function formatLine(session, now, currentPane) {
       ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n]+/g, ' ').slice(0, 40)}\x1b[0m`
       : subagents
         ? `  \x1b[35m${subagents.slice(0, 55)}\x1b[0m`
+      : evidence
+        ? `  \x1b[2m${evidence.slice(0, 55)}\x1b[0m`
       : ''
 
   const paneId = session.tmuxPane || 'UNBOUND'
@@ -307,7 +344,7 @@ function run(file, pane, cached) {
   }
 }
 
-module.exports = { run, getActiveSessions, formatLine, subagentDetail }
+module.exports = { run, getActiveSessions, formatLine, subagentDetail, evidenceDetail }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

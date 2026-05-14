@@ -5,6 +5,7 @@ const path = require('path')
 const os = require('os')
 const net = require('net')
 const { applySessionEvent } = require('./session-state')
+const { createAgentEvent } = require('./agent-events')
 const { terminalContext } = require('./terminal-context')
 
 const LIFECYCLE_FIELDS = new Set([
@@ -15,7 +16,10 @@ const LIFECYCLE_FIELDS = new Set([
   'activeTool',
   'endedAt',
   'stateSource',
-  'lastEvent'
+  'stateConfidence',
+  'stateReason',
+  'lastEvent',
+  'lifecycle'
 ])
 
 function defaultPaths(homeDir = os.homedir()) {
@@ -88,8 +92,22 @@ function resolvePid(data) {
   return Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null
 }
 
+function eventDefaultsFromUpdates(updates, config) {
+  return {
+    source: 'hook',
+    stateSource: updates.stateSource || config.defaultStateSource,
+    rawEventName: updates.lastHookEventName || updates.rawEventName,
+    transcriptPath: updates.transcriptPath,
+    tmuxPane: updates.tmuxPane,
+    pid: updates.pid
+  }
+}
+
 function createLifecycleEvent(updates, config) {
-  if (updates.lifecycleEvent) return updates.lifecycleEvent
+  const defaults = eventDefaultsFromUpdates(updates, config)
+  if (updates.lifecycleEvent) {
+    return createAgentEvent(updates.lifecycleEvent, defaults)
+  }
   if (!updates.lastEvent) return null
 
   const legacyNotify = updates.stateSource === 'notify'
@@ -97,19 +115,23 @@ function createLifecycleEvent(updates, config) {
     ? config.lifecycleForce(updates)
     : config.lifecycleForce
 
-  return {
+  return createAgentEvent({
     type: updates.lastEvent.type,
     source: legacyNotify ? 'notify' : 'hook',
     stateSource: updates.stateSource || config.defaultStateSource,
     timestamp: updates.lastEvent.timestamp,
     details: updates.lastEvent.details,
     turnId: updates.lastEvent.turnId,
+    rawEventName: updates.lastEvent.rawEventName || updates.lastHookEventName || updates.lastEvent.details,
+    transcriptPath: updates.transcriptPath,
+    tmuxPane: updates.tmuxPane,
+    pid: updates.pid,
     attentionReason: updates.needsAttention || null,
     pendingToolUse: updates.pendingToolUse,
     activeTool: updates.activeTool,
     endedAt: updates.endedAt,
     force: Boolean(lifecycleForce)
-  }
+  }, defaults)
 }
 
 function sessionPath(paths, sessionId) {
@@ -271,7 +293,8 @@ function createHookContext(config) {
       transcriptPath: payload.transcript_path,
       tmuxPane: process.env.TMUX_PANE || null,
       pid,
-      lastHookAt: now
+      lastHookAt: now,
+      lastHookEventName: payload.hook_event_name || payload.event_type || payload.type || null
     }, terminalContext(pid))
 
     if (typeof adapterConfig.baseFields === 'function') {

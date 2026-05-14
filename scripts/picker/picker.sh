@@ -94,6 +94,9 @@ if [ "$first_line" = "ctrl-d" ]; then
   else
     selected="${fzf_output#*$'\n'}"
   fi
+elif [ -z "$first_line" ] && [ "$fzf_output" != "${fzf_output#*$'\n'}" ]; then
+  # fzf --expect prints an empty key line when the default Enter action is used.
+  selected="${fzf_output#*$'\n'}"
 fi
 [ -z "$selected" ] && exit 0
 
@@ -103,7 +106,7 @@ if [ "$action" = "details" ]; then
   exec "$0"
 fi
 
-pane_id=$(echo "$selected" | cut -f1)
+pane_id=$(printf '%s\n' "$selected" | cut -f1)
 
 if [ "$pane_id" = "UNBOUND" ]; then
   tmux display-popup -w 64 -h 16 -T " tmux-scout " -E bash -c '
@@ -126,6 +129,19 @@ read -rsn1
 fi
 
 # Jump to the pane
-target=$(tmux display-message -p -t "$pane_id" '#{session_name}:#{window_index}' 2>/dev/null) || exit 0
-tmux switch-client -t "$target" 2>/dev/null || tmux select-window -t "$target"
-tmux select-pane -t "$pane_id"
+target=$(tmux display-message -p -t "$pane_id" '#{session_name}:#{window_index}' 2>/dev/null || true)
+if [ -z "$target" ]; then
+  tmux display-message "tmux-scout: pane $pane_id is no longer available" 2>/dev/null || true
+  exit 0
+fi
+
+if ! tmux switch-client -t "$target" 2>/dev/null; then
+  if ! tmux select-window -t "$target" 2>/dev/null; then
+    tmux display-message "tmux-scout: cannot switch to $target" 2>/dev/null || true
+    exit 0
+  fi
+fi
+
+if ! tmux select-pane -t "$pane_id" 2>/dev/null; then
+  tmux display-message "tmux-scout: cannot select pane $pane_id" 2>/dev/null || true
+fi

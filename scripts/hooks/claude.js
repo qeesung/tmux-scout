@@ -2,102 +2,17 @@
 // tmux-scout Claude Code hook
 // Tracks Claude session status with tmux pane mapping
 
-const fs = require('fs')
 const path = require('path')
-const os = require('os')
-const { applySessionEvent } = require('../lib/session-state')
-const { terminalContext } = require('../lib/terminal-context')
+const { createHookContext, liveSessionState, readStdin } = require('../lib/hook-adapter')
 
-const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
-const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
-const SESSIONS_DIR = path.join(STATUS_DIR, 'sessions')
-
-function ensureDirs() {
-  if (!fs.existsSync(STATUS_DIR)) {
-    fs.mkdirSync(STATUS_DIR, { recursive: true })
-  }
-  if (!fs.existsSync(SESSIONS_DIR)) {
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
-  }
-}
-
-function writeStatusAtomic(filePath, data) {
-  const tempPath = filePath + '.tmp.' + process.pid
-  try {
-    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2))
-    fs.renameSync(tempPath, filePath)
-  } catch (e) {
-    try { fs.unlinkSync(tempPath) } catch (_) {}
-    throw e
-  }
-}
-
-function readStatus() {
-  try {
-    if (fs.existsSync(STATUS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8'))
-    }
-  } catch (e) {}
-  return { version: 1, lastUpdated: Date.now(), sessions: {} }
-}
-
-function liveSessionState(updates) {
-  return Object.assign({
-    endedAt: null,
-    needsAttention: null
-  }, updates)
-}
+const hookContext = createHookContext({
+  agentType: 'claude',
+  defaultStateSource: 'claude-hooks',
+  lifecycleForce: true
+})
 
 function updateSession(sessionId, updates) {
-  ensureDirs()
-
-  const sessionFile = path.join(SESSIONS_DIR, sessionId.replace(/[/\\:]/g, '_') + '.json')
-  let session = { sessionId, agentType: 'claude', startedAt: Date.now() }
-  try {
-    if (fs.existsSync(sessionFile)) {
-      session = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))
-    }
-  } catch (e) {}
-
-  const lifecycleEvent = updates.lifecycleEvent || (updates.lastEvent ? {
-    type: updates.lastEvent.type,
-    source: 'hook',
-    stateSource: updates.stateSource || 'claude-hooks',
-    timestamp: updates.lastEvent.timestamp,
-    details: updates.lastEvent.details,
-    attentionReason: updates.needsAttention || null,
-    pendingToolUse: updates.pendingToolUse,
-    activeTool: updates.activeTool,
-    endedAt: updates.endedAt,
-    force: true
-  } : null)
-  delete updates.lifecycleEvent
-
-  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'activeTool', 'endedAt', 'stateSource', 'lastEvent'])
-  for (const [key, value] of Object.entries(updates)) {
-    if (lifecycleEvent && lifecycleFields.has(key)) continue
-    if (value !== undefined) session[key] = value
-  }
-  session.lastUpdated = Date.now()
-  if (lifecycleEvent) applySessionEvent(session, lifecycleEvent)
-  writeStatusAtomic(sessionFile, session)
-
-  const status = readStatus()
-  status.sessions[sessionId] = session
-  status.lastUpdated = Date.now()
-
-  // Clean up old sessions (older than 24h)
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000
-  for (const [id, sess] of Object.entries(status.sessions)) {
-    if (sess.endedAt && sess.endedAt < cutoff) {
-      delete status.sessions[id]
-      try {
-        fs.unlinkSync(path.join(SESSIONS_DIR, id.replace(/[/\\:]/g, '_') + '.json'))
-      } catch (e) {}
-    }
-  }
-
-  writeStatusAtomic(STATUS_FILE, status)
+  hookContext.updateSession(sessionId, updates)
 }
 
 function getToolDetails(tool_name, tool_input) {
@@ -144,37 +59,15 @@ function isPlanApprovalTool(toolName) {
   return toolName === 'ExitPlanMode'
 }
 
-function eventBase(data, now, tmuxPane, pid) {
-  return Object.assign({
-    workingDirectory: data.cwd,
-    transcriptPath: data.transcript_path,
-    tmuxPane,
-    pid,
-    lastHookAt: now
-  }, terminalContext(pid))
+function eventBase(data, now) {
+  return hookContext.baseUpdates(data, now)
 }
 
-async function main() {
-  let input = ''
-  for await (const chunk of process.stdin) {
-    input += chunk
-  }
-
-  if (!input.trim()) {
-    process.exit(0)
-  }
-
-  let data
-  try {
-    data = JSON.parse(input)
-  } catch (e) {
-    process.exit(0)
-  }
-
+function handleClaudeHook(data) {
   const { session_id, hook_event_name, tool_name, tool_input, prompt, source, reason } = data
 
   if (!session_id) {
-    process.exit(0)
+    return
   }
 
   const now = Date.now()
@@ -372,4 +265,31 @@ async function main() {
   }
 }
 
-main().catch(() => process.exit(0))
+async function main() {
+  const input = await readStdin()
+  if (!input.trim()) return
+
+  let data
+  try {
+    data = JSON.parse(input)
+  } catch (_) {
+    return
+  }
+
+  handleClaudeHook(data)
+}
+
+const adapter = {
+  agentId: 'claude',
+  handle: handleClaudeHook
+}
+
+module.exports = {
+  adapter,
+  handleClaudeHook,
+  getToolDetails
+}
+
+if (require.main === module) {
+  main().catch(() => process.exit(0))
+}

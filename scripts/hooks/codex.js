@@ -4,121 +4,34 @@
 
 const fs = require('fs')
 const path = require('path')
-const os = require('os')
 const { spawnSync } = require('child_process')
-const { applySessionEvent } = require('../lib/session-state')
+const { createHookContext, readStdin } = require('../lib/hook-adapter')
 const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
-const { terminalContext } = require('../lib/terminal-context')
 
-const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
-const STATUS_FILE = path.join(STATUS_DIR, 'status.json')
-const SESSIONS_DIR = path.join(STATUS_DIR, 'sessions')
+const hookContext = createHookContext({
+  agentType: 'codex',
+  defaultStateSource: 'codex-hooks',
+  lifecycleForce: updates => updates.stateSource !== 'notify',
+  baseFields: data => ({
+    endedAt: null,
+    threadId: data.thread_id || data.session_id || data['thread-id'],
+    stateSource: data.hook_event_name ? 'codex-hooks' : 'notify'
+  })
+})
+
+const STATUS_DIR = hookContext.paths.statusDir
 const ORIGINAL_NOTIFY_FILE = path.join(STATUS_DIR, 'codex-original-notify.json')
 
-function ensureDirs() {
-  if (!fs.existsSync(STATUS_DIR)) {
-    fs.mkdirSync(STATUS_DIR, { recursive: true })
-  }
-  if (!fs.existsSync(SESSIONS_DIR)) {
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true })
-  }
-}
-
-function writeStatusAtomic(filePath, data) {
-  const tempPath = filePath + '.tmp.' + process.pid
-  try {
-    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2))
-    fs.renameSync(tempPath, filePath)
-  } catch (e) {
-    try { fs.unlinkSync(tempPath) } catch (_) {}
-    throw e
-  }
-}
-
-function readStatus() {
-  try {
-    if (fs.existsSync(STATUS_FILE)) {
-      return JSON.parse(fs.readFileSync(STATUS_FILE, 'utf-8'))
-    }
-  } catch (_) {}
-  return { version: 1, lastUpdated: Date.now(), sessions: {} }
-}
-
-function sessionPath(sessionId) {
-  return path.join(SESSIONS_DIR, sessionId.replace(/[/\\:]/g, '_') + '.json')
-}
-
 function readSession(sessionId) {
-  try {
-    const filePath = sessionPath(sessionId)
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf-8'))
-    }
-  } catch (_) {}
-  return null
+  return hookContext.readSession(sessionId)
 }
 
 function updateSession(sessionId, updates) {
-  ensureDirs()
-
-  const sessionFile = sessionPath(sessionId)
-  let session = { sessionId, agentType: 'codex', startedAt: Date.now() }
-  try {
-    if (fs.existsSync(sessionFile)) {
-      session = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))
-    }
-  } catch (_) {}
-
-  const isLegacyNotify = updates.stateSource === 'notify'
-  const lifecycleEvent = updates.lifecycleEvent || (updates.lastEvent ? {
-    type: updates.lastEvent.type,
-    source: isLegacyNotify ? 'notify' : 'hook',
-    stateSource: updates.stateSource,
-    timestamp: updates.lastEvent.timestamp,
-    details: updates.lastEvent.details,
-    turnId: updates.lastEvent.turnId,
-    attentionReason: updates.needsAttention || null,
-    pendingToolUse: updates.pendingToolUse,
-    activeTool: updates.activeTool,
-    endedAt: updates.endedAt,
-    force: !isLegacyNotify
-  } : null)
-  delete updates.lifecycleEvent
-
-  const lifecycleFields = new Set(['status', 'phase', 'needsAttention', 'pendingToolUse', 'activeTool', 'endedAt', 'stateSource', 'lastEvent'])
-  for (const [key, value] of Object.entries(updates)) {
-    if (lifecycleEvent && lifecycleFields.has(key)) continue
-    if (value !== undefined) session[key] = value
-  }
-
-  if (lifecycleEvent) applySessionEvent(session, lifecycleEvent)
-
-  session.lastUpdated = Date.now()
-  writeStatusAtomic(sessionFile, session)
-
-  const status = readStatus()
-  status.sessions[sessionId] = session
-  status.lastUpdated = Date.now()
-
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000
-  for (const [id, sess] of Object.entries(status.sessions)) {
-    if (sess.endedAt && sess.endedAt < cutoff) {
-      delete status.sessions[id]
-      try { fs.unlinkSync(sessionPath(id)) } catch (_) {}
-    }
-  }
-
-  writeStatusAtomic(STATUS_FILE, status)
+  hookContext.updateSession(sessionId, updates)
 }
 
-function readStdin() {
-  return new Promise((resolve) => {
-    let input = ''
-    process.stdin.setEncoding('utf-8')
-    process.stdin.on('data', chunk => { input += chunk })
-    process.stdin.on('end', () => resolve(input))
-    process.stdin.on('error', () => resolve(input))
-  })
+function baseUpdates(data, now) {
+  return hookContext.baseUpdates(data, now)
 }
 
 function extractSessionPrompt(inputMessages) {
@@ -185,25 +98,6 @@ function forwardToOriginalNotify(jsonArg) {
       timeout: 30000
     })
   } catch (_) {}
-}
-
-function baseUpdates(data, now) {
-  const tmuxPane = process.env.TMUX_PANE || null
-  const payloadPid = Number.parseInt(data.pid, 10)
-  const pid = Number.isInteger(payloadPid) && payloadPid > 0
-    ? payloadPid
-    : Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null
-  return Object.assign({
-    agentType: 'codex',
-    endedAt: null,
-    workingDirectory: data.cwd,
-    transcriptPath: data.transcript_path,
-    threadId: data.thread_id || data.session_id || data['thread-id'],
-    tmuxPane,
-    pid,
-    stateSource: data.hook_event_name ? 'codex-hooks' : 'notify',
-    lastHookAt: now
-  }, terminalContext(pid))
 }
 
 function normalizeSignal(value) {
@@ -665,10 +559,7 @@ async function main() {
   const jsonArg = process.argv[2]
 
   if (jsonArg) {
-    forwardToOriginalNotify(jsonArg)
-    try {
-      handleLegacyNotify(JSON.parse(jsonArg))
-    } catch (_) {}
+    adapter.handleArg(jsonArg)
     return
   }
 
@@ -682,11 +573,34 @@ async function main() {
     return
   }
 
-  if (data && data.hook_event_name) {
-    handleModernHook(data)
-  } else {
-    handleLegacyNotify(data)
+  adapter.handlePayload(data)
+}
+
+const adapter = {
+  agentId: 'codex',
+  handlePayload(data) {
+    if (data && data.hook_event_name) {
+      handleModernHook(data)
+    } else {
+      handleLegacyNotify(data)
+    }
+  },
+  handleArg(jsonArg) {
+    forwardToOriginalNotify(jsonArg)
+    try {
+      handleLegacyNotify(JSON.parse(jsonArg))
+    } catch (_) {}
   }
 }
 
-main().catch(() => process.exit(0))
+module.exports = {
+  adapter,
+  handleModernHook,
+  handleLegacyNotify,
+  codexStopWantsAnswer,
+  looksLikeAssistantQuestion
+}
+
+if (require.main === module) {
+  main().catch(() => process.exit(0))
+}

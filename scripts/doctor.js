@@ -6,8 +6,7 @@ const os = require('os')
 const path = require('path')
 const { spawnSync } = require('child_process')
 
-const claude = require('./setup/claude')
-const codex = require('./setup/codex')
+const { HOOK_MANAGERS, checkManagerHealth } = require('./setup/managers')
 
 const PROJECT_DIR = path.resolve(__dirname, '..')
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
@@ -229,33 +228,19 @@ function checkHooks() {
   section('Hooks')
 
   let anyInstalled = false
-  const claudeStatus = claude.status()
-  if (claudeStatus.installed === claudeStatus.total) {
-    ok('Claude Code hooks', `${claudeStatus.installed}/${claudeStatus.total} installed`)
-    anyInstalled = true
-  } else if (claudeStatus.installed > 0) {
-    warn('Claude Code hooks', `${claudeStatus.installed}/${claudeStatus.total} installed; missing ${claudeStatus.missing.join(', ')}`)
-    anyInstalled = true
-  } else {
-    warn('Claude Code hooks', 'not installed')
-  }
 
-  const codexStatus = codex.status()
-  if (!codexStatus.available) {
-    warn('Codex hooks', 'Codex config directory not found')
-  } else if (codexStatus.modern && codexStatus.modern.installed) {
-    ok('Codex event hooks', `${codexStatus.modern.installedEvents}/${codexStatus.modern.totalEvents} installed`)
-    anyInstalled = true
-  } else if (codexStatus.modern && codexStatus.modern.installedEvents > 0) {
-    warn('Codex event hooks', `${codexStatus.modern.installedEvents}/${codexStatus.modern.totalEvents} installed`)
-    if (!codexStatus.modern.featuresEnabled) warn('Codex hooks feature', 'missing [features].hooks = true or codex_hooks = true')
-    if (codexStatus.modern.missingTrust.length > 0) warn('Codex hook trust state', `${codexStatus.modern.missingTrust.length} entries missing`)
-    anyInstalled = true
-  } else if (codexStatus.legacy && codexStatus.legacy.installed) {
-    warn('Codex legacy notify hook', 'installed; event hooks are missing')
-    anyInstalled = true
-  } else {
-    warn('Codex hooks', 'not installed')
+  for (const manager of HOOK_MANAGERS) {
+    const report = checkManagerHealth(manager)
+    const label = `${report.label} hooks`
+    if (report.installed) {
+      ok(label, report.summary)
+      anyInstalled = true
+    } else if (report.partial) {
+      warn(label, [report.summary, ...report.issues].filter(Boolean).join('; '))
+      anyInstalled = true
+    } else {
+      warn(label, report.issues[0] || report.summary || 'not installed')
+    }
   }
 
   if (!anyInstalled) {

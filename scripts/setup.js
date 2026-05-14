@@ -4,18 +4,17 @@
 
 const path = require('path')
 const { spawnSync } = require('child_process')
-const claude = require('./setup/claude')
-const codex = require('./setup/codex')
+const { managerById, selectManagers } = require('./setup/managers')
 
 const args = process.argv.slice(2)
 const command = args.find(a => !a.startsWith('-'))
 const flags = new Set(args.filter(a => a.startsWith('-')))
 
-const onlyClaude = flags.has('--claude')
-const onlyCodex = flags.has('--codex')
 const quiet = flags.has('--quiet')
-const runClaude = !onlyCodex || onlyClaude
-const runCodex = !onlyClaude || onlyCodex
+const selectedManagers = selectManagers(flags)
+const selectedManagerIds = new Set(selectedManagers.map(manager => manager.id))
+const claude = managerById.claude.module
+const codex = managerById.codex.module
 
 // Colors
 const c = {
@@ -27,15 +26,24 @@ const c = {
   cyan: s => `\x1b[36m${s}\x1b[0m`
 }
 
+function shouldRun(id) {
+  return selectedManagerIds.has(id)
+}
+
+function printManagerHeader(id) {
+  const manager = managerById[id]
+  console.log(c.cyan(manager.label) + c.dim(' ' + manager.detail))
+}
+
 function doInstall() {
   console.log()
   console.log(c.bold('tmux-scout hook setup'))
   console.log(c.dim('─'.repeat(21)))
   let ok = true
 
-  if (runClaude) {
+  if (shouldRun('claude')) {
     console.log()
-    console.log(c.cyan('Claude Code') + c.dim(' (~/.claude/settings.json)'))
+    printManagerHeader('claude')
     const r = claude.install()
     if (r.skipped) {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
@@ -54,9 +62,9 @@ function doInstall() {
     }
   }
 
-  if (runCodex) {
+  if (shouldRun('codex')) {
     console.log()
-    console.log(c.cyan('Codex') + c.dim(' (~/.codex/hooks.json + config.toml)'))
+    printManagerHeader('codex')
     const r = codex.install()
     if (r.skipped) {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
@@ -82,9 +90,9 @@ function doUninstall() {
   console.log(c.bold('tmux-scout hook removal'))
   console.log(c.dim('─'.repeat(22)))
 
-  if (runClaude) {
+  if (shouldRun('claude')) {
     console.log()
-    console.log(c.cyan('Claude Code') + c.dim(' (~/.claude/settings.json)'))
+    printManagerHeader('claude')
     const r = claude.uninstall()
     if (r.skipped) {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
@@ -97,9 +105,9 @@ function doUninstall() {
     }
   }
 
-  if (runCodex) {
+  if (shouldRun('codex')) {
     console.log()
-    console.log(c.cyan('Codex') + c.dim(' (~/.codex/hooks.json + config.toml)'))
+    printManagerHeader('codex')
     const r = codex.uninstall()
     if (r.skipped) {
       console.log('  ' + c.yellow('⊘') + ' ' + r.reason)
@@ -122,7 +130,7 @@ function doStatus() {
 
   if (!quiet) console.log()
 
-  if (runClaude) {
+  if (shouldRun('claude')) {
     const r = claude.status()
     if (r.installed === r.total) {
       if (quiet) {
@@ -143,7 +151,7 @@ function doStatus() {
     }
   }
 
-  if (runCodex) {
+  if (shouldRun('codex')) {
     const r = codex.status()
     if (!r.available) {
       // Codex not installed — not a problem

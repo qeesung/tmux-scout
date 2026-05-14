@@ -15,6 +15,9 @@ const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts
 const { markInterrupted: markClaudeInterrupted } = require('../scripts/lib/claude-transcript-watcher')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
+const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
+const claudeHook = require('../scripts/hooks/claude')
+const codexHook = require('../scripts/hooks/codex')
 
 const tests = []
 
@@ -176,6 +179,59 @@ test('hook command helper wraps installed hooks with missing-file guard', () => 
   assert.ok(command.startsWith('[ -e '))
   assert.ok(command.includes(' || exit 0; node '))
   assert.strictEqual(extractHookPathFromCommand(command, 'claude.js'), hookPath)
+})
+
+test('hook scripts expose lightweight adapters', () => {
+  assert.strictEqual(claudeHook.adapter.agentId, 'claude')
+  assert.strictEqual(typeof claudeHook.adapter.handle, 'function')
+  assert.strictEqual(codexHook.adapter.agentId, 'codex')
+  assert.strictEqual(typeof codexHook.adapter.handlePayload, 'function')
+  assert.strictEqual(typeof codexHook.adapter.handleArg, 'function')
+})
+
+test('setup manager registry selects agent managers by flags', () => {
+  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), ['claude', 'codex'])
+  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), ['claude', 'codex'])
+  assert.deepStrictEqual(selectManagers(new Set(['--claude'])).map(manager => manager.id), ['claude'])
+  assert.deepStrictEqual(selectManagers(new Set(['--codex', '--quiet'])).map(manager => manager.id), ['codex'])
+})
+
+test('setup manager health normalizes partial hook states', () => {
+  const claudeReport = checkManagerHealth({
+    id: 'claude',
+    label: 'Claude Code',
+    module: {
+      status: () => ({ installed: 12, total: 13, missing: ['Stop'] })
+    }
+  })
+  assert.strictEqual(claudeReport.installed, false)
+  assert.strictEqual(claudeReport.partial, true)
+  assert.strictEqual(claudeReport.summary, '12/13 hooks installed')
+  assert.deepStrictEqual(claudeReport.issues, ['Missing hooks: Stop'])
+
+  const codexReport = checkManagerHealth({
+    id: 'codex',
+    label: 'Codex',
+    module: {
+      status: () => ({
+        available: true,
+        modern: {
+          installed: false,
+          installedEvents: 6,
+          totalEvents: 6,
+          missing: [],
+          featuresEnabled: false,
+          missingTrust: ['trust-key']
+        },
+        legacy: { installed: false }
+      })
+    }
+  })
+  assert.strictEqual(codexReport.installed, false)
+  assert.strictEqual(codexReport.partial, true)
+  assert.strictEqual(codexReport.summary, '6/6 event hooks installed')
+  assert.ok(codexReport.issues.includes('Missing config: [features].hooks = true'))
+  assert.ok(codexReport.issues.includes('Missing trust state entries: 1'))
 })
 
 test('agent registry provides display metadata and process scoring', () => {

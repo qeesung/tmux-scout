@@ -134,6 +134,7 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
   const claudeTranscript = stats && stats.claudeTranscript ? stats.claudeTranscript : {}
   const reconcileChanges = (reconcile.processExits || 0)
     + (reconcile.paneShellExits || 0)
+    + (reconcile.paneVanished || 0)
     + (reconcile.pidBindings || 0)
   const evidence = stats && stats.evidence ? stats.evidence : {}
   const claudeInterruptions = claudeTranscript.interrupted || 0
@@ -148,6 +149,7 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     reconcileChanges,
     processExits: reconcile.processExits || 0,
     paneShellExits: reconcile.paneShellExits || 0,
+    paneVanished: reconcile.paneVanished || 0,
     pidBindings: reconcile.pidBindings || 0,
     codexInterrupted: codexInterruptions,
     codexTranscriptRead: codex.filesRead || 0,

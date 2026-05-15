@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Optional tmux-managed watcher for tmux-scout.
 // It keeps hooks as the primary source, then performs fast lifecycle checks,
-// incremental Codex transcript reads, and slower full reconciles.
+// bridge delivery, and narrow transcript interruption checks.
 
 const fs = require('fs')
 const path = require('path')
@@ -19,9 +19,6 @@ const LOG_FILE = path.join(STATUS_DIR, 'watcher.log')
 const BRIDGE_SOCKET = path.join(STATUS_DIR, 'run', 'bridge.sock')
 
 const DEFAULT_FAST_INTERVAL_MS = 2000
-const DEFAULT_DISCOVERY_INTERVAL_MS = 30000
-const DEFAULT_FULL_INTERVAL_MS = 60000
-const STALE_STATE_MS = 24 * 60 * 60 * 1000
 
 function ensureDir() {
   fs.mkdirSync(STATUS_DIR, { recursive: true })
@@ -121,62 +118,42 @@ function removeOwnLock() {
 }
 
 function loadState() {
-  const state = readJson(STATE_FILE, { version: 1, codexFiles: {} })
-  if (!state || typeof state !== 'object') return { version: 1, codexFiles: {} }
-  if (!state.codexFiles || typeof state.codexFiles !== 'object') state.codexFiles = {}
+  const state = readJson(STATE_FILE, { version: 1 })
+  if (!state || typeof state !== 'object') return { version: 1 }
+  if (state.codexFiles) delete state.codexFiles
   return state
 }
 
 function pruneState(state) {
-  const cutoff = Date.now() - STALE_STATE_MS
-  for (const [filePath, fileState] of Object.entries(state.codexFiles || {})) {
-    const lastReadAt = Number.isFinite(fileState && fileState.lastReadAt) ? fileState.lastReadAt : 0
-    if (lastReadAt && lastReadAt >= cutoff) continue
-    try {
-      const stat = fs.statSync(filePath)
-      if (stat.mtimeMs >= cutoff) continue
-    } catch (_) {}
-    delete state.codexFiles[filePath]
-  }
+  if (state && state.codexFiles) delete state.codexFiles
 }
 
 function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
   const reconcile = stats && stats.reconcile ? stats.reconcile : {}
   const codex = stats && stats.codex ? stats.codex : {}
   const claudeTranscript = stats && stats.claudeTranscript ? stats.claudeTranscript : {}
-  const paneGroundTruth = stats && stats.paneGroundTruth ? stats.paneGroundTruth : {}
-  const stuckTools = stats && stats.stuckTools ? stats.stuckTools : {}
   const reconcileChanges = (reconcile.processExits || 0)
     + (reconcile.paneShellExits || 0)
     + (reconcile.pidBindings || 0)
-  const codexChanges = (codex.discovered || 0) + (codex.updated || 0) + (codex.stale || 0)
   const evidence = stats && stats.evidence ? stats.evidence : {}
-  const paneUpdates = paneGroundTruth.updates || 0
-  const stuckInterruptions = stuckTools.interrupted || 0
   const claudeInterruptions = claudeTranscript.interrupted || 0
+  const codexInterruptions = codex.interrupted || 0
 
   return {
     mode,
     startedAt,
     finishedAt,
     durationMs,
-    changes: reconcileChanges + codexChanges + paneUpdates + stuckInterruptions + claudeInterruptions,
+    changes: reconcileChanges + codexInterruptions + claudeInterruptions,
     reconcileChanges,
     processExits: reconcile.processExits || 0,
     paneShellExits: reconcile.paneShellExits || 0,
     pidBindings: reconcile.pidBindings || 0,
-    codexDiscovered: codex.discovered || 0,
-    codexUpdated: codex.updated || 0,
-    codexInterrupted: codex.interrupted || 0,
-    codexStale: codex.stale || 0,
-    codexFilesRead: codex.filesRead || 0,
-    codexEventsParsed: codex.eventsParsed || 0,
-    codexParseErrors: codex.parseErrors || 0,
+    codexInterrupted: codexInterruptions,
+    codexTranscriptRead: codex.filesRead || 0,
     claudeTranscriptRead: claudeTranscript.filesRead || 0,
     claudeTranscriptParseErrors: claudeTranscript.parseErrors || 0,
     claudeInterrupted: claudeInterruptions,
-    paneUpdates,
-    stuckToolInterruptions: stuckInterruptions,
     evidenceWritten: evidence.written || 0
   }
 }
@@ -195,18 +172,11 @@ function formatTickDiagnostics(summary) {
   if (Number.isFinite(summary.durationMs)) parts.push(`duration=${summary.durationMs}ms`)
   if (Number.isFinite(summary.changes)) parts.push(`changes=${summary.changes}`)
   if (Number.isFinite(summary.reconcileChanges)) parts.push(`reconcile=${summary.reconcileChanges}`)
-  if (Number.isFinite(summary.codexFilesRead)) parts.push(`codexRead=${summary.codexFilesRead}`)
-  if (Number.isFinite(summary.codexEventsParsed)) parts.push(`codexParsed=${summary.codexEventsParsed}`)
-  if (summary.codexParseErrors > 0) parts.push(`codexParseErrors=${summary.codexParseErrors}`)
+  if (Number.isFinite(summary.codexTranscriptRead)) parts.push(`codexRead=${summary.codexTranscriptRead}`)
   if (Number.isFinite(summary.claudeTranscriptRead)) parts.push(`claudeRead=${summary.claudeTranscriptRead}`)
   if (summary.claudeTranscriptParseErrors > 0) parts.push(`claudeParseErrors=${summary.claudeTranscriptParseErrors}`)
   if (summary.claudeInterrupted > 0) parts.push(`claudeInterrupted=${summary.claudeInterrupted}`)
-  if (summary.codexDiscovered > 0) parts.push(`codexDiscovered=${summary.codexDiscovered}`)
-  if (summary.codexUpdated > 0) parts.push(`codexUpdated=${summary.codexUpdated}`)
   if (summary.codexInterrupted > 0) parts.push(`codexInterrupted=${summary.codexInterrupted}`)
-  if (summary.codexStale > 0) parts.push(`codexStale=${summary.codexStale}`)
-  if (summary.paneUpdates > 0) parts.push(`paneUpdates=${summary.paneUpdates}`)
-  if (summary.stuckToolInterruptions > 0) parts.push(`stuckTools=${summary.stuckToolInterruptions}`)
   if (summary.evidenceWritten > 0) parts.push(`evidence=${summary.evidenceWritten}`)
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
@@ -225,27 +195,8 @@ function bridgeStatus(running) {
 
 function runTick(state, forceFull = false, transcriptWatchManager = null) {
   const startedAt = Date.now()
-  const now = startedAt
-  const discoveryIntervalMs = optionSeconds('@scout-watchdog-discovery-interval', DEFAULT_DISCOVERY_INTERVAL_MS, 5000)
-  const fullIntervalMs = optionSeconds('@scout-watchdog-full-interval', DEFAULT_FULL_INTERVAL_MS, 10000)
-  const discoverDue = now - (state.lastDiscoveryAt || 0) >= discoveryIntervalMs
-  const fullDue = forceFull || now - (state.lastFullReconcileAt || 0) >= fullIntervalMs
-  let result
-
-  if (fullDue) {
-    result = sync.run(STATUS_FILE)
-    state.lastFullReconcileAt = now
-    state.lastDiscoveryAt = now
-    state.lastMode = 'full'
-  } else {
-    result = sync.run(STATUS_FILE, {
-      codexMode: 'incremental',
-      watcherState: state,
-      discoverCodex: discoverDue
-    })
-    if (discoverDue) state.lastDiscoveryAt = now
-    state.lastMode = discoverDue ? 'incremental+discover' : 'incremental'
-  }
+  const result = sync.run(STATUS_FILE)
+  state.lastMode = forceFull ? 'reconcile:forced' : 'reconcile'
 
   const finishedAt = Date.now()
   const stats = result && result.stats ? result.stats : null
@@ -331,17 +282,16 @@ async function runLoop({ requireTmuxOption }) {
 function status() {
   const lock = readLock()
   const state = loadState()
-  const files = Object.keys(state.codexFiles || {}).length
   const lastTick = state.lastTickAt ? new Date(state.lastTickAt).toISOString() : 'never'
   const error = state.lastError ? ` error=${JSON.stringify(state.lastError)}` : ''
   const diagnostics = formatTickDiagnostics(state.lastTickSummary)
   const running = Boolean(lock && isPidAlive(lock.pid))
   const bridge = bridgeStatus(running)
   if (running) {
-    console.log(`running pid=${lock.pid} bridge=${bridge} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
+    console.log(`running pid=${lock.pid} bridge=${bridge} lastTick=${lastTick} mode=${state.lastMode || 'unknown'}${diagnostics}${error}`)
     return
   }
-  console.log(`stopped bridge=${bridge} lastTick=${lastTick} mode=${state.lastMode || 'unknown'} codexFiles=${files}${diagnostics}${error}`)
+  console.log(`stopped bridge=${bridge} lastTick=${lastTick} mode=${state.lastMode || 'unknown'}${diagnostics}${error}`)
 }
 
 function stop(quiet) {

@@ -281,8 +281,7 @@ function checkWatcher() {
     const details = [`running pid=${pid}`, `lastTick=${lastTick}`]
     if (Number.isFinite(summary.durationMs)) details.push(`duration=${summary.durationMs}ms`)
     if (Number.isFinite(summary.changes)) details.push(`changes=${summary.changes}`)
-    if (Number.isFinite(summary.codexFilesRead)) details.push(`codexRead=${summary.codexFilesRead}`)
-    if (summary.codexParseErrors > 0) details.push(`codexParseErrors=${summary.codexParseErrors}`)
+    if (Number.isFinite(summary.codexTranscriptRead)) details.push(`codexRead=${summary.codexTranscriptRead}`)
     ok('watcher process', details.join(', '))
     if (bridge === 'socket') ok('bridge socket', BRIDGE_SOCKET)
     else warn('bridge socket', `watcher is running but bridge socket is ${bridge}`)

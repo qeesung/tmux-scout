@@ -1550,6 +1550,114 @@ test('sync marks running Claude session interrupted from transcript marker', () 
   }
 })
 
+test('sync marks sessions stale when their tmux pane vanishes', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    const now = Date.now()
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        ghost: {
+          sessionId: 'ghost',
+          agentType: 'claude',
+          status: 'completed',
+          phase: 'completed',
+          tmuxPane: '%9999',
+          startedAt: now - 60000,
+          lastUpdated: now - 30000
+        },
+        live: {
+          sessionId: 'live',
+          agentType: 'claude',
+          status: 'completed',
+          phase: 'completed',
+          tmuxPane: '%1',
+          startedAt: now - 60000,
+          lastUpdated: now - 30000
+        },
+        unbound: {
+          sessionId: 'unbound',
+          agentType: 'codex',
+          status: 'completed',
+          phase: 'completed',
+          tmuxPane: null,
+          startedAt: now - 60000,
+          lastUpdated: now - 30000
+        }
+      }
+    }))
+
+    const initResult = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+
+    const panes = new Map([['%1', { paneId: '%1', currentCommand: 'node', paneDead: false }]])
+    panes.tmuxAvailable = true
+    const stats = sync.createStats()
+    sync.sweepVanishedPanes(initResult.status, panes, stats)
+
+    assert.strictEqual(stats.reconcile.paneVanished, 1)
+    const reloaded = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(reloaded.sessions.ghost.status, 'stale')
+    assert.match(reloaded.sessions.ghost.staleReason || '', /pane %9999 no longer exists/)
+    assert.strictEqual(reloaded.sessions.live.status, 'completed')
+    assert.strictEqual(reloaded.sessions.unbound.status, 'completed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync vanished-pane sweep skips when tmux is unavailable', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    const now = Date.now()
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        ghost: {
+          sessionId: 'ghost',
+          agentType: 'claude',
+          status: 'completed',
+          phase: 'completed',
+          tmuxPane: '%9999',
+          startedAt: now - 60000,
+          lastUpdated: now - 30000
+        }
+      }
+    }))
+
+    const initResult = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+
+    const panes = new Map()
+    const stats = sync.createStats()
+    sync.sweepVanishedPanes(initResult.status, panes, stats)
+
+    assert.strictEqual(stats.reconcile.paneVanished, 0)
+    const reloaded = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(reloaded.sessions.ghost.status, 'completed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('render hides completed sessions that never linked to a tmux pane', () => {
   const active = getActiveSessions({
     sessions: {

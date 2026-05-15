@@ -28,6 +28,7 @@ function createStats(options = {}) {
     reconcile: {
       processExits: 0,
       paneShellExits: 0,
+      paneVanished: 0,
       pidBindings: 0
     },
     codex: {
@@ -91,11 +92,13 @@ function sessionFilePath(sessionId) {
 
 function getPaneSnapshot() {
   const panes = new Map()
+  panes.tmuxAvailable = false
   try {
     const output = execSync('tmux list-panes -a -F "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{session_name}\t#{window_index}\t#{window_name}"', {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore']
     }).trim()
+    panes.tmuxAvailable = true
 
     if (!output) return panes
 
@@ -242,8 +245,32 @@ function sweepDeadProcesses(status, panes, stats) {
   }
 }
 
+function sweepVanishedPanes(status, panes, stats) {
+  if (!panes || panes.tmuxAvailable !== true) return
+  const now = Date.now()
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (!session || session.endedAt) continue
+    if (isHiddenCodexSession(session)) continue
+    if (!session.tmuxPane) continue
+    if (panes.has(session.tmuxPane)) continue
+
+    const reason = `pane ${session.tmuxPane} no longer exists`
+    const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pane', now), stats)
+    if (updated && stats) stats.reconcile.paneVanished++
+    changed = updated || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
 function reconcileSessions(status, panes, stats) {
   const processTable = readProcessTable()
+  sweepVanishedPanes(status, panes, stats)
   sweepDeadProcesses(status, panes, stats)
   sweepPidBindings(status, panes, processTable, stats)
 }
@@ -470,7 +497,7 @@ function run(file, options = {}) {
   return { status, panes, stats }
 }
 
-module.exports = { run, isWatcherRunning, clearPidStateCache, createStats }
+module.exports = { run, isWatcherRunning, clearPidStateCache, createStats, sweepVanishedPanes }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

@@ -856,6 +856,27 @@ test('status bar omits empty output', () => {
   assert.strictEqual(statusBar.renderStatusBar(counts, '{T}', 'on'), '')
 })
 
+test('status bar derives active pane rows from cached status only', () => {
+  const status = {
+    sessions: {
+      busy: {
+        sessionId: 'busy',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'running',
+        tmuxPane: '%1',
+        pid: 999999999,
+        lastUpdated: Date.now()
+      }
+    }
+  }
+
+  const cachedStatus = statusBar.cachedStatusSnapshot(status)
+  const active = getActiveSessions(cachedStatus, statusBar.cachedPaneSnapshot(cachedStatus))
+  assert.deepStrictEqual(active.map(session => session.sessionId), ['busy'])
+  assert.strictEqual(status.sessions.busy.pid, 999999999)
+})
+
 test('session details render as an information panel', () => {
   const output = formatSessionDetails({
     sessionId: 'session-1',
@@ -1685,7 +1706,7 @@ test('codex full sync does not refresh unchanged same-phase transcript state', (
   }
 })
 
-test('codex full sync refreshes unchanged same-phase active unbound sessions', () => {
+test('codex sync does not refresh unchanged active unbound sessions from JSONL', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -1723,9 +1744,9 @@ test('codex full sync refreshes unchanged same-phase active unbound sessions', (
       stuckSweep: false,
       claudeTranscript: false
     })
-    assert.ok(result.status.sessions[threadId].lastUpdated > oldUpdated)
+    assert.strictEqual(result.status.sessions[threadId].lastUpdated, oldUpdated)
     assert.strictEqual(result.status.sessions[threadId].status, 'working')
-    assert.strictEqual(result.stats.codex.updated, 1)
+    assert.strictEqual(result.stats.codex.updated, 0)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
@@ -1780,6 +1801,73 @@ test('codex sync marks matching current turn interrupted from transcript', () =>
     assert.strictEqual(updated.lastEvent.turnId, 'turn-current')
     assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
     assert.strictEqual(result.stats.codex.interrupted, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync marks waiting current turns interrupted from transcript', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const cases = [
+      { threadId: 'waiting-approval-codex-interrupt', phase: 'waitingForApproval', turnId: 'turn-approval' },
+      { threadId: 'waiting-answer-codex-interrupt', phase: 'waitingForAnswer', turnId: 'turn-answer' }
+    ]
+    const sessions = {}
+
+    for (const testCase of cases) {
+      const jsonl = path.join(dir, `${testCase.threadId}.jsonl`)
+      fs.writeFileSync(jsonl, [
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: new Date(now - 2000).toISOString(),
+          payload: { type: 'user_message', message: 'keep working', turn_id: testCase.turnId }
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: new Date(now - 1000).toISOString(),
+          payload: { type: 'turn_aborted', turn_id: testCase.turnId, reason: 'interrupted' }
+        })
+      ].join('\n') + '\n')
+
+      const session = {
+        sessionId: testCase.threadId,
+        threadId: testCase.threadId,
+        agentType: 'codex',
+        status: 'working',
+        phase: testCase.phase,
+        transcriptPath: jsonl,
+        tmuxPane: null,
+        lastTurnId: testCase.turnId,
+        lastUpdated: now - 3000
+      }
+      sessions[testCase.threadId] = session
+      fs.writeFileSync(path.join(scoutDir, 'sessions', `${testCase.threadId}.json`), JSON.stringify(session, null, 2))
+    }
+
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    for (const testCase of cases) {
+      const updated = result.status.sessions[testCase.threadId]
+      assert.strictEqual(currentPhase(updated), 'interrupted')
+      assert.strictEqual(updated.lastEvent.turnId, testCase.turnId)
+      assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
+    }
+    assert.strictEqual(result.stats.codex.interrupted, cases.length)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
@@ -1892,7 +1980,7 @@ test('codex sync ignores stale interrupted transcript events for newer turns', (
   }
 })
 
-test('codex sync marks stale unbound sessions even when a stale pid is present', () => {
+test('codex sync does not mark unbound sessions stale from inactive JSONL', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -1930,8 +2018,8 @@ test('codex sync marks stale unbound sessions even when a stale pid is present',
       stuckSweep: false,
       claudeTranscript: false
     })
-    assert.strictEqual(result.status.sessions[threadId].status, 'stale')
-    assert.strictEqual(result.stats.codex.stale, 1)
+    assert.strictEqual(result.status.sessions[threadId].status, 'working')
+    assert.strictEqual(result.stats.codex.stale, 0)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
@@ -2645,7 +2733,7 @@ test('codex hidden subagents are summarized on parent picker rows', () => {
   }
 })
 
-test('codex jsonl discovery keeps standalone review sessions visible', () => {
+test('codex jsonl discovery no longer creates standalone review sessions', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -2677,18 +2765,15 @@ test('codex jsonl discovery keeps standalone review sessions visible', () => {
       stuckSweep: false,
       claudeTranscript: false
     })
-    const session = result.status.sessions[threadId]
-    assert.ok(session)
-    assert.notStrictEqual(session.isHiddenFromScout, true)
-    assert.strictEqual(currentPhase(session), 'running')
-    assert.strictEqual(session.status, 'working')
+    assert.deepStrictEqual(Object.keys(result.status.sessions), [])
+    assert.strictEqual(fs.existsSync(statusFile), false)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex jsonl discovery skips subagent sessions by default', () => {
+test('codex jsonl discovery remains disabled for subagent sessions', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {

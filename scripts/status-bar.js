@@ -7,6 +7,7 @@
 // Example: set -g @scout-status-format '{W}/{B}/{D}/{I}'
 
 const path = require('path')
+const fs = require('fs')
 const { execSync } = require('child_process')
 
 const STATUS_FILE = (process.env.HOME || '') + '/.tmux-scout/status.json'
@@ -16,9 +17,17 @@ const CLICK_RANGE_START = '#[range=user|scout]'
 const CLICK_RANGE_END = '#[norange]'
 const DEFAULT_CLICK_STYLE = 'underscore'
 
-// Reuse sync + render logic so counts stay aligned with picker
-const sync = require(path.join(__dirname, 'picker', 'sync'))
+// Reuse render logic so counts stay aligned with picker without mutating state.
 const { getActiveSessions, waitCode } = require(path.join(__dirname, 'picker', 'render'))
+
+function readJson(filePath, fallback) {
+  try {
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    }
+  } catch (_) {}
+  return fallback
+}
 
 function readTmuxOption(name) {
   try {
@@ -65,6 +74,28 @@ function summarizeSessions(active) {
   return counts
 }
 
+function cachedPaneSnapshot(status) {
+  const panes = new Map()
+  for (const session of Object.values(status && status.sessions ? status.sessions : {})) {
+    if (!session || !session.tmuxPane || panes.has(session.tmuxPane)) continue
+    panes.set(session.tmuxPane, {
+      paneId: session.tmuxPane,
+      currentCommand: '',
+      paneDead: false,
+      windowName: session.tmuxWindowName || ''
+    })
+  }
+  return panes
+}
+
+function cachedStatusSnapshot(status) {
+  const sessions = {}
+  for (const [sessionId, session] of Object.entries(status && status.sessions ? status.sessions : {})) {
+    sessions[sessionId] = Object.assign({}, session, { pid: null })
+  }
+  return Object.assign({}, status || {}, { sessions })
+}
+
 function applyFormat(fmt, counts) {
   return fmt
     .replace(/\{W\}/g, String(counts.wait))
@@ -105,16 +136,11 @@ function renderStatusBar(counts, fmt, clickOption, clickStyle) {
 }
 
 function main() {
-  let cached
-  try {
-    const watcherRunning = sync.isWatcherRunning()
-    cached = sync.run(STATUS_FILE, watcherRunning
-      ? { reconcile: false, codexMode: 'none', paneGroundTruth: false, stuckSweep: false }
-      : {})
-  } catch (_) {}
-  if (!cached || !cached.status) process.exit(0)
+  const status = readJson(STATUS_FILE, null)
+  if (!status) process.exit(0)
 
-  const active = getActiveSessions(cached.status, cached.panes)
+  const cachedStatus = cachedStatusSnapshot(status)
+  const active = getActiveSessions(cachedStatus, cachedPaneSnapshot(cachedStatus))
   const output = renderStatusBar(
     summarizeSessions(active),
     readTmuxOption('@scout-status-format'),
@@ -129,7 +155,9 @@ module.exports = {
   applyClickStyle,
   clickEnabled,
   renderStatusBar,
-  summarizeSessions
+  summarizeSessions,
+  cachedPaneSnapshot,
+  cachedStatusSnapshot
 }
 
 if (require.main === module) main()

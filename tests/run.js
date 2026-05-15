@@ -1983,6 +1983,213 @@ test('codex sync marks matching current turn interrupted from transcript', () =>
   }
 })
 
+test('codex sync settle gate skips very recent transcript scans', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-settling-scan'
+    const jsonl = path.join(dir, 'codex-settling.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 500).toISOString(),
+      payload: { type: 'turn_aborted', turn_id: 'turn-current', reason: 'interrupted' }
+    }) + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-current',
+      lastUpdated: now - 1000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    assert.strictEqual(currentPhase(result.status.sessions[threadId]), 'running')
+    assert.strictEqual(result.stats.codex.filesRead, 0)
+    assert.strictEqual(result.stats.codex.skippedSettling, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync reuses transcript path, turn id, and scanned size cache', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-size-cache'
+    const jsonl = path.join(dir, 'codex-size-cache.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 10000).toISOString(),
+      payload: { type: 'user_message', message: 'keep working', turn_id: 'turn-current' }
+    }) + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-current',
+      lastUpdated: now - 10000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const codexTranscriptState = {}
+    const first = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      codexTranscriptState
+    })
+    assert.strictEqual(first.stats.codex.filesRead, 1)
+    assert.strictEqual(codexTranscriptState[threadId].transcriptPath, jsonl)
+    assert.strictEqual(codexTranscriptState[threadId].latestTurnId, 'turn-current')
+    assert.strictEqual(codexTranscriptState[threadId].lastScannedSize, fs.statSync(jsonl).size)
+
+    const second = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      codexTranscriptState
+    })
+    assert.strictEqual(second.stats.codex.filesRead, 0)
+    assert.strictEqual(second.stats.codex.skippedUnchanged, 1)
+
+    fs.appendFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 1000).toISOString(),
+      payload: { type: 'turn_aborted', turn_id: 'turn-current', reason: 'interrupted' }
+    }) + '\n')
+
+    const third = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      codexTranscriptState
+    })
+    assert.strictEqual(third.stats.codex.filesRead, 1)
+    assert.strictEqual(currentPhase(third.status.sessions[threadId]), 'interrupted')
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync invalidates transcript cache when mtime changes at same byte size', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-mtime-cache'
+    const jsonl = path.join(dir, 'codex-mtime-cache.jsonl')
+
+    const baseUser = JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 10000).toISOString(),
+      payload: { type: 'user_message', message: 'keep working', turn_id: 'turn-current' }
+    })
+    const baseAborted = JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 1000).toISOString(),
+      payload: { type: 'turn_aborted', turn_id: 'turn-current', reason: 'interrupted' }
+    })
+    const padOverhead = ',"_pad":""'.length
+    const targetLen = Math.max(baseUser.length, baseAborted.length) + padOverhead + 16
+    const withPad = (base) => {
+      const obj = JSON.parse(base)
+      obj._pad = 'x'.repeat(targetLen - base.length - padOverhead)
+      return JSON.stringify(obj) + '\n'
+    }
+    const paddedUser = withPad(baseUser)
+    const paddedAborted = withPad(baseAborted)
+    assert.strictEqual(paddedUser.length, paddedAborted.length)
+
+    fs.writeFileSync(jsonl, paddedUser)
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-current',
+      lastUpdated: now - 10000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const codexTranscriptState = {}
+    const first = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      codexTranscriptState,
+      codexTranscriptSettleGateMs: 0
+    })
+    assert.strictEqual(first.stats.codex.filesRead, 1)
+    const cached = codexTranscriptState[threadId]
+    assert.ok(Number.isFinite(cached.lastScannedMtimeMs))
+    assert.ok(Number.isFinite(cached.lastScannedInode))
+    assert.strictEqual(cached.lastScannedSize, fs.statSync(jsonl).size)
+
+    fs.writeFileSync(jsonl, paddedAborted)
+    const bumped = new Date(Date.now() + 5000)
+    fs.utimesSync(jsonl, bumped, bumped)
+    assert.strictEqual(fs.statSync(jsonl).size, cached.lastScannedSize)
+    assert.notStrictEqual(fs.statSync(jsonl).mtimeMs, cached.lastScannedMtimeMs)
+
+    const second = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      codexTranscriptState,
+      codexTranscriptSettleGateMs: 0
+    })
+    assert.strictEqual(second.stats.codex.filesRead, 1)
+    assert.strictEqual(currentPhase(second.status.sessions[threadId]), 'interrupted')
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('codex sync marks waiting current turns interrupted from transcript', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME

@@ -18,6 +18,7 @@ let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') :
 const pidStateCache = new Map()
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = DEFAULT_TAIL_BYTES
 const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
+const CODEX_TRANSCRIPT_SETTLE_GATE_MS = 3000
 
 function createStats(options = {}) {
   return {
@@ -37,6 +38,8 @@ function createStats(options = {}) {
       interrupted: 0,
       stale: 0,
       filesRead: 0,
+      skippedSettling: 0,
+      skippedUnchanged: 0,
       eventsParsed: 0,
       parseErrors: 0
     },
@@ -295,11 +298,97 @@ function codexInterruptForSession(session) {
   return timestampHit
 }
 
+function codexTranscriptState(options) {
+  const state = options && options.codexTranscriptState
+  return state && typeof state === 'object' && !Array.isArray(state) ? state : null
+}
+
+function codexTranscriptSettleGateMs(options) {
+  if (options && Number.isFinite(options.codexTranscriptSettleGateMs)) {
+    return Math.max(0, options.codexTranscriptSettleGateMs)
+  }
+  return CODEX_TRANSCRIPT_SETTLE_GATE_MS
+}
+
+function latestTurnKey(session) {
+  return session && session.lastTurnId ? String(session.lastTurnId) : null
+}
+
+function statTranscriptFile(transcriptPath) {
+  try {
+    return fs.statSync(transcriptPath)
+  } catch (_) {
+    return null
+  }
+}
+
+function shouldSkipCodexTranscriptScan(sessionId, session, options, stats, now) {
+  const settleGateMs = codexTranscriptSettleGateMs(options)
+  const lastChangedAt = Math.max(
+    Number.isFinite(session.lastUpdated) ? session.lastUpdated : 0,
+    Number.isFinite(session.lastHookAt) ? session.lastHookAt : 0
+  )
+  if (settleGateMs > 0 && lastChangedAt > 0 && now - lastChangedAt < settleGateMs) {
+    if (stats && stats.codex) stats.codex.skippedSettling++
+    return { skip: true }
+  }
+
+  const state = codexTranscriptState(options)
+  if (!state) return { skip: false }
+
+  const stat = statTranscriptFile(session.transcriptPath)
+  if (!stat) return { skip: true }
+
+  const cache = state[sessionId]
+  const turnKey = latestTurnKey(session)
+  if (cache &&
+    cache.transcriptPath === session.transcriptPath &&
+    cache.latestTurnId === turnKey &&
+    cache.lastScannedSize === stat.size &&
+    cache.lastScannedMtimeMs === stat.mtimeMs &&
+    cache.lastScannedInode === stat.ino) {
+    if (stats && stats.codex) stats.codex.skippedUnchanged++
+    return { skip: true, stat }
+  }
+
+  return { skip: false, stat }
+}
+
+function updateCodexTranscriptScanState(sessionId, session, options, stat, now) {
+  const state = codexTranscriptState(options)
+  if (!state) return
+  const nextStat = stat || statTranscriptFile(session.transcriptPath)
+  if (!nextStat) return
+  state[sessionId] = {
+    transcriptPath: session.transcriptPath,
+    latestTurnId: latestTurnKey(session),
+    lastScannedSize: nextStat.size,
+    lastScannedMtimeMs: nextStat.mtimeMs,
+    lastScannedInode: nextStat.ino,
+    lastScannedAt: now
+  }
+}
+
+function pruneCodexTranscriptScanState(status, options) {
+  const state = codexTranscriptState(options)
+  if (!state) return
+  const keep = new Set()
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
+    if (!session || session.agentType !== 'codex' || session.endedAt || !session.transcriptPath) continue
+    if (!isActiveCodexTranscriptPhase(currentPhase(session))) continue
+    keep.add(sessionId)
+  }
+  for (const sessionId of Object.keys(state)) {
+    if (!keep.has(sessionId)) delete state[sessionId]
+  }
+}
+
 function isActiveCodexTranscriptPhase(phase) {
   return phase === 'running' || phase === 'waitingForApproval' || phase === 'waitingForAnswer'
 }
 
-function sweepInterruptedCodexTranscripts(status, stats) {
+function sweepInterruptedCodexTranscripts(status, stats, options = {}) {
   const now = Date.now()
   let changed = false
 
@@ -309,8 +398,12 @@ function sweepInterruptedCodexTranscripts(status, stats) {
     if (!isActiveCodexTranscriptPhase(currentPhase(session))) continue
     if (!session.transcriptPath) continue
 
+    const scan = shouldSkipCodexTranscriptScan(sessionId, session, options, stats, now)
+    if (scan.skip) continue
+
     if (stats && stats.codex) stats.codex.filesRead++
     const hit = codexInterruptForSession(session)
+    updateCodexTranscriptScanState(sessionId, session, options, scan.stat, now)
     if (!hit) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
@@ -336,7 +429,8 @@ function sweepInterruptedCodexTranscripts(status, stats) {
 
 function syncCodexSessions(status, panes, options = {}, stats) {
   if (options.codexMode === 'none' || options.codexTranscript === false) return
-  sweepInterruptedCodexTranscripts(status, stats)
+  sweepInterruptedCodexTranscripts(status, stats, options)
+  pruneCodexTranscriptScanState(status, options)
 }
 
 // --- Claude transcript helpers ---

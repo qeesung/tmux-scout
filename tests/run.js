@@ -723,6 +723,54 @@ test('picker rows keep display text unchanged while carrying hidden session id',
   assert.strictEqual(fields[2], 'session-hidden-id')
 })
 
+test('picker rows prefer pending interaction detail for waits', () => {
+  const session = {
+    sessionId: 'session-plan-wait',
+    agentType: 'claude',
+    status: 'working',
+    phase: 'waitingForApproval',
+    needsAttention: 'waiting for plan approval',
+    pendingInteraction: {
+      type: 'plan',
+      phase: 'waitingForApproval',
+      source: 'hook',
+      reason: 'waiting for plan approval',
+      details: 'ExitPlanMode: proposed plan',
+      tool: 'ExitPlanMode'
+    },
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    _tmuxPaneSnapshot: { windowName: 'main' }
+  }
+  const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+  assert.ok(line.includes('W:PLAN'), line)
+  assert.ok(line.includes('waiting for plan approval: ExitPlanMode: proposed plan'), line)
+})
+
+test('picker rows omit duplicated generic wait details', () => {
+  const session = {
+    sessionId: 'session-answer-wait',
+    agentType: 'codex',
+    status: 'working',
+    phase: 'waitingForAnswer',
+    needsAttention: 'waiting for answer',
+    pendingInteraction: {
+      type: 'question',
+      phase: 'waitingForAnswer',
+      source: 'pane',
+      reason: 'waiting for answer',
+      details: 'waiting for answer'
+    },
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    _tmuxPaneSnapshot: { windowName: 'main' }
+  }
+  const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+  assert.ok(line.includes('W:ANS'), line)
+  assert.ok(line.includes('waiting for answer · pane'), line)
+  assert.ok(!line.includes('waiting for answer: waiting for answer'), line)
+})
+
 test('session details render as an information panel', () => {
   const output = formatSessionDetails({
     sessionId: 'session-1',
@@ -730,6 +778,19 @@ test('session details render as an information panel', () => {
     status: 'working',
     phase: 'waitingForApproval',
     needsAttention: 'waiting for approval',
+    pendingInteraction: {
+      type: 'approval',
+      phase: 'waitingForApproval',
+      source: 'hook',
+      stateSource: 'codex-hooks',
+      rawEventName: 'PermissionRequest',
+      startedAt: 2000,
+      updatedAt: 2000,
+      reason: 'waiting for approval',
+      details: 'Bash: npm test',
+      tool: 'Bash',
+      confidence: 90
+    },
     pendingToolUse: { tool: 'Bash', details: 'Bash: npm test' },
     workingDirectory: '/tmp/tmux-scout',
     tmuxPane: '%1',
@@ -755,6 +816,8 @@ test('session details render as an information panel', () => {
   assert.ok(plain.includes('WAITING'))
   assert.ok(plain.includes('Current'))
   assert.ok(plain.includes('Bash: npm test'))
+  assert.ok(plain.includes('source=hook'))
+  assert.ok(plain.includes('event=PermissionRequest'))
   assert.ok(plain.includes('Context'))
   assert.ok(plain.includes('source=process-tree'))
   assert.ok(plain.includes('State Stream'))
@@ -807,6 +870,9 @@ test('generic hook treats capitalized Kimi tools as permission requests', () => 
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.tool, 'Shell')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+    assert.strictEqual(session.pendingInteraction.source, 'hook')
+    assert.strictEqual(session.pendingInteraction.tool, 'Shell')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -829,6 +895,9 @@ test('generic hook treats mutating Copilot tools as permission requests', () => 
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+    assert.strictEqual(session.pendingInteraction.source, 'hook')
+    assert.strictEqual(session.pendingInteraction.tool, 'Bash')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -984,6 +1053,18 @@ test('session reducer applies attention and terminal events', () => {
   assert.strictEqual(session.needsAttention, 'waiting for approval')
   assert.deepStrictEqual(session.pendingToolUse.tool, 'Bash')
   assert.strictEqual(session.activeTool, 'Bash')
+  assert.deepStrictEqual(session.pendingInteraction, {
+    type: 'approval',
+    phase: 'waitingForApproval',
+    source: 'hook',
+    rawEventName: 'permission_request',
+    startedAt: 1000,
+    updatedAt: 1000,
+    reason: 'waiting for approval',
+    details: 'Bash: npm test',
+    tool: 'Bash',
+    confidence: 90
+  })
 
   applySessionEvent(session, {
     type: 'process_exit_detected',
@@ -997,6 +1078,7 @@ test('session reducer applies attention and terminal events', () => {
   assert.strictEqual(session.status, 'crashed')
   assert.strictEqual(session.endedAt, 2000)
   assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.pendingInteraction, null)
 })
 
 test('session reducer tracks active tool separately from pending approval state', () => {
@@ -1023,6 +1105,87 @@ test('session reducer tracks active tool separately from pending approval state'
   assert.strictEqual(session.activeTool, null)
 })
 
+test('session reducer classifies plan approval as pending interaction', () => {
+  const session = { sessionId: 's2-plan', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'hook',
+    timestamp: 1000,
+    attentionReason: 'waiting for plan approval',
+    pendingToolUse: { tool: 'ExitPlanMode', details: 'ExitPlanMode: proposed plan', timestamp: 1000 },
+    requestId: 'req-plan-1'
+  })
+
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.needsAttention, 'waiting for plan approval')
+  assert.strictEqual(session.pendingInteraction.type, 'plan')
+  assert.strictEqual(session.pendingInteraction.tool, 'ExitPlanMode')
+  assert.strictEqual(session.pendingInteraction.requestId, 'req-plan-1')
+  assert.strictEqual(session.pendingInteraction.startedAt, 1000)
+
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'hook',
+    timestamp: 1500,
+    attentionReason: 'waiting for plan approval',
+    pendingToolUse: { tool: 'ExitPlanMode', details: 'ExitPlanMode: proposed plan', timestamp: 1500 },
+    requestId: 'req-plan-1'
+  })
+
+  assert.strictEqual(session.pendingInteraction.startedAt, 1000)
+  assert.strictEqual(session.pendingInteraction.updatedAt, 1500)
+})
+
+test('session reducer keeps pending tool detail on low-fidelity wait refresh', () => {
+  const session = { sessionId: 's2-wait-refresh', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'hook',
+    timestamp: 1000,
+    attentionReason: 'waiting for approval',
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 },
+    requestId: 'req-approval-1'
+  })
+
+  const refreshed = applySessionEvent(session, {
+    type: 'pane_state',
+    source: 'pane',
+    timestamp: 1000 + PROTECTED_PHASE_MS + 1,
+    phase: 'waitingForApproval',
+    status: 'needsAttention',
+    attentionReason: 'waiting for approval',
+    details: 'needsAttention'
+  })
+
+  assert.strictEqual(refreshed.applied, true)
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+  assert.strictEqual(session.pendingInteraction.type, 'approval')
+  assert.strictEqual(session.pendingInteraction.source, 'pane')
+  assert.strictEqual(session.pendingInteraction.tool, 'Bash')
+  assert.strictEqual(session.pendingInteraction.details, 'Bash: npm test')
+  assert.strictEqual(session.pendingInteraction.requestId, 'req-approval-1')
+  assert.strictEqual(session.pendingInteraction.startedAt, 1000)
+  assert.strictEqual(session.pendingInteraction.updatedAt, 1000 + PROTECTED_PHASE_MS + 1)
+})
+
+test('session reducer keeps ordinary approval when command details mention plan', () => {
+  const session = { sessionId: 's2-terraform-plan', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'hook',
+    timestamp: 1000,
+    attentionReason: 'waiting for approval',
+    pendingToolUse: { tool: 'Bash', details: 'Bash: terraform plan', timestamp: 1000 }
+  })
+
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.needsAttention, 'waiting for approval')
+  assert.strictEqual(session.pendingInteraction.type, 'approval')
+  assert.strictEqual(session.pendingInteraction.tool, 'Bash')
+  assert.strictEqual(session.pendingInteraction.details, 'Bash: terraform plan')
+})
+
 test('session reducer clears stale tool state for answer-only pane waits', () => {
   const session = { sessionId: 's2-answer', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
@@ -1046,6 +1209,10 @@ test('session reducer clears stale tool state for answer-only pane waits', () =>
   assert.strictEqual(session.needsAttention, 'waiting for answer')
   assert.strictEqual(session.pendingToolUse, null)
   assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.pendingInteraction.type, 'question')
+  assert.strictEqual(session.pendingInteraction.source, 'pane')
+  assert.strictEqual(session.pendingInteraction.reason, 'waiting for answer')
+  assert.strictEqual(session.pendingInteraction.tool, undefined)
 })
 
 test('session reducer restores tool state for tool-backed answer waits', () => {
@@ -1069,6 +1236,9 @@ test('session reducer restores tool state for tool-backed answer waits', () => {
   assert.strictEqual(session.needsAttention, 'waiting for answer')
   assert.strictEqual(session.pendingToolUse.tool, 'AskUserQuestion')
   assert.strictEqual(session.activeTool, 'AskUserQuestion')
+  assert.strictEqual(session.pendingInteraction.type, 'question')
+  assert.strictEqual(session.pendingInteraction.tool, 'AskUserQuestion')
+  assert.strictEqual(session.pendingInteraction.details, 'AskUserQuestion: continue?')
 })
 
 test('session reducer does not reopen crashed sessions with late interrupted transcript events', () => {
@@ -1799,6 +1969,8 @@ test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => 
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for answer')
     assert.strictEqual(session.activeTool, 'AskUserQuestion')
+    assert.strictEqual(session.pendingInteraction.type, 'question')
+    assert.strictEqual(session.pendingInteraction.tool, 'AskUserQuestion')
     assert.strictEqual(session.lastEvent.type, 'question_asked')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -1830,6 +2002,8 @@ test('claude hook records PermissionRequest as approval wait', () => {
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.details, 'Bash: npm test')
     assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+    assert.strictEqual(session.pendingInteraction.details, 'Bash: npm test')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -1861,6 +2035,7 @@ test('claude hook clears approval wait on PostToolUseFailure', () => {
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
     assert.strictEqual(session.pendingToolUse, null)
     assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastToolError, 'exit code 1')
@@ -1917,6 +2092,8 @@ test('claude hook resets lifecycle on clear but preserves compact starts', () =>
     let session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.pendingInteraction.type, 'plan')
+    assert.strictEqual(session.pendingInteraction.tool, 'ExitPlanMode')
 
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'SessionStart',

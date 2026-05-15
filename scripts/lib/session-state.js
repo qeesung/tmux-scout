@@ -20,6 +20,17 @@ const EVIDENCE_DEDUPE_MS = 10000
 const TERMINAL_PHASES = new Set(['crashed', 'stale'])
 const NON_TERMINAL_END_PHASES = new Set(['completed', 'interrupted'])
 const ACTIVE_TOOL_PHASES = new Set(['running', 'waitingForApproval'])
+const PENDING_INTERACTION_PHASES = new Set(['waitingForApproval', 'waitingForAnswer'])
+const PLAN_APPROVAL_TOOLS = new Set(['exitplanmode', 'enterplanmode'])
+const GENERIC_WAIT_DETAILS = new Set([
+  'needsattention',
+  'needs attention',
+  'waiting',
+  'waitingforapproval',
+  'waiting for approval',
+  'waitingforanswer',
+  'waiting for answer'
+])
 
 function normalizeSource(source) {
   if (!source) return 'unknown'
@@ -65,6 +76,120 @@ function attentionForPhase(phase, reason) {
   if (phase === 'waitingForApproval') return reason || 'waiting for approval'
   if (phase === 'waitingForAnswer') return reason || 'waiting for answer'
   return null
+}
+
+function isGenericWaitDetail(value) {
+  const text = compactEvidenceText(value, 200)
+  return text ? GENERIC_WAIT_DETAILS.has(text.toLowerCase()) : false
+}
+
+function isPlanApprovalReason(value) {
+  const text = compactEvidenceText(value, 200)
+  if (!text) return false
+  const normalized = text.toLowerCase()
+  return normalized.includes('plan approval') ||
+    normalized.includes('plan confirmation') ||
+    normalized.includes('confirm plan') ||
+    normalized.includes('implement this plan')
+}
+
+function pendingInteractionType(phase, event, pendingTool) {
+  if (phase === 'waitingForAnswer') return 'question'
+  const tool = String(pendingTool.tool || event.activeTool || '').toLowerCase()
+  if (PLAN_APPROVAL_TOOLS.has(tool) ||
+    isPlanApprovalReason(event.attentionReason) ||
+    isPlanApprovalReason(event.needsAttention)) {
+    return 'plan'
+  }
+  return 'approval'
+}
+
+function requestIdForEvent(event) {
+  return event.requestId || event.toolCallId || event.toolUseId || event.turnId
+}
+
+function samePendingInteraction(previous, phase, type, requestId, tool, details) {
+  if (!previous || previous.phase !== phase || previous.type !== type) return false
+  if (previous.requestId || requestId) return previous.requestId === requestId
+  if (previous.tool || tool) return previous.tool === tool && previous.details === details
+  return previous.details === details
+}
+
+function sameWaitRefresh(session, phase, event) {
+  return PENDING_INTERACTION_PHASES.has(phase) &&
+    session.pendingInteraction &&
+    session.pendingInteraction.phase === phase &&
+    event.pendingToolUse === undefined &&
+    event.activeTool === undefined
+}
+
+function fallbackPendingTool(session, sameWait) {
+  if (!sameWait) return null
+  if (session.pendingToolUse && typeof session.pendingToolUse === 'object') return session.pendingToolUse
+  const previous = session.pendingInteraction
+  if (previous && (previous.tool || previous.details)) {
+    return { tool: previous.tool, details: previous.details }
+  }
+  return null
+}
+
+function pendingInteractionForPhase(session, phase, event, now) {
+  const sameWait = sameWaitRefresh(session, phase, event)
+  const previousInteraction = sameWait ? session.pendingInteraction : null
+  const pendingTool = event.pendingToolUse && typeof event.pendingToolUse === 'object'
+    ? event.pendingToolUse
+    : fallbackPendingTool(session, sameWait)
+  const type = pendingInteractionType(phase, event, pendingTool || {})
+  const tool = pendingTool && pendingTool.tool
+    ? String(pendingTool.tool)
+    : event.activeTool ? String(event.activeTool) : undefined
+  const rawReason = event.attentionReason || event.needsAttention
+  const reason = attentionForPhase(
+    phase,
+    rawReason && !isGenericWaitDetail(rawReason)
+      ? rawReason
+      : previousInteraction && previousInteraction.reason ? previousInteraction.reason : rawReason
+  )
+  const eventDetails = isGenericWaitDetail(event.details) ? undefined : event.details
+  const details = compactEvidenceText(
+    eventDetails ||
+      (pendingTool && pendingTool.details) ||
+      (previousInteraction && previousInteraction.details) ||
+      (!sameWait ? event.reason : undefined) ||
+      reason,
+    200
+  )
+  const requestId = requestIdForEvent(event) || (previousInteraction && previousInteraction.requestId)
+  const matchingPrevious = samePendingInteraction(session.pendingInteraction, phase, type, requestId, tool, details)
+    ? session.pendingInteraction
+    : null
+  const source = normalizeSource(event.source)
+  const priority = Number.isFinite(event.priority) ? event.priority : sourcePriority(source)
+  const interaction = {
+    type,
+    phase,
+    source,
+    stateSource: event.stateSource || session.stateSource,
+    rawEventName: event.rawEventName || event.type,
+    startedAt: matchingPrevious && Number.isFinite(matchingPrevious.startedAt) ? matchingPrevious.startedAt : now,
+    updatedAt: now,
+    reason,
+    details,
+    tool,
+    requestId,
+    turnId: event.turnId || (matchingPrevious && matchingPrevious.turnId),
+    transcriptPath: event.transcriptPath || session.transcriptPath,
+    tmuxPane: event.tmuxPane || session.tmuxPane,
+    pid: Number.isInteger(event.pid) ? event.pid : session.pid,
+    confidence: Number.isFinite(event.confidence) ? event.confidence : priority,
+    channelAlive: typeof event.channelAlive === 'boolean' ? event.channelAlive : undefined
+  }
+
+  const clean = {}
+  for (const [key, value] of Object.entries(interaction)) {
+    if (value !== undefined && value !== null && value !== '') clean[key] = value
+  }
+  return clean
 }
 
 function phaseForEvent(event) {
@@ -154,12 +279,16 @@ function setPhase(session, phase, event, now) {
 
   session.phase = phase
   session.status = status
-  session.needsAttention = attentionForPhase(phase, event.attentionReason)
+  session.needsAttention = attentionForPhase(phase, event.attentionReason || event.needsAttention)
 
   if (!ACTIVE_TOOL_PHASES.has(phase)) {
     session.pendingToolUse = null
     session.activeTool = null
   }
+
+  session.pendingInteraction = PENDING_INTERACTION_PHASES.has(phase)
+    ? pendingInteractionForPhase(session, phase, event, now)
+    : null
 
   if (event.type === AGENT_EVENTS.SESSION_END) {
     session.endedAt = event.endedAt || now

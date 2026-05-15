@@ -36,6 +36,33 @@ function baseUpdates(data, now) {
   return hookContext.baseUpdates(data, now)
 }
 
+function pendingResolutionType(pending) {
+  return pending && pending.type === 'question'
+    ? AGENT_EVENTS.QUESTION_ANSWERED
+    : AGENT_EVENTS.PERMISSION_RESOLVED
+}
+
+function resolvePendingInteraction(sessionId, data, now, details) {
+  const session = readSession(sessionId)
+  const pending = session && session.pendingInteraction
+  if (!pending) return
+  const eventType = pendingResolutionType(pending)
+  updateSession(sessionId, Object.assign({}, baseUpdates(data, now), {
+    status: 'working',
+    needsAttention: null,
+    pendingToolUse: null,
+    activeTool: null,
+    lastTurnId: data.turn_id,
+    lastEvent: {
+      type: eventType,
+      timestamp: now,
+      details: details || pending.details || pending.reason,
+      turnId: data.turn_id,
+      rawEventName: `${data.hook_event_name || 'hook'}:${eventType}`
+    }
+  }))
+}
+
 function extractSessionPrompt(inputMessages) {
   if (!inputMessages || !Array.isArray(inputMessages)) return undefined
   for (const msg of inputMessages) {
@@ -460,6 +487,7 @@ function handleModernHook(data) {
     }
 
     case 'UserPromptSubmit': {
+      resolvePendingInteraction(sessionId, data, now, 'user prompt submitted')
       const title = titleFromPrompt(data.prompt || data.prompt_preview)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
@@ -477,6 +505,7 @@ function handleModernHook(data) {
     case 'PreToolUse': {
       const toolName = data.tool_name || 'unknown'
       const details = getToolDetails(toolName, data.tool_input)
+      resolvePendingInteraction(sessionId, data, now, details)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
         needsAttention: null,
@@ -490,6 +519,7 @@ function handleModernHook(data) {
 
     case 'PermissionRequest': {
       if (isBypassPermission(data)) {
+        resolvePendingInteraction(sessionId, data, now, 'permission bypassed')
         updateSession(sessionId, Object.assign({}, base, {
           lastTurnId: data.turn_id,
           lastEvent: { type: AGENT_EVENTS.PERMISSION_BYPASSED, timestamp: now, turnId: data.turn_id }
@@ -511,6 +541,7 @@ function handleModernHook(data) {
 
     case 'PostToolUse': {
       const toolName = data.tool_name || 'unknown'
+      resolvePendingInteraction(sessionId, data, now, toolName)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
         needsAttention: null,
@@ -527,6 +558,7 @@ function handleModernHook(data) {
         ? data.last_assistant_message
         : ''
       const wantsAnswer = codexStopWantsAnswer(data, lastAssistantMessage)
+      if (!wantsAnswer) resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
       updateSession(sessionId, Object.assign({}, base, {
         status: wantsAnswer ? 'working' : 'completed',
         needsAttention: wantsAnswer ? 'waiting for answer' : null,

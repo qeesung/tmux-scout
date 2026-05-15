@@ -621,6 +621,8 @@ test('agent event aliases normalize to persisted event names', () => {
   assert.strictEqual(normalizeAgentEventType('sessionStarted'), AGENT_EVENTS.SESSION_START)
   assert.strictEqual(normalizeAgentEventType('toolUseStarted'), AGENT_EVENTS.TOOL_USE)
   assert.strictEqual(normalizeAgentEventType('subagentStarted'), AGENT_EVENTS.SUBAGENT_START)
+  assert.strictEqual(normalizeAgentEventType('permissionResolved'), AGENT_EVENTS.PERMISSION_RESOLVED)
+  assert.strictEqual(normalizeAgentEventType('questionAnswered'), AGENT_EVENTS.QUESTION_ANSWERED)
   assert.strictEqual(normalizeAgentEventType(AGENT_EVENTS.PERMISSION_REQUEST), AGENT_EVENTS.PERMISSION_REQUEST)
 })
 
@@ -1158,7 +1160,7 @@ test('session reducer applies attention and terminal events', () => {
   assert.strictEqual(session.status, 'working')
   assert.strictEqual(session.needsAttention, 'waiting for approval')
   assert.deepStrictEqual(session.pendingToolUse.tool, 'Bash')
-  assert.strictEqual(session.activeTool, 'Bash')
+  assert.strictEqual(session.activeTool, null)
   assert.deepStrictEqual(session.pendingInteraction, {
     type: 'approval',
     phase: 'waitingForApproval',
@@ -1193,7 +1195,8 @@ test('session reducer tracks active tool separately from pending approval state'
     type: 'tool_use',
     source: 'hook',
     timestamp: 1000,
-    pendingToolUse: { tool: 'Read', details: 'Read: package.json', timestamp: 1000 }
+    pendingToolUse: { tool: 'Read', details: 'Read: package.json', timestamp: 1000 },
+    activeTool: 'Read'
   })
 
   assert.strictEqual(currentPhase(session), 'running')
@@ -1207,6 +1210,71 @@ test('session reducer tracks active tool separately from pending approval state'
   })
 
   assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, null)
+})
+
+test('session reducer does not infer active tool from pending display fields', () => {
+  const session = { sessionId: 's2-no-infer', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 1000,
+    pendingToolUse: { tool: 'Read', details: 'Thinking about Read...', timestamp: 1000 }
+  })
+
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.pendingToolUse.tool, 'Read')
+  assert.strictEqual(session.activeTool, null)
+})
+
+test('session reducer clears waits with explicit pending lifecycle events', () => {
+  const session = { sessionId: 's2-resolved', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'hook',
+    timestamp: 1000,
+    attentionReason: 'waiting for approval',
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
+  })
+
+  applySessionEvent(session, {
+    type: 'permission_resolved',
+    source: 'hook',
+    timestamp: 1500,
+    activeTool: 'Bash',
+    details: 'approved'
+  })
+
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.needsAttention, null)
+  assert.strictEqual(session.pendingInteraction, null)
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, 'Bash')
+
+  applySessionEvent(session, {
+    type: 'question_asked',
+    source: 'hook',
+    timestamp: 2000,
+    attentionReason: 'waiting for answer',
+    pendingToolUse: { tool: 'AskUserQuestion', details: 'continue?', timestamp: 2000 },
+    activeTool: 'AskUserQuestion'
+  })
+
+  assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+  assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.pendingInteraction.type, 'question')
+
+  applySessionEvent(session, {
+    type: 'question_answered',
+    source: 'hook',
+    timestamp: 2500,
+    details: 'answered'
+  })
+
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.needsAttention, null)
+  assert.strictEqual(session.pendingInteraction, null)
   assert.strictEqual(session.pendingToolUse, null)
   assert.strictEqual(session.activeTool, null)
 })
@@ -1341,7 +1409,7 @@ test('session reducer restores tool state for tool-backed answer waits', () => {
   assert.strictEqual(currentPhase(session), 'waitingForAnswer')
   assert.strictEqual(session.needsAttention, 'waiting for answer')
   assert.strictEqual(session.pendingToolUse.tool, 'AskUserQuestion')
-  assert.strictEqual(session.activeTool, 'AskUserQuestion')
+  assert.strictEqual(session.activeTool, null)
   assert.strictEqual(session.pendingInteraction.type, 'question')
   assert.strictEqual(session.pendingInteraction.tool, 'AskUserQuestion')
   assert.strictEqual(session.pendingInteraction.details, 'AskUserQuestion: continue?')
@@ -2249,7 +2317,7 @@ test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => 
     assert.strictEqual(currentPhase(session), 'waitingForAnswer')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for answer')
-    assert.strictEqual(session.activeTool, 'AskUserQuestion')
+    assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.pendingInteraction.type, 'question')
     assert.strictEqual(session.pendingInteraction.tool, 'AskUserQuestion')
     assert.strictEqual(session.lastEvent.type, 'question_asked')
@@ -2282,7 +2350,7 @@ test('claude hook records PermissionRequest as approval wait', () => {
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.details, 'Bash: npm test')
-    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.pendingInteraction.type, 'approval')
     assert.strictEqual(session.pendingInteraction.details, 'Bash: npm test')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
@@ -2321,6 +2389,7 @@ test('claude hook clears approval wait on PostToolUseFailure', () => {
     assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastToolError, 'exit code 1')
     assert.strictEqual(session.lastEvent.type, 'post_tool_use_failure')
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === 'permission_resolved'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2524,6 +2593,35 @@ test('codex hook treats question-like Stop messages as waiting for answer', () =
     assert.strictEqual(session.needsAttention, 'waiting for answer')
     assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastEvent.type, 'question_asked')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook records question answered before next prompt clears wait', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-question-answered'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'help me choose'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: '请选择一个方案？\n1. A\n2. B'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'A'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, 'prompt_submit')
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === 'question_answered'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

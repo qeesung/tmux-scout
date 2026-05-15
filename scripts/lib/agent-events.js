@@ -87,6 +87,10 @@ function normalizeAgentEvent(event, defaults = {}) {
       base.hook_event_name
     ),
     turnId: firstDefined(input.turnId, input.turn_id, base.turnId, base.turn_id),
+    requestId: firstDefined(input.requestId, input.request_id, base.requestId, base.request_id),
+    toolCallId: firstDefined(input.toolCallId, input.tool_call_id, base.toolCallId, base.tool_call_id),
+    toolUseId: firstDefined(input.toolUseId, input.tool_use_id, base.toolUseId, base.tool_use_id),
+    channelAlive: firstDefined(input.channelAlive, input.channel_alive, base.channelAlive, base.channel_alive),
     transcriptPath: firstDefined(input.transcriptPath, input.transcript_path, base.transcriptPath, base.transcript_path),
     tmuxPane: firstDefined(input.tmuxPane, base.tmuxPane),
     pid: firstDefined(input.pid, base.pid)

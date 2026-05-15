@@ -12,6 +12,7 @@ const LIFECYCLE_FIELDS = new Set([
   'status',
   'phase',
   'needsAttention',
+  'pendingInteraction',
   'pendingToolUse',
   'activeTool',
   'endedAt',
@@ -99,7 +100,11 @@ function eventDefaultsFromUpdates(updates, config) {
     rawEventName: updates.lastHookEventName || updates.rawEventName,
     transcriptPath: updates.transcriptPath,
     tmuxPane: updates.tmuxPane,
-    pid: updates.pid
+    pid: updates.pid,
+    requestId: updates.requestId,
+    toolCallId: updates.toolCallId,
+    toolUseId: updates.toolUseId,
+    channelAlive: updates.channelAlive
   }
 }
 
@@ -129,6 +134,10 @@ function createLifecycleEvent(updates, config) {
     attentionReason: updates.needsAttention || null,
     pendingToolUse: updates.pendingToolUse,
     activeTool: updates.activeTool,
+    requestId: updates.requestId,
+    toolCallId: updates.toolCallId,
+    toolUseId: updates.toolUseId,
+    channelAlive: updates.channelAlive,
     endedAt: updates.endedAt,
     force: Boolean(lifecycleForce)
   }, defaults)
@@ -298,6 +307,9 @@ function createHookContext(config) {
       transcriptPath: payload.transcript_path,
       tmuxPane,
       pid,
+      requestId: payload.request_id || payload.requestId || payload.tool_call_id || payload.toolCallId || payload.tool_use_id || payload.toolUseId || payload.call_id || payload.permission_id || payload.question_id,
+      toolCallId: payload.tool_call_id || payload.toolCallId || payload.call_id,
+      toolUseId: payload.tool_use_id || payload.toolUseId,
       lastHookAt: now,
       lastHookEventName: payload.hook_event_name || payload.event_type || payload.type || null
     }, runtime)

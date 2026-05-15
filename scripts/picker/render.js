@@ -186,6 +186,10 @@ function cleanText(value, fallback) {
   return text || fallback || '?'
 }
 
+function cleanOptionalText(value) {
+  return String(value || '').replace(/[\r\n\t]+/g, ' ').trim()
+}
+
 function truncateText(value, width) {
   if (width <= 0) return ''
   const text = cleanText(value, '')
@@ -198,8 +202,17 @@ function formatField(value, width, color) {
   return `\x1b[${color}m${text}\x1b[0m${padding}`
 }
 
-function waitCode(reason) {
-  const text = String(reason || '').toLowerCase()
+function waitCode(session) {
+  const pending = session && typeof session === 'object' ? session.pendingInteraction : null
+  if (pending && pending.type === 'question') return 'ANS'
+  if (pending && pending.type === 'plan') return 'PLAN'
+  if (pending && pending.type === 'approval') return 'APP'
+  const text = String(
+    (pending && (pending.reason || pending.details)) ||
+    (session && session.needsAttention) ||
+    session ||
+    ''
+  ).toLowerCase()
   if (text.includes('answer') || text.includes('input') || text.includes('question')) return 'ANS'
   if (text.includes('plan')) return 'PLAN'
   if (text.includes('approval') || text.includes('permission') || text.includes('allow')) return 'APP'
@@ -207,7 +220,7 @@ function waitCode(reason) {
 }
 
 function statusTag(session, now) {
-  if (isNeedsAttention(session, now)) return formatField(`W:${waitCode(session.needsAttention)}`, STATUS_WIDTH, '31')
+  if (isNeedsAttention(session, now)) return formatField(`W:${waitCode(session)}`, STATUS_WIDTH, '31')
   if (session.status === 'working') return formatField('BUSY', STATUS_WIDTH, '33')
   if (session.status === 'interrupted') return formatField('INT', STATUS_WIDTH, '35')
   if (session.status === 'crashed') return formatField('CRASH', STATUS_WIDTH, '31')
@@ -218,11 +231,23 @@ function statusTag(session, now) {
 
 function attentionDetail(session) {
   if (!session.needsAttention) return ''
-  const reason = cleanText(session.needsAttention, 'waiting')
-  const tool = session.pendingToolUse && session.pendingToolUse.details
-    ? cleanText(session.pendingToolUse.details, '')
+  const pending = session.pendingInteraction || {}
+  const reason = cleanText(pending.reason || session.needsAttention, 'waiting')
+  const pendingDetails = cleanOptionalText(pending.details)
+  const pendingTool = cleanOptionalText(pending.tool)
+  let tool = ''
+  if (pendingDetails && pendingDetails.toLowerCase() !== reason.toLowerCase()) {
+    tool = pendingDetails
+  } else if (pendingTool && pendingTool.toLowerCase() !== reason.toLowerCase()) {
+    tool = pendingTool
+  } else if (!pendingDetails && !pendingTool && session.pendingToolUse && session.pendingToolUse.details) {
+    const toolDetails = cleanOptionalText(session.pendingToolUse.details)
+    if (toolDetails.toLowerCase() !== reason.toLowerCase()) tool = toolDetails
+  }
+  const source = pending.source && pending.source !== 'unknown'
+    ? ` · ${pending.source}`
     : ''
-  return tool ? `${reason}: ${tool}` : reason
+  return tool ? `${reason}: ${cleanText(tool, '')}${source}` : `${reason}${source}`
 }
 
 function subagentDetail(session) {

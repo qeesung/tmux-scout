@@ -124,6 +124,25 @@ function updatedLine(session, now) {
   return parts.join('  ')
 }
 
+function pendingInteractionDetail(pending) {
+  if (!pending) return ''
+  const head = [pending.type, pending.tool].filter(Boolean).join(' ')
+  return truncateText([head, pending.details].filter(Boolean).join('  '), 120)
+}
+
+function pendingInteractionEvidence(pending, now) {
+  if (!pending) return ''
+  const parts = []
+  if (pending.source) parts.push(`source=${pending.source}`)
+  if (pending.stateSource) parts.push(`state=${pending.stateSource}`)
+  if (pending.rawEventName) parts.push(`event=${pending.rawEventName}`)
+  const age = shortAge(now, pending.updatedAt)
+  if (age) parts.push(`updated=${age}`)
+  if (Number.isFinite(pending.confidence)) parts.push(`confidence=${pending.confidence}`)
+  if (pending.requestId) parts.push(`request=${pending.requestId}`)
+  return parts.join('  ')
+}
+
 function pushField(lines, label, value) {
   const text = cleanText(value)
   if (!text) return
@@ -151,6 +170,8 @@ function formatCurrent(session, now) {
   pushField(lines, 'phase', colorText(phase, phaseColor(phase)))
   pushField(lines, 'activity', colorText(truncateText(currentActivity(session), 120), COLOR.yellow))
   pushField(lines, 'request', colorText(session.needsAttention, COLOR.red))
+  pushField(lines, 'pending', colorText(pendingInteractionDetail(session.pendingInteraction), COLOR.red))
+  pushField(lines, 'evidence', pendingInteractionEvidence(session.pendingInteraction, now))
   pushField(lines, 'updated', updatedLine(session, now))
   return lines
 }

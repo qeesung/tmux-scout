@@ -140,6 +140,14 @@ W|B|D
 
 Where `W` = waiting for attention (red), `B` = busy/working (yellow), `D` = done/completed (green). An optional `I` = idle (blue) appears when idle sessions exist.
 
+When tmux mouse mode is enabled, clicking the tmux-scout status segment opens the same picker as `prefix + O`:
+
+```bash
+set -g mouse on
+```
+
+tmux-scout does not enable mouse mode for you. The clickable segment is subtly underlined by default. In the picker, single-click selects a row and double-click jumps to it.
+
 ## Configuration
 
 ### Keybinding
@@ -155,7 +163,24 @@ set -g @scout-status-format '{W}/{B}/{D}'         # custom separators
 set -g @scout-status-format '{W} wait {B} busy'   # with labels
 ```
 
-Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle.
+Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle, `{A}` approval waits, `{Q}` question/answer waits, `{P}` plan waits, `{T}` total active sessions.
+
+Status click behavior:
+
+```bash
+set -g @scout-status-click on      # default: clickable status segment
+set -g @scout-status-click off     # plain text status segment
+set -g @scout-status-click force   # override an existing MouseDown1Status binding
+```
+
+With the default `on`, tmux-scout only installs its click binding when `MouseDown1Status` is unset, still tmux's default, or already owned by tmux-scout.
+
+Optional mouse UI tuning:
+
+```bash
+set -g @scout-status-click-style underscore   # default clickable hint
+set -g @scout-status-click-style off          # disable the underline hint
+```
 
 ### Watchdog
 

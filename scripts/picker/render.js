@@ -370,7 +370,7 @@ function run(file, pane, cached) {
   }
 }
 
-module.exports = { run, getActiveSessions, formatLine, subagentDetail, evidenceDetail }
+module.exports = { run, getActiveSessions, formatLine, subagentDetail, evidenceDetail, waitCode }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

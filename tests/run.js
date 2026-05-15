@@ -21,6 +21,7 @@ const { startOptionalBridge, optionEnabled: watcherOptionEnabled } = require('..
 const { AGENT_EVENTS, normalizeAgentEventType, createAgentEvent } = require('../scripts/lib/agent-events')
 const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
+const statusBar = require('../scripts/status-bar')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
@@ -286,6 +287,19 @@ test('setup manager health normalizes partial hook states', () => {
   assert.strictEqual(codexReport.summary, '6/6 event hooks installed')
   assert.ok(codexReport.issues.includes('Missing config: [features].hooks = true'))
   assert.ok(codexReport.issues.includes('Missing trust state entries: 1'))
+})
+
+test('shell entrypoints pass bash syntax checks', () => {
+  for (const file of [
+    'tmux-scout.tmux',
+    'scripts/picker/picker.sh',
+    'scripts/status-widget.sh',
+    'scripts/setup.sh'
+  ]) {
+    execFileSync('bash', ['-n', path.join(__dirname, '..', file)], {
+      stdio: ['ignore', 'ignore', 'pipe']
+    })
+  }
 })
 
 test('Gemini and Copilot setup managers install guarded generic hooks', () => {
@@ -769,6 +783,77 @@ test('picker rows omit duplicated generic wait details', () => {
   assert.ok(line.includes('W:ANS'), line)
   assert.ok(line.includes('waiting for answer · pane'), line)
   assert.ok(!line.includes('waiting for answer: waiting for answer'), line)
+})
+
+test('status bar summarizes wait subtypes and active totals', () => {
+  const counts = statusBar.summarizeSessions([
+    {
+      needsAttention: 'waiting for approval',
+      pendingInteraction: { type: 'approval' }
+    },
+    {
+      needsAttention: 'waiting for answer',
+      pendingInteraction: { type: 'question' }
+    },
+    {
+      needsAttention: 'waiting for plan approval',
+      pendingInteraction: { type: 'plan' }
+    },
+    { status: 'working' },
+    { status: 'completed' },
+    { status: 'idle' },
+    { status: 'interrupted' }
+  ])
+
+  assert.deepStrictEqual(counts, {
+    wait: 3,
+    busy: 1,
+    done: 1,
+    idle: 1,
+    approval: 1,
+    question: 1,
+    plan: 1,
+    total: 7
+  })
+})
+
+test('status bar keeps compact default output clickable', () => {
+  const output = statusBar.renderStatusBar({
+    wait: 1,
+    busy: 2,
+    done: 3,
+    idle: 0,
+    approval: 1,
+    question: 0,
+    plan: 0,
+    total: 6
+  }, '', 'on')
+
+  assert.ok(output.startsWith('#[range=user|scout]'), output)
+  assert.ok(output.endsWith('#[norange]'), output)
+  assert.ok(output.includes('#[underscore]'), output)
+  assert.ok(output.includes('#[fg=#e06c75]1#[default]#[underscore]|#[fg=#e5c07b]2#[default]#[underscore]|#[fg=#98c379]3#[default]'), output)
+})
+
+test('status bar supports custom placeholders and click opt-out', () => {
+  const output = statusBar.renderStatusBar({
+    wait: 6,
+    busy: 5,
+    done: 4,
+    idle: 3,
+    approval: 2,
+    question: 1,
+    plan: 3,
+    total: 18
+  }, '{A}/{Q}/{P}/{T}/{I}', 'off')
+
+  assert.strictEqual(output, '2/1/3/18/3')
+})
+
+test('status bar omits empty output', () => {
+  const counts = statusBar.summarizeSessions([])
+  assert.strictEqual(statusBar.renderStatusBar(counts, '', 'on'), '')
+  assert.strictEqual(statusBar.renderStatusBar(counts, '{T}', 'on'), '')
 })
 
 test('session details render as an information panel', () => {

@@ -140,6 +140,14 @@ W|B|D
 
 其中 `W` = 等待关注（红色），`B` = 工作中（黄色），`D` = 已完成（绿色）。当存在空闲会话时会额外显示 `I` = 空闲（蓝色）。
 
+启用 tmux 鼠标模式后，点击 tmux-scout 状态栏片段会打开和 `prefix + O` 相同的 picker：
+
+```bash
+set -g mouse on
+```
+
+tmux-scout 不会主动替你开启鼠标模式。可点击片段默认会有轻量下划线提示。picker 里单击选择行，双击跳转。
+
 ## 配置选项
 
 ### 快捷键
@@ -155,7 +163,24 @@ set -g @scout-status-format '{W}/{B}/{D}'         # 自定义分隔符
 set -g @scout-status-format '{W} wait {B} busy'   # 带标签
 ```
 
-占位符：`{W}` 等待，`{B}` 工作中，`{D}` 已完成，`{I}` 空闲。
+占位符：`{W}` 等待，`{B}` 工作中，`{D}` 已完成，`{I}` 空闲，`{A}` 审批等待，`{Q}` 问题/回答等待，`{P}` 计划确认等待，`{T}` 活跃会话总数。
+
+状态栏点击行为：
+
+```bash
+set -g @scout-status-click on      # 默认：状态栏片段可点击
+set -g @scout-status-click off     # 纯文本状态栏片段
+set -g @scout-status-click force   # 覆盖已有 MouseDown1Status 绑定
+```
+
+默认 `on` 时，只有在 `MouseDown1Status` 未设置、仍是 tmux 默认绑定，或已经由 tmux-scout 管理时，tmux-scout 才会安装点击绑定。
+
+可选鼠标 UI 调整：
+
+```bash
+set -g @scout-status-click-style underscore   # 默认：可点击下划线提示
+set -g @scout-status-click-style off          # 关闭下划线提示
+```
 
 ### Watchdog
 

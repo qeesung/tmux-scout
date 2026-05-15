@@ -121,6 +121,9 @@ function loadState() {
   const state = readJson(STATE_FILE, { version: 1 })
   if (!state || typeof state !== 'object') return { version: 1 }
   if (state.codexFiles) delete state.codexFiles
+  if (!state.codexTranscripts || typeof state.codexTranscripts !== 'object' || Array.isArray(state.codexTranscripts)) {
+    state.codexTranscripts = {}
+  }
   return state
 }
 
@@ -197,7 +200,12 @@ function bridgeStatus(running) {
 
 function runTick(state, forceFull = false, transcriptWatchManager = null) {
   const startedAt = Date.now()
-  const result = sync.run(STATUS_FILE)
+  if (!state.codexTranscripts || typeof state.codexTranscripts !== 'object' || Array.isArray(state.codexTranscripts)) {
+    state.codexTranscripts = {}
+  }
+  const result = sync.run(STATUS_FILE, {
+    codexTranscriptState: state.codexTranscripts
+  })
   state.lastMode = forceFull ? 'reconcile:forced' : 'reconcile'
 
   const finishedAt = Date.now()

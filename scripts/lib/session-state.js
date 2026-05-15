@@ -19,8 +19,26 @@ const MAX_STATE_EVIDENCE = 20
 const EVIDENCE_DEDUPE_MS = 10000
 const TERMINAL_PHASES = new Set(['crashed', 'stale'])
 const NON_TERMINAL_END_PHASES = new Set(['completed', 'interrupted'])
-const ACTIVE_TOOL_PHASES = new Set(['running', 'waitingForApproval'])
+const ACTIVE_TOOL_PHASES = new Set(['running'])
 const PENDING_INTERACTION_PHASES = new Set(['waitingForApproval', 'waitingForAnswer'])
+const PENDING_RESOLUTION_EVENTS = new Set([
+  AGENT_EVENTS.PERMISSION_RESOLVED,
+  AGENT_EVENTS.QUESTION_ANSWERED
+])
+const TOOL_CLEAR_EVENTS = new Set([
+  AGENT_EVENTS.SESSION_START,
+  AGENT_EVENTS.PROMPT_SUBMIT,
+  AGENT_EVENTS.POST_TOOL_USE,
+  AGENT_EVENTS.POST_TOOL_USE_FAILURE,
+  AGENT_EVENTS.PERMISSION_BYPASSED,
+  AGENT_EVENTS.STOP,
+  AGENT_EVENTS.STOP_FAILURE,
+  AGENT_EVENTS.TURN_COMPLETE,
+  AGENT_EVENTS.SESSION_END,
+  AGENT_EVENTS.INTERRUPTED,
+  AGENT_EVENTS.PROCESS_EXIT_DETECTED,
+  AGENT_EVENTS.STALE
+])
 const PLAN_APPROVAL_TOOLS = new Set(['exitplanmode', 'enterplanmode'])
 const GENERIC_WAIT_DETAILS = new Set([
   'needsattention',
@@ -200,6 +218,8 @@ function phaseForEvent(event) {
     case AGENT_EVENTS.POST_TOOL_USE: return 'running'
     case AGENT_EVENTS.POST_TOOL_USE_FAILURE: return 'running'
     case AGENT_EVENTS.PERMISSION_BYPASSED: return 'running'
+    case AGENT_EVENTS.PERMISSION_RESOLVED: return 'running'
+    case AGENT_EVENTS.QUESTION_ANSWERED: return 'running'
     case AGENT_EVENTS.PERMISSION_REQUEST: return 'waitingForApproval'
     case AGENT_EVENTS.QUESTION_ASKED: return 'waitingForAnswer'
     case AGENT_EVENTS.STOP: return 'completed'
@@ -282,8 +302,12 @@ function setPhase(session, phase, event, now) {
   session.needsAttention = attentionForPhase(phase, event.attentionReason || event.needsAttention)
 
   if (!ACTIVE_TOOL_PHASES.has(phase)) {
-    session.pendingToolUse = null
     session.activeTool = null
+  }
+  if (!PENDING_INTERACTION_PHASES.has(phase)) {
+    session.pendingToolUse = null
+  } else if (event.pendingToolUse === undefined && !sameWaitRefresh(session, phase, event)) {
+    session.pendingToolUse = null
   }
 
   session.pendingInteraction = PENDING_INTERACTION_PHASES.has(phase)
@@ -317,14 +341,29 @@ function compactEvidenceText(value, max = 160) {
   return text.length > max ? text.slice(0, max - 1) + '~' : text
 }
 
+function eventClearsPendingToolUse(event) {
+  return event.pendingToolUse === null ||
+    PENDING_RESOLUTION_EVENTS.has(event.type) ||
+    TOOL_CLEAR_EVENTS.has(event.type)
+}
+
+function eventClearsActiveTool(event) {
+  return event.activeTool === null ||
+    event.pendingToolUse === null ||
+    TOOL_CLEAR_EVENTS.has(event.type) ||
+    event.type === AGENT_EVENTS.QUESTION_ASKED ||
+    event.type === AGENT_EVENTS.PERMISSION_REQUEST
+}
+
+function activeToolAllowedForPhase(phase) {
+  return ACTIVE_TOOL_PHASES.has(phase)
+}
+
 function evidenceForEvent(session, event, nextPhase, previousPhase, applied, blockedReason, now) {
-  const pendingTool = event.pendingToolUse && event.pendingToolUse.tool
-    ? event.pendingToolUse.tool
-    : undefined
-  const explicitToolCleared = event.pendingToolUse === null || event.activeTool === null
-  const activeTool = event.activeTool !== undefined
+  const phase = nextPhase || event.phase || previousPhase
+  const activeTool = event.activeTool !== undefined && event.activeTool !== null && activeToolAllowedForPhase(phase)
     ? event.activeTool
-    : explicitToolCleared ? undefined : pendingTool || session.activeTool || undefined
+    : eventClearsActiveTool(event) ? undefined : session.activeTool || undefined
   return {
     type: event.type,
     source: normalizeSource(event.source),
@@ -410,14 +449,20 @@ function applySessionEvent(session, event) {
   )
 
   if (applied || !nextPhase) {
-    if (event.pendingToolUse !== undefined) session.pendingToolUse = event.pendingToolUse
+    const phase = currentPhase(session)
+    if (event.pendingToolUse !== undefined) {
+      session.pendingToolUse = event.pendingToolUse
+    } else if (eventClearsPendingToolUse(event)) {
+      session.pendingToolUse = null
+    }
     if (event.activeTool !== undefined) {
-      session.activeTool = event.activeTool
-    } else if (event.pendingToolUse && event.pendingToolUse.tool) {
-      session.activeTool = event.pendingToolUse.tool
-    } else if (event.pendingToolUse === null) {
+      if (event.activeTool === null || activeToolAllowedForPhase(phase)) {
+        session.activeTool = event.activeTool
+      }
+    } else if (eventClearsActiveTool(event)) {
       session.activeTool = null
     }
+    if (session.activeTool === undefined) session.activeTool = null
     session.lastEvent = {
       type: event.type,
       timestamp: now,

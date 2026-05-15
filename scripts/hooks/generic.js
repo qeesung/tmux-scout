@@ -35,6 +35,31 @@ function baseUpdates(data, now) {
   return hookContext.baseUpdates(data, now)
 }
 
+function pendingResolutionType(pending) {
+  return pending && pending.type === 'question'
+    ? AGENT_EVENTS.QUESTION_ANSWERED
+    : AGENT_EVENTS.PERMISSION_RESOLVED
+}
+
+function resolvePendingInteraction(sessionId, data, now, details) {
+  const session = hookContext.readSession(sessionId)
+  const pending = session && session.pendingInteraction
+  if (!pending) return
+  const eventType = pendingResolutionType(pending)
+  updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
+    status: 'working',
+    needsAttention: null,
+    pendingToolUse: null,
+    activeTool: null,
+    lastEvent: {
+      type: eventType,
+      timestamp: now,
+      details: details || pending.details || pending.reason,
+      rawEventName: `${getEventName(data) || 'hook'}:${eventType}`
+    }
+  })))
+}
+
 function basename(value) {
   return value ? path.basename(String(value)) : ''
 }
@@ -159,6 +184,7 @@ function sessionStart(data, sessionId, now, title) {
 }
 
 function promptSubmit(data, sessionId, now, prompt) {
+  resolvePendingInteraction(sessionId, data, now, 'user prompt submitted')
   const title = titleFromPrompt(prompt, data.session_title || basename(data.cwd) || `${agentType} session`)
   updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
     status: 'working',
@@ -174,6 +200,7 @@ function toolUse(data, sessionId, now) {
   const toolName = getToolName(data)
   const toolInput = getToolInput(data)
   const details = getToolDetails(toolName, toolInput)
+  resolvePendingInteraction(sessionId, data, now, details)
   updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
     status: 'working',
     needsAttention: null,
@@ -214,6 +241,7 @@ function postToolUse(data, sessionId, now, failure) {
   const details = failure && rawError
     ? `${getToolDetails(toolName, getToolInput(data))} failed: ${String(rawError).slice(0, 80)}`
     : toolName
+  resolvePendingInteraction(sessionId, data, now, details)
   updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
     status: 'working',
     needsAttention: null,
@@ -229,6 +257,7 @@ function stop(data, sessionId, now, failure) {
     data.prompt_response ||
     data.assistant_message ||
     latestAssistantFromCopilotTranscript(data.transcriptPath || data.transcript_path)
+  resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
   updateSession(sessionId, Object.assign(baseUpdates(data, now), {
     status: 'completed',
     needsAttention: null,
@@ -246,6 +275,7 @@ function stop(data, sessionId, now, failure) {
 }
 
 function sessionEnd(data, sessionId, now) {
+  resolvePendingInteraction(sessionId, data, now, data.reason || getEventName(data))
   updateSession(sessionId, Object.assign(baseUpdates(data, now), {
     status: 'completed',
     needsAttention: null,

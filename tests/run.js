@@ -19,6 +19,15 @@ const { startBridgeServer } = require('../scripts/lib/bridge-server')
 const { markInterrupted: markClaudeInterrupted, ClaudeTranscriptWatchManager } = require('../scripts/lib/claude-transcript-watcher')
 const { startOptionalBridge, optionEnabled: watcherOptionEnabled } = require('../scripts/watcher')
 const { AGENT_EVENTS, normalizeAgentEventType, createAgentEvent } = require('../scripts/lib/agent-events')
+const {
+  SESSION_CONTRACT_VERSION,
+  SESSION_PHASES,
+  phaseFromLegacyStatus,
+  phaseForAgentEvent,
+  statusForPhase,
+  validateAgentEvent,
+  validateSessionSnapshot
+} = require('../scripts/lib/session-contract')
 const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
@@ -402,6 +411,164 @@ test('Copilot setup surfaces invalid existing settings instead of overwriting', 
   }
 })
 
+test('session reducer stamps the state contract and current turn lifecycle', () => {
+  const session = { sessionId: 'turn-contract', agentType: 'codex', startedAt: 500 }
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'hook',
+    timestamp: 1000,
+    details: 'run tests',
+    turnId: 'turn-1'
+  })
+  assert.strictEqual(session.stateContractVersion, SESSION_CONTRACT_VERSION)
+  assert.strictEqual(currentPhase(session), SESSION_PHASES.RUNNING)
+  assert.strictEqual(session.currentTurnId, 'turn-1')
+  assert.strictEqual(session.lastTurnId, 'turn-1')
+  assert.strictEqual(session.turnStartedAt, 1000)
+  assert.strictEqual(session.turnEndedAt, null)
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.TOOL_USE,
+    source: 'hook',
+    timestamp: 1200,
+    activeTool: 'Read',
+    details: 'Read package.json',
+    turnId: 'turn-1'
+  })
+  assert.strictEqual(session.currentTurnId, 'turn-1')
+  assert.strictEqual(session.turnStartedAt, 1000)
+  assert.strictEqual(session.activeTool, 'Read')
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.STOP,
+    source: 'hook',
+    timestamp: 2000,
+    turnId: 'turn-1'
+  })
+  assert.strictEqual(currentPhase(session), SESSION_PHASES.COMPLETED)
+  assert.strictEqual(session.currentTurnId, 'turn-1')
+  assert.strictEqual(session.lastTurnId, 'turn-1')
+  assert.strictEqual(session.turnStartedAt, 1000)
+  assert.strictEqual(session.turnEndedAt, 2000)
+  assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.pendingInteraction, null)
+
+  const validation = validateSessionSnapshot(session)
+  assert.strictEqual(validation.valid, true)
+  assert.deepStrictEqual(validation.errors, [])
+  assert.deepStrictEqual(validation.warnings, [])
+})
+
+test('session reducer ends turn lifecycle when hooks omit turn ids', () => {
+  for (const type of [AGENT_EVENTS.STOP, AGENT_EVENTS.SESSION_END]) {
+    const session = { sessionId: `turn-no-id-${type}`, agentType: 'claude', startedAt: 500 }
+
+    applySessionEvent(session, {
+      type: AGENT_EVENTS.PROMPT_SUBMIT,
+      source: 'hook',
+      timestamp: 1000,
+      details: 'run tests'
+    })
+    assert.strictEqual(currentPhase(session), SESSION_PHASES.RUNNING)
+    assert.strictEqual(session.currentTurnId, null)
+    assert.strictEqual(session.turnStartedAt, 1000)
+    assert.strictEqual(session.turnEndedAt, null)
+
+    applySessionEvent(session, {
+      type,
+      source: 'hook',
+      timestamp: 2000
+    })
+    assert.strictEqual(currentPhase(session), SESSION_PHASES.COMPLETED)
+    assert.strictEqual(session.currentTurnId, null)
+    assert.strictEqual(session.turnStartedAt, 1000)
+    assert.strictEqual(session.turnEndedAt, 2000)
+  }
+})
+
+test('session reducer keeps a full interaction flow inside the session contract', () => {
+  const session = { sessionId: 'contract-flow', agentType: 'codex', startedAt: 1000 }
+  const events = [
+    {
+      type: AGENT_EVENTS.PROMPT_SUBMIT,
+      source: 'hook',
+      timestamp: 1000,
+      details: 'deploy',
+      turnId: 'turn-flow'
+    },
+    {
+      type: AGENT_EVENTS.TOOL_USE,
+      source: 'hook',
+      timestamp: 1100,
+      details: 'Bash: npm test',
+      activeTool: 'Bash',
+      pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1100 },
+      turnId: 'turn-flow'
+    },
+    {
+      type: AGENT_EVENTS.PERMISSION_REQUEST,
+      source: 'hook',
+      timestamp: 1200,
+      attentionReason: 'waiting for approval',
+      details: 'Bash: npm test',
+      activeTool: 'Bash',
+      pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1200 },
+      requestId: 'permission-1',
+      turnId: 'turn-flow'
+    },
+    {
+      type: AGENT_EVENTS.PERMISSION_RESOLVED,
+      source: 'hook',
+      timestamp: 1300,
+      activeTool: 'Bash',
+      turnId: 'turn-flow'
+    },
+    {
+      type: AGENT_EVENTS.QUESTION_ASKED,
+      source: 'hook',
+      timestamp: 1400,
+      attentionReason: 'waiting for answer',
+      details: 'AskUserQuestion: continue?',
+      activeTool: 'AskUserQuestion',
+      pendingToolUse: { tool: 'AskUserQuestion', details: 'AskUserQuestion: continue?', timestamp: 1400 },
+      requestId: 'question-1',
+      turnId: 'turn-flow'
+    },
+    {
+      type: AGENT_EVENTS.QUESTION_ANSWERED,
+      source: 'hook',
+      timestamp: 1500,
+      turnId: 'turn-flow'
+    },
+    {
+      type: AGENT_EVENTS.STOP,
+      source: 'hook',
+      timestamp: 1600,
+      turnId: 'turn-flow'
+    }
+  ]
+
+  for (const event of events) {
+    const result = applySessionEvent(session, event)
+    assert.strictEqual(result.applied, true)
+    const validation = validateSessionSnapshot(session)
+    assert.strictEqual(validation.valid, true, validation.errors.join('; '))
+    assert.deepStrictEqual(validation.errors, [])
+    assert.deepStrictEqual(validation.warnings, [])
+  }
+
+  assert.strictEqual(currentPhase(session), SESSION_PHASES.COMPLETED)
+  assert.strictEqual(session.currentTurnId, 'turn-flow')
+  assert.strictEqual(session.turnStartedAt, 1000)
+  assert.strictEqual(session.turnEndedAt, 1600)
+  assert.strictEqual(session.pendingInteraction, null)
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, null)
+  assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_REQUEST))
+  assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.QUESTION_ASKED))
+})
+
 test('Kimi setup manager appends and removes managed TOML hook blocks', () => {
   const dir = tempDir()
   try {
@@ -642,6 +809,80 @@ test('agent events normalize source metadata for reducer evidence', () => {
   assert.strictEqual(event.turnId, 'turn-1')
   assert.strictEqual(event.transcriptPath, '/tmp/codex.jsonl')
   assert.strictEqual(event.timestamp, new Date('2026-01-01T00:00:00.000Z').getTime())
+})
+
+test('session contract maps events to canonical phases', () => {
+  assert.strictEqual(statusForPhase(SESSION_PHASES.WAITING_FOR_APPROVAL), 'working')
+  assert.strictEqual(phaseFromLegacyStatus('crashed', 'waiting for approval'), SESSION_PHASES.CRASHED)
+  assert.strictEqual(phaseFromLegacyStatus('stale', 'waiting for answer'), SESSION_PHASES.STALE)
+  assert.strictEqual(phaseFromLegacyStatus('interrupted', 'waiting for approval'), SESSION_PHASES.INTERRUPTED)
+  assert.strictEqual(phaseForAgentEvent({ type: 'permissionRequested' }), SESSION_PHASES.WAITING_FOR_APPROVAL)
+  assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.QUESTION_ASKED }), SESSION_PHASES.WAITING_FOR_ANSWER)
+  assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.PANE_STATE, status: 'working' }), SESSION_PHASES.RUNNING)
+  assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.PANE_STATE, status: 'crashed', needsAttention: 'waiting for approval' }), SESSION_PHASES.CRASHED)
+  assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.TRANSCRIPT_STATUS, needsAttention: 'waiting for answer' }), SESSION_PHASES.WAITING_FOR_ANSWER)
+
+  const valid = validateAgentEvent(createAgentEvent('toolUseStarted', {
+    source: 'hook',
+    timestamp: 1000,
+    activeTool: 'Read',
+    turnId: 'turn-1'
+  }))
+  assert.strictEqual(valid.valid, true)
+  assert.deepStrictEqual(valid.errors, [])
+
+  const invalid = validateAgentEvent({
+    type: AGENT_EVENTS.TOOL_USE,
+    timestamp: { bad: true },
+    phase: 'busy'
+  })
+  assert.strictEqual(invalid.valid, false)
+  assert.ok(invalid.errors.includes('event.timestamp must be a number, ISO string, or omitted'))
+  assert.ok(invalid.errors.includes('event.phase busy is not canonical'))
+})
+
+test('session contract validates factual state invariants', () => {
+  const waiting = validateSessionSnapshot({
+    sessionId: 'contract-wait',
+    agentType: 'codex',
+    phase: SESSION_PHASES.WAITING_FOR_APPROVAL,
+    status: 'working',
+    needsAttention: 'waiting for approval',
+    activeTool: null,
+    pendingInteraction: {
+      type: 'approval',
+      phase: SESSION_PHASES.WAITING_FOR_APPROVAL,
+      source: 'hook'
+    }
+  })
+  assert.strictEqual(waiting.valid, true)
+  assert.deepStrictEqual(waiting.errors, [])
+  assert.deepStrictEqual(waiting.warnings, [])
+
+  const noisy = validateSessionSnapshot({
+    sessionId: 'contract-noisy',
+    agentType: 'codex',
+    phase: SESSION_PHASES.IDLE,
+    status: 'working',
+    needsAttention: 'waiting for answer',
+    activeTool: 'Bash',
+    pendingInteraction: {
+      type: 'question',
+      phase: SESSION_PHASES.WAITING_FOR_ANSWER
+    },
+    stateEvidence: {}
+  })
+  assert.strictEqual(noisy.valid, true)
+  assert.ok(noisy.warnings.some(warning => warning.includes('status working does not match phase idle')))
+  assert.ok(noisy.warnings.some(warning => warning.includes('needsAttention is set while phase is idle')))
+  assert.ok(noisy.warnings.some(warning => warning.includes('activeTool is set while phase is idle')))
+  assert.ok(noisy.warnings.some(warning => warning.includes('pendingInteraction is set while phase is idle')))
+  assert.ok(noisy.warnings.some(warning => warning.includes('stateEvidence should be an array')))
+
+  const invalid = validateSessionSnapshot({ agentType: 'codex', phase: 'busy' })
+  assert.strictEqual(invalid.valid, false)
+  assert.ok(invalid.errors.includes('session.sessionId is required'))
+  assert.ok(invalid.errors.includes('session.phase is required and must be canonical'))
 })
 
 test('codex hook enriches sessions with compact session meta fields', () => {
@@ -1441,6 +1682,33 @@ test('session reducer does not reopen crashed sessions with late interrupted tra
   assert.strictEqual(currentPhase(session), 'crashed')
   assert.strictEqual(session.status, 'crashed')
   assert.strictEqual(session.endedAt, 2000)
+})
+
+test('session reducer preserves terminal legacy status despite stale attention', () => {
+  for (const status of ['crashed', 'stale']) {
+    const session = {
+      sessionId: `legacy-${status}`,
+      agentType: 'codex',
+      startedAt: 1000,
+      status,
+      needsAttention: 'waiting for approval',
+      stateSource: 'pid',
+      lastUpdated: 1000
+    }
+
+    const result = applySessionEvent(session, {
+      type: 'pane_state',
+      source: 'pane',
+      timestamp: 1000 + PROTECTED_PHASE_MS + 1,
+      phase: 'running',
+      status: 'working'
+    })
+
+    assert.strictEqual(result.applied, false)
+    assert.strictEqual(currentPhase(session), status)
+    assert.strictEqual(session.status, status)
+    assert.strictEqual(session.needsAttention, 'waiting for approval')
+  }
 })
 
 test('claude setup registers monitored official hook events', () => {

@@ -1,6 +1,17 @@
 // Central session state reducer for tmux-scout.
 
 const { AGENT_EVENTS, normalizeAgentEvent } = require('./agent-events')
+const {
+  SESSION_CONTRACT_VERSION,
+  TERMINAL_SESSION_PHASES,
+  NON_TERMINAL_END_PHASES,
+  ACTIVE_TOOL_PHASES,
+  PENDING_INTERACTION_PHASES,
+  phaseFromLegacyStatus,
+  phaseForAgentEvent,
+  statusForPhase,
+  attentionForPhase
+} = require('./session-contract')
 
 const SOURCE_PRIORITY = {
   hook: 90,
@@ -17,13 +28,22 @@ const SOURCE_PRIORITY = {
 const PROTECTED_PHASE_MS = 120000
 const MAX_STATE_EVIDENCE = 20
 const EVIDENCE_DEDUPE_MS = 10000
-const TERMINAL_PHASES = new Set(['crashed', 'stale'])
-const NON_TERMINAL_END_PHASES = new Set(['completed', 'interrupted'])
-const ACTIVE_TOOL_PHASES = new Set(['running'])
-const PENDING_INTERACTION_PHASES = new Set(['waitingForApproval', 'waitingForAnswer'])
+const TERMINAL_PHASES = TERMINAL_SESSION_PHASES
 const PENDING_RESOLUTION_EVENTS = new Set([
   AGENT_EVENTS.PERMISSION_RESOLVED,
   AGENT_EVENTS.QUESTION_ANSWERED
+])
+const TURN_START_EVENTS = new Set([
+  AGENT_EVENTS.PROMPT_SUBMIT
+])
+const TURN_END_EVENTS = new Set([
+  AGENT_EVENTS.STOP,
+  AGENT_EVENTS.STOP_FAILURE,
+  AGENT_EVENTS.TURN_COMPLETE,
+  AGENT_EVENTS.SESSION_END,
+  AGENT_EVENTS.INTERRUPTED,
+  AGENT_EVENTS.PROCESS_EXIT_DETECTED,
+  AGENT_EVENTS.STALE
 ])
 const TOOL_CLEAR_EVENTS = new Set([
   AGENT_EVENTS.SESSION_START,
@@ -65,35 +85,7 @@ function sourcePriority(source) {
 function currentPhase(session) {
   if (session.phase) return session.phase
   if (session.lifecycle && session.lifecycle.phase) return session.lifecycle.phase
-  if (session.status === 'crashed') return 'crashed'
-  if (session.status === 'stale') return 'stale'
-  if (session.status === 'interrupted') return 'interrupted'
-  if (session.needsAttention === 'waiting for answer') return 'waitingForAnswer'
-  if (session.needsAttention) return 'waitingForApproval'
-  if (session.status === 'working') return 'running'
-  if (session.status === 'completed') return 'completed'
-  if (session.status === 'idle') return 'idle'
-  return 'idle'
-}
-
-function legacyStatusForPhase(phase) {
-  switch (phase) {
-    case 'idle': return 'idle'
-    case 'running': return 'working'
-    case 'waitingForApproval': return 'working'
-    case 'waitingForAnswer': return 'working'
-    case 'completed': return 'completed'
-    case 'interrupted': return 'interrupted'
-    case 'crashed': return 'crashed'
-    case 'stale': return 'stale'
-    default: return 'working'
-  }
-}
-
-function attentionForPhase(phase, reason) {
-  if (phase === 'waitingForApproval') return reason || 'waiting for approval'
-  if (phase === 'waitingForAnswer') return reason || 'waiting for answer'
-  return null
+  return phaseFromLegacyStatus(session.status, session.needsAttention) || 'idle'
 }
 
 function isGenericWaitDetail(value) {
@@ -211,42 +203,7 @@ function pendingInteractionForPhase(session, phase, event, now) {
 }
 
 function phaseForEvent(event) {
-  switch (event.type) {
-    case AGENT_EVENTS.SESSION_START: return 'idle'
-    case AGENT_EVENTS.PROMPT_SUBMIT: return 'running'
-    case AGENT_EVENTS.TOOL_USE: return 'running'
-    case AGENT_EVENTS.POST_TOOL_USE: return 'running'
-    case AGENT_EVENTS.POST_TOOL_USE_FAILURE: return 'running'
-    case AGENT_EVENTS.PERMISSION_BYPASSED: return 'running'
-    case AGENT_EVENTS.PERMISSION_RESOLVED: return 'running'
-    case AGENT_EVENTS.QUESTION_ANSWERED: return 'running'
-    case AGENT_EVENTS.PERMISSION_REQUEST: return 'waitingForApproval'
-    case AGENT_EVENTS.QUESTION_ASKED: return 'waitingForAnswer'
-    case AGENT_EVENTS.STOP: return 'completed'
-    case AGENT_EVENTS.STOP_FAILURE: return 'completed'
-    case AGENT_EVENTS.TURN_COMPLETE: return 'completed'
-    case AGENT_EVENTS.SESSION_END: return 'completed'
-    case AGENT_EVENTS.INTERRUPTED: return 'interrupted'
-    case AGENT_EVENTS.PROCESS_EXIT_DETECTED: return 'crashed'
-    case AGENT_EVENTS.STALE: return 'stale'
-    case AGENT_EVENTS.PANE_STATE:
-    case AGENT_EVENTS.TRANSCRIPT_STATUS:
-      return event.phase || event.statusPhase || currentPhaseFromStatus(event.status, event.needsAttention)
-    default:
-      return event.phase
-  }
-}
-
-function currentPhaseFromStatus(status, needsAttention) {
-  if (needsAttention === 'waiting for answer') return 'waitingForAnswer'
-  if (needsAttention) return 'waitingForApproval'
-  if (status === 'working') return 'running'
-  if (status === 'completed') return 'completed'
-  if (status === 'interrupted') return 'interrupted'
-  if (status === 'crashed') return 'crashed'
-  if (status === 'stale') return 'stale'
-  if (status === 'idle') return 'idle'
-  return null
+  return phaseForAgentEvent(event)
 }
 
 function phaseDecision(session, event, nextPhase, now) {
@@ -292,14 +249,49 @@ function shouldApplyPhase(session, event, nextPhase, now) {
   return phaseDecision(session, event, nextPhase, now).apply
 }
 
+function updateTurnLifecycle(session, event, phase, now) {
+  if (event.type === AGENT_EVENTS.SESSION_START) {
+    session.currentTurnId = null
+    session.turnStartedAt = null
+    session.turnEndedAt = null
+    return
+  }
+
+  if (event.turnId) {
+    session.lastTurnId = event.turnId
+  }
+
+  if (TURN_START_EVENTS.has(event.type)) {
+    session.currentTurnId = event.turnId || null
+    session.turnStartedAt = now
+    session.turnEndedAt = null
+    return
+  }
+
+  if (event.turnId && !session.currentTurnId) {
+    session.currentTurnId = event.turnId
+    session.turnStartedAt = Number.isFinite(session.turnStartedAt) ? session.turnStartedAt : now
+    session.turnEndedAt = null
+  }
+
+  if (TURN_END_EVENTS.has(event.type) || TERMINAL_PHASES.has(phase) || NON_TERMINAL_END_PHASES.has(phase)) {
+    if (event.turnId && !session.currentTurnId) session.currentTurnId = event.turnId
+    if (session.currentTurnId || event.turnId || Number.isFinite(session.turnStartedAt)) {
+      session.turnEndedAt = now
+    }
+  }
+}
+
 function setPhase(session, phase, event, now) {
   const source = normalizeSource(event.source)
   const priority = Number.isFinite(event.priority) ? event.priority : sourcePriority(source)
-  const status = legacyStatusForPhase(phase)
+  const status = statusForPhase(phase)
 
+  session.stateContractVersion = SESSION_CONTRACT_VERSION
   session.phase = phase
   session.status = status
   session.needsAttention = attentionForPhase(phase, event.attentionReason || event.needsAttention)
+  updateTurnLifecycle(session, event, phase, now)
 
   if (!ACTIVE_TOOL_PHASES.has(phase)) {
     session.activeTool = null

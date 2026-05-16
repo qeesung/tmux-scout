@@ -10,7 +10,7 @@ const path = require('path')
 const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, splitJsonlLines } = require('../scripts/lib/jsonl-tail-reader')
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
-const { formatLine, getActiveSessions } = require('../scripts/picker/render')
+const { compareSessions, formatLine, getActiveSessions } = require('../scripts/picker/render')
 const { AGENTS, agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
@@ -1232,6 +1232,44 @@ test('picker rows omit duplicated generic wait details', () => {
   assert.ok(line.includes('W:ANS'), line)
   assert.ok(line.includes('waiting for answer · pane'), line)
   assert.ok(!line.includes('waiting for answer: waiting for answer'), line)
+})
+
+test('picker ordering promotes current pane inside each status group only', () => {
+  const now = Date.now()
+  const sessions = [
+    {
+      sessionId: 'newer-busy',
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      tmuxPane: '%2',
+      lastUpdated: now
+    },
+    {
+      sessionId: 'current-busy',
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      tmuxPane: '%1',
+      lastUpdated: now - 10000
+    },
+    {
+      sessionId: 'wait-other-pane',
+      agentType: 'codex',
+      status: 'working',
+      phase: 'waitingForApproval',
+      needsAttention: 'waiting for approval',
+      tmuxPane: '%3',
+      lastUpdated: now - 20000
+    }
+  ]
+
+  sessions.sort((left, right) => compareSessions(left, right, now, '%1'))
+  assert.deepStrictEqual(sessions.map(session => session.sessionId), [
+    'wait-other-pane',
+    'current-busy',
+    'newer-busy'
+  ])
 })
 
 test('status bar summarizes wait subtypes and active totals', () => {

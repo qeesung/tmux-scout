@@ -11,7 +11,7 @@ const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, s
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
 const { formatLine, getActiveSessions } = require('../scripts/picker/render')
-const { agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
+const { AGENTS, agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
 const { resolveAgentProcess } = require('../scripts/lib/terminal-context')
@@ -33,6 +33,7 @@ const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
 const sync = require('../scripts/picker/sync')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
+const { HOOK_EVENTS: COCO_HOOK_EVENTS } = require('../scripts/setup/coco')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
 const claudeHook = require('../scripts/hooks/claude')
 const codexHook = require('../scripts/hooks/codex')
@@ -253,11 +254,12 @@ test('hook scripts expose lightweight adapters', () => {
 })
 
 test('setup manager registry selects agent managers by flags', () => {
-  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode'])
-  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode'])
+  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco'])
+  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco'])
   assert.deepStrictEqual(selectManagers(new Set(['--claude'])).map(manager => manager.id), ['claude'])
   assert.deepStrictEqual(selectManagers(new Set(['--codex', '--quiet'])).map(manager => manager.id), ['codex'])
   assert.deepStrictEqual(selectManagers(new Set(['--copilot-cli'])).map(manager => manager.id), ['copilot-cli'])
+  assert.deepStrictEqual(selectManagers(new Set(['--cursor'])).map(manager => manager.id), ['cursor'])
 })
 
 test('setup manager health normalizes partial hook states', () => {
@@ -326,6 +328,206 @@ test('Gemini and Copilot setup managers install guarded generic hooks', () => {
     assert.strictEqual(copilotSettings.version, 1)
     assert.ok(copilotSettings.hooks.preToolUse[0].bash.includes('--event'))
     assert.ok(copilotSettings.hooks.preToolUse[0].bash.includes('preToolUse'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Cursor setup manager preserves third-party hooks', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.cursor', 'hooks.json')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, JSON.stringify({
+      version: 1,
+      hooks: {
+        beforeSubmitPrompt: [{ command: 'echo keep' }]
+      }
+    }, null, 2))
+
+    runScript('scripts/setup/cursor.js', ['install'], dir)
+    runScript('scripts/setup/cursor.js', ['status'], dir)
+
+    const installed = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+    assert.ok(installed.hooks.beforeSubmitPrompt.some(entry => entry.command === 'echo keep'))
+    assert.ok(installed.hooks.beforeSubmitPrompt.some(entry => entry.command.includes('scripts/hooks/generic.js') && entry.command.includes('--agent') && entry.command.includes('cursor')))
+    assert.ok(installed.hooks.stop.some(entry => entry.command.includes('--agent') && entry.command.includes('cursor')))
+
+    runScript('scripts/setup/cursor.js', ['uninstall'], dir)
+    const removed = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'))
+    assert.ok(removed.hooks.beforeSubmitPrompt.some(entry => entry.command === 'echo keep'))
+    assert.ok(!JSON.stringify(removed).includes('--agent') || !JSON.stringify(removed).includes('cursor'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Coco setup manager preserves unrelated YAML and hooks', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.trae', 'traecli.yaml')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, [
+      'allowed_tools:',
+      '  - ls',
+      'hooks:',
+      '    - type: command',
+      '      command: "echo keep"',
+      '      matchers:',
+      '        - event: user_prompt_submit',
+      'model: default'
+    ].join('\n') + '\n')
+
+    runScript('scripts/setup/coco.js', ['install'], dir)
+    runScript('scripts/setup/coco.js', ['status'], dir)
+
+    const installed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(installed.includes('allowed_tools:'))
+    assert.ok(installed.includes('command: "echo keep"'))
+    assert.ok(installed.includes('--agent'))
+    assert.ok(installed.includes('coco'))
+    assert.ok(installed.includes('event: permission_request'))
+    assert.ok(installed.includes('timeout: 86400'))
+    assert.ok(installed.indexOf('event: permission_request') < installed.indexOf('model: default'))
+
+    runScript('scripts/setup/coco.js', ['uninstall'], dir)
+    const removed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(removed.includes('command: "echo keep"'))
+    assert.ok(!removed.includes('--agent') || !removed.includes('coco'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Coco setup manager removes managed hook matcher blocks cleanly', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.trae', 'traecli.yaml')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, 'model: default\n')
+
+    runScript('scripts/setup/coco.js', ['install'], dir)
+    runScript('scripts/setup/coco.js', ['install'], dir)
+
+    const reinstalled = fs.readFileSync(settingsPath, 'utf-8')
+    const matcherLines = reinstalled.split('\n').filter(line => /^        - event: /.test(line))
+    assert.strictEqual(matcherLines.length, COCO_HOOK_EVENTS.length)
+
+    runScript('scripts/setup/coco.js', ['uninstall'], dir)
+    const removed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(removed.includes('model: default'))
+    assert.strictEqual(removed.split('\n').filter(line => /^        - event: /.test(line)).length, 0)
+    assert.ok(!removed.includes('--agent') || !removed.includes('coco'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes setup manager preserves unrelated YAML and hooks', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.hermes', 'config.yaml')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, [
+      'model: hermes-3',
+      'hooks:',
+      '  pre_tool_call:',
+      '    - command: "echo keep"',
+      'theme: dark'
+    ].join('\n') + '\n')
+
+    runScript('scripts/setup/hermes.js', ['install'], dir)
+    runScript('scripts/setup/hermes.js', ['status'], dir)
+
+    const installed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(installed.includes('model: hermes-3'))
+    assert.ok(installed.includes('command: "echo keep"'))
+    assert.ok(installed.includes('--agent'))
+    assert.ok(installed.includes('hermes'))
+    assert.ok(installed.includes('on_session_start:'))
+    assert.ok(installed.includes('timeout: 600'))
+    assert.ok(installed.includes('theme: dark'))
+    assert.ok(installed.indexOf('on_session_start:') < installed.indexOf('theme: dark'))
+
+    runScript('scripts/setup/hermes.js', ['uninstall'], dir)
+    const removed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(removed.includes('command: "echo keep"'))
+    assert.ok(!removed.includes('--agent') || !removed.includes('hermes'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes setup manager appends to commented existing event headers', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.hermes', 'config.yaml')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, [
+      'model: hermes-3',
+      'hooks:',
+      '  pre_tool_call: # keep user hook',
+      '    - command: "echo keep"',
+      'theme: dark'
+    ].join('\n') + '\n')
+
+    runScript('scripts/setup/hermes.js', ['install'], dir)
+
+    const installed = fs.readFileSync(settingsPath, 'utf-8')
+    const lines = installed.split('\n')
+    const hooksIndex = lines.indexOf('hooks:')
+    assert.strictEqual(/^    - command: /.test(lines[hooksIndex + 1] || ''), false)
+
+    const headerIndex = lines.findIndex(line => line === '  pre_tool_call: # keep user hook')
+    assert.ok(headerIndex > hooksIndex)
+    const nextHeaderIndex = lines.findIndex((line, index) => index > headerIndex && /^\s{2}[A-Za-z0-9_-]+:\s*(?:#.*)?$/.test(line))
+    const eventBlock = lines.slice(headerIndex, nextHeaderIndex < 0 ? lines.length : nextHeaderIndex).join('\n')
+    assert.ok(eventBlock.includes('command: "echo keep"'))
+    assert.ok(eventBlock.includes('--agent'))
+    assert.ok(eventBlock.includes('hermes'))
+    assert.ok(eventBlock.includes('timeout: 600'))
+
+    runScript('scripts/setup/hermes.js', ['uninstall'], dir)
+    const removed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(removed.includes('  pre_tool_call: # keep user hook'))
+    assert.ok(removed.includes('command: "echo keep"'))
+    assert.ok(!removed.includes('--agent') || !removed.includes('hermes'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Coco setup manager preserves YAML without hooks and trailing newline', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.trae', 'traecli.yaml')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, 'model: default')
+
+    runScript('scripts/setup/coco.js', ['install'], dir)
+
+    const installed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(installed.startsWith('model: default\n\nhooks:\n'))
+    assert.ok(installed.includes('--agent'))
+    assert.ok(installed.includes('coco'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes setup manager preserves YAML without hooks and trailing newline', () => {
+  const dir = tempDir()
+  try {
+    const settingsPath = path.join(dir, '.hermes', 'config.yaml')
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true })
+    fs.writeFileSync(settingsPath, 'model: hermes-3')
+
+    runScript('scripts/setup/hermes.js', ['install'], dir)
+
+    const installed = fs.readFileSync(settingsPath, 'utf-8')
+    assert.ok(installed.startsWith('model: hermes-3\n\nhooks:\n'))
+    assert.ok(installed.includes('--agent'))
+    assert.ok(installed.includes('hermes'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -712,7 +914,11 @@ test('unified quiet any status accepts new-agent-only installs', () => {
 })
 
 test('agent registry provides display metadata and process scoring', () => {
-  assert.deepStrictEqual(agentDisplay('codex'), { label: 'codex', color: '38;5;114' })
+  for (const agent of AGENTS) {
+    assert.match(agent.brandColor, /^#[0-9a-f]{6}$/i)
+    assert.match(agent.color, /^38;5;(?:1[6-9]|[2-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/)
+  }
+  assert.deepStrictEqual(agentDisplay('codex'), { label: 'codex', color: '38;5;36' })
   assert.strictEqual(scoreAgentProcess({ basename: 'opencode', commandLine: '/usr/bin/opencode' }, 'opencode'), 100)
   assert.strictEqual(scoreAgentProcess({ basename: 'gh', commandLine: 'gh copilot suggest' }, 'copilot-cli'), 70)
   assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)
@@ -1248,6 +1454,103 @@ test('generic hook treats mutating Copilot tools as permission requests', () => 
     assert.strictEqual(session.pendingInteraction.source, 'hook')
     assert.strictEqual(session.pendingInteraction.tool, 'Bash')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('generic hook tracks Cursor prompt, shell and stop events', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'cursor-session'
+    const base = { conversation_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('cursor', Object.assign({}, base, {
+      hook_event_name: 'beforeSubmitPrompt',
+      prompt: 'ship cursor support'
+    }), dir)
+    runGenericHook('cursor', Object.assign({}, base, {
+      hook_event_name: 'beforeShellExecution',
+      command: 'npm test'
+    }), dir)
+    runGenericHook('cursor', Object.assign({}, base, {
+      hook_event_name: 'afterShellExecution',
+      command: 'npm test',
+      exit_code: 0
+    }), dir)
+    runGenericHook('cursor', Object.assign({}, base, {
+      hook_event_name: 'stop',
+      text: 'done'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'cursor')
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.sessionTitle, 'ship cursor support')
+    assert.strictEqual(session.lastAssistantMessage, 'done')
+    assert.strictEqual(session.pendingToolUse, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('generic hook maps Coco permission requests', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'coco-session'
+    runGenericHook('coco', {
+      hook_event_name: 'user_prompt_submit',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      prompt: 'change the build script'
+    }, dir)
+    runGenericHook('coco', {
+      hook_event_name: 'permission_request',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }, dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'coco')
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('generic hook maps Hermes clarify questions and completion', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'hermes-session'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('hermes', Object.assign({}, base, {
+      hook_event_name: 'pre_llm_call',
+      user_message: 'need choice'
+    }), dir)
+    runGenericHook('hermes', Object.assign({}, base, {
+      hook_event_name: 'pre_tool_call',
+      tool_name: 'clarify',
+      tool_input: { question: 'keep API?' }
+    }), dir)
+    runGenericHook('hermes', Object.assign({}, base, {
+      hook_event_name: 'post_tool_call',
+      tool_name: 'clarify'
+    }), dir)
+    runGenericHook('hermes', Object.assign({}, base, {
+      hook_event_name: 'post_llm_call',
+      response: 'done'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'hermes')
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.sessionTitle, 'need choice')
+    assert.strictEqual(session.lastAssistantMessage, 'done')
+    assert.strictEqual(session.pendingToolUse, null)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

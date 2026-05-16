@@ -64,6 +64,31 @@ function eventBase(data, now) {
   return hookContext.baseUpdates(data, now)
 }
 
+function pendingResolutionType(pending) {
+  return pending && pending.type === 'question'
+    ? AGENT_EVENTS.QUESTION_ANSWERED
+    : AGENT_EVENTS.PERMISSION_RESOLVED
+}
+
+function resolvePendingInteraction(sessionId, data, now, details) {
+  const session = hookContext.readSession(sessionId)
+  const pending = session && session.pendingInteraction
+  if (!pending) return
+  const eventType = pendingResolutionType(pending)
+  updateSession(sessionId, liveSessionState(Object.assign(eventBase(data, now), {
+    status: 'working',
+    needsAttention: null,
+    pendingToolUse: null,
+    activeTool: null,
+    lastEvent: {
+      type: eventType,
+      timestamp: now,
+      details: details || pending.details || pending.reason,
+      rawEventName: `${data.hook_event_name || 'hook'}:${eventType}`
+    }
+  })))
+}
+
 function normalizeSubagents(value) {
   return Array.isArray(value) ? value.filter(Boolean) : []
 }
@@ -323,6 +348,7 @@ function handleClaudeHook(data) {
       break
 
     case 'UserPromptSubmit': {
+      resolvePendingInteraction(session_id, data, now, 'user prompt submitted')
       let title = undefined
       let cleanPrompt = ''
       if (prompt) {
@@ -346,6 +372,7 @@ function handleClaudeHook(data) {
     }
 
     case 'PreToolUse': {
+      resolvePendingInteraction(session_id, data, now, getToolDetails(tool_name, tool_input))
       const toolDetails = getToolDetails(tool_name, tool_input)
       const attentionTools = ['ExitPlanMode', 'AskUserQuestion', 'mcp__conductor__AskUserQuestion']
       const needsAttention = attentionTools.includes(tool_name)
@@ -390,6 +417,7 @@ function handleClaudeHook(data) {
     }
 
     case 'PostToolUse':
+      resolvePendingInteraction(session_id, data, now, tool_name || 'tool completed')
       updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
         pendingToolUse: null,
@@ -402,6 +430,7 @@ function handleClaudeHook(data) {
       const toolDetails = getToolDetails(tool_name, tool_input)
       const error = data.error || data.error_message || data.message || data.reason
       const details = error ? `${toolDetails} failed: ${String(error).slice(0, 80)}` : `${toolDetails} failed`
+      resolvePendingInteraction(session_id, data, now, details)
       updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
         needsAttention: null,
@@ -414,6 +443,7 @@ function handleClaudeHook(data) {
     }
 
     case 'Stop':
+      resolvePendingInteraction(session_id, data, now, data.last_assistant_message)
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
@@ -425,6 +455,7 @@ function handleClaudeHook(data) {
       break
 
     case 'StopFailure':
+      resolvePendingInteraction(session_id, data, now, data.error_details || data.error_detail || data.error || data.message || data.reason)
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
@@ -478,6 +509,7 @@ function handleClaudeHook(data) {
       break
 
     case 'SessionEnd':
+      resolvePendingInteraction(session_id, data, now, reason)
       updateSession(session_id, {
         status: 'idle',
         endedAt: now,

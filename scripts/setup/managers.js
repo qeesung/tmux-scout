@@ -6,6 +6,9 @@ const gemini = require('./gemini')
 const kimi = require('./kimi')
 const copilotCli = require('./copilot-cli')
 const opencode = require('./opencode')
+const cursor = require('./cursor')
+const hermes = require('./hermes')
+const coco = require('./coco')
 
 const HOOK_MANAGERS = [
   {
@@ -49,6 +52,27 @@ const HOOK_MANAGERS = [
     label: 'OpenCode',
     detail: '(~/.config/opencode)',
     module: opencode
+  },
+  {
+    id: 'cursor',
+    flag: '--cursor',
+    label: 'Cursor Agent',
+    detail: '(~/.cursor/hooks.json)',
+    module: cursor
+  },
+  {
+    id: 'hermes',
+    flag: '--hermes',
+    label: 'Hermes',
+    detail: '(~/.hermes/cli-config.yaml)',
+    module: hermes
+  },
+  {
+    id: 'coco',
+    flag: '--coco',
+    label: 'Coco CLI',
+    detail: '(~/.trae/traecli.yaml)',
+    module: coco
   }
 ]
 

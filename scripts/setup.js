@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // tmux-scout unified hook setup
-// Usage: node setup.js <install|uninstall|status> [--claude] [--codex] [--quiet] [--any]
+// Usage: node setup.js <install|uninstall|status> [--agent flags] [--quiet] [--any]
 
 const path = require('path')
 const { spawnSync } = require('child_process')
@@ -272,7 +272,7 @@ function doDoctor() {
 
 // Main dispatch
 if (!command || !['install', 'uninstall', 'status', 'doctor', 'watcher', 'watchdog'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status|doctor|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--quiet] [--any]')
+  console.log('Usage: node setup.js <install|uninstall|status|doctor|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--coco] [--quiet] [--any]')
   console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
   process.exit(command ? 1 : 0)
 }

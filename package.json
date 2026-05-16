@@ -12,6 +12,7 @@
     "check": "node scripts/check-js.js",
     "test": "node tests/run.js",
     "ci": "npm run check && npm test",
-    "doctor": "node scripts/setup.js doctor"
+    "doctor": "node scripts/setup.js doctor",
+    "agent-colors": "node scripts/dev/agent-colors.js"
   }
 }

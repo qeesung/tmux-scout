@@ -32,6 +32,7 @@ const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-de
 const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
 const sync = require('../scripts/picker/sync')
+const { agentColorRows } = require('../scripts/dev/agent-colors')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 const { HOOK_EVENTS: COCO_HOOK_EVENTS } = require('../scripts/setup/coco')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
@@ -922,6 +923,26 @@ test('agent registry provides display metadata and process scoring', () => {
   assert.strictEqual(scoreAgentProcess({ basename: 'opencode', commandLine: '/usr/bin/opencode' }, 'opencode'), 100)
   assert.strictEqual(scoreAgentProcess({ basename: 'gh', commandLine: 'gh copilot suggest' }, 'copilot-cli'), 70)
   assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)
+})
+
+test('README agent color tables match registry', () => {
+  function readColorRows(relativePath) {
+    const lines = fs.readFileSync(path.join(__dirname, '..', relativePath), 'utf-8').split('\n')
+    const headerIndex = lines.findIndex(line => /^\| Agent \| .*xterm \|$/.test(line))
+    assert.ok(headerIndex >= 0, `${relativePath} is missing agent color table`)
+
+    const rows = []
+    for (const line of lines.slice(headerIndex + 2)) {
+      if (!line.startsWith('|')) break
+      const cells = line.split('|').slice(1, -1).map(cell => cell.trim().replace(/`/g, ''))
+      rows.push({ agent: cells[0], brandColor: cells[1], xterm: cells[2] })
+    }
+    return rows
+  }
+
+  const expected = agentColorRows()
+  assert.deepStrictEqual(readColorRows('README.md'), expected)
+  assert.deepStrictEqual(readColorRows('README_CN.md'), expected)
 })
 
 test('hook runtime resolves the real agent pid from the hook parent chain', () => {

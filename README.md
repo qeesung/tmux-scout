@@ -123,6 +123,7 @@ Each line shows:
 ### Agent Colors
 
 Agent labels in the picker and session details use terminal colors chosen from each product's brand palette. The `xterm` value is the 256-color foreground code used in tmux/fzf.
+Run `npm run agent-colors` to preview the colors in your terminal.
 
 | Agent | Brand color | xterm |
 |---|---:|---:|

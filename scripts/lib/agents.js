@@ -2,32 +2,37 @@
 
 const path = require('path')
 
+// `color` is the terminal foreground chosen from the product palette for legibility.
 const AGENTS = [
   {
     id: 'claude',
     label: 'claude',
-    color: '38;5;209',
+    brandColor: '#d97757',
+    color: '38;5;173',
     processNames: ['claude'],
     commandIncludes: ['claude-code', '/claude']
   },
   {
     id: 'codex',
     label: 'codex',
-    color: '38;5;114',
+    brandColor: '#10a37f',
+    color: '38;5;36',
     processNames: ['codex'],
     commandIncludes: ['/codex']
   },
   {
     id: 'opencode',
     label: 'opencode',
-    color: '38;5;220',
+    brandColor: '#fab283',
+    color: '38;5;216',
     processNames: ['opencode'],
     commandIncludes: ['opencode']
   },
   {
     id: 'gemini',
     label: 'gemini',
-    color: '38;5;111',
+    brandColor: '#4285f4',
+    color: '38;5;69',
     processNames: ['gemini'],
     commandIncludes: ['gemini-cli', '/gemini']
   },
@@ -35,27 +40,31 @@ const AGENTS = [
     id: 'copilot-cli',
     aliases: ['copilot', 'github-copilot'],
     label: 'copilot',
-    color: '38;5;141',
+    brandColor: '#8534f3',
+    color: '38;5;99',
     processNames: ['copilot'],
     commandIncludes: ['gh copilot', 'github-copilot']
   },
   {
     id: 'cursor',
     label: 'cursor',
-    color: '38;5;75',
+    brandColor: '#edecec',
+    color: '38;5;255',
     processNames: ['cursor'],
     commandIncludes: ['cursor-agent', '/cursor']
   },
   {
     id: 'kimi',
     label: 'kimi',
-    color: '38;5;219',
+    brandColor: '#0d0f14',
+    color: '38;5;246',
     processNames: ['kimi'],
     commandIncludes: ['/kimi']
   },
   {
     id: 'hermes',
     label: 'hermes',
+    brandColor: '#e5c07b',
     color: '38;5;180',
     processNames: ['hermes'],
     commandIncludes: ['/hermes']
@@ -63,7 +72,8 @@ const AGENTS = [
   {
     id: 'coco',
     label: 'coco',
-    color: '38;5;156',
+    brandColor: '#32f08c',
+    color: '38;5;84',
     processNames: ['coco'],
     commandIncludes: ['/coco']
   }

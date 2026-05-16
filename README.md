@@ -1,6 +1,6 @@
 # tmux-scout
 
-A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), Gemini CLI, Kimi CLI, GitHub Copilot CLI, and OpenCode sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
+A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, and Coco CLI sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
 
 [中文文档](README_CN.md)
 
@@ -67,6 +67,9 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --kimi     # Kimi CLI only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --copilot-cli  # GitHub Copilot CLI only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --opencode # OpenCode only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --cursor   # Cursor Agent only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --hermes   # Hermes only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --coco     # Coco CLI only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" uninstall          # Remove all hooks
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status             # Check installation status
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor             # Run environment diagnostics
@@ -83,6 +86,9 @@ Without an agent flag, `install`, `uninstall`, and `status` operate on all suppo
 - **Kimi CLI**: Appends managed `[[hooks]]` blocks to `~/.kimi/config.toml` while preserving unrelated TOML content
 - **GitHub Copilot CLI**: Adds command hooks in `~/.copilot/settings.json`
 - **OpenCode**: Writes `~/.config/opencode/plugins/tmux-scout-opencode-plugin.js` and registers it in the OpenCode JSON config
+- **Cursor Agent**: Adds command hooks in `~/.cursor/hooks.json`
+- **Hermes**: Adds command hooks in `~/.hermes/cli-config.yaml` or an existing `~/.hermes/config.yaml`
+- **Coco CLI**: Adds command hooks in `~/.trae/traecli.yaml` or an existing Coco config file
 
 ## Usage
 
@@ -108,11 +114,27 @@ Each line shows:
 - `W:APP` / `W:ANS` / `W:PLAN` — waiting for approval, answer, or plan confirmation
 - `BUSY` / `DONE` / `IDLE` — session status
 - `INT` / `CRASH` / `STALE` — recently interrupted, crashed, or stale sessions
-- Agent type (claude / codex / gemini / kimi / copilot-cli / opencode)
+- Agent type (claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / coco)
 - tmux window name (`-` when no window is linked)
 - Project directory name
 - Session title (first prompt)
 - Current tool details (for working sessions)
+
+### Agent Colors
+
+Agent labels in the picker and session details use terminal colors chosen from each product's brand palette. The `xterm` value is the 256-color foreground code used in tmux/fzf.
+
+| Agent | Brand color | xterm |
+|---|---:|---:|
+| claude | `#d97757` | `38;5;173` |
+| codex | `#10a37f` | `38;5;36` |
+| opencode | `#fab283` | `38;5;216` |
+| gemini | `#4285f4` | `38;5;69` |
+| copilot | `#8534f3` | `38;5;99` |
+| cursor | `#edecec` | `38;5;255` |
+| kimi | `#0d0f14` | `38;5;246` |
+| hermes | `#e5c07b` | `38;5;180` |
+| coco | `#32f08c` | `38;5;84` |
 
 ### Status Bar
 
@@ -140,6 +162,14 @@ W|B|D
 
 Where `W` = waiting for attention (red), `B` = busy/working (yellow), `D` = done/completed (green). An optional `I` = idle (blue) appears when idle sessions exist.
 
+When tmux mouse mode is enabled, clicking the tmux-scout status segment opens the same picker as `prefix + O`:
+
+```bash
+set -g mouse on
+```
+
+tmux-scout does not enable mouse mode for you. The clickable segment is subtly underlined by default. In the picker, single-click selects a row and double-click jumps to it.
+
 ## Configuration
 
 ### Keybinding
@@ -155,7 +185,24 @@ set -g @scout-status-format '{W}/{B}/{D}'         # custom separators
 set -g @scout-status-format '{W} wait {B} busy'   # with labels
 ```
 
-Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle.
+Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle, `{A}` approval waits, `{Q}` question/answer waits, `{P}` plan waits, `{T}` total active sessions.
+
+Status click behavior:
+
+```bash
+set -g @scout-status-click on      # default: clickable status segment
+set -g @scout-status-click off     # plain text status segment
+set -g @scout-status-click force   # override an existing MouseDown1Status binding
+```
+
+With the default `on`, tmux-scout only installs its click binding when `MouseDown1Status` is unset, still tmux's default, or already owned by tmux-scout.
+
+Optional mouse UI tuning:
+
+```bash
+set -g @scout-status-click-style underscore   # default clickable hint
+set -g @scout-status-click-style off          # disable the underline hint
+```
 
 ### Watchdog
 
@@ -221,7 +268,7 @@ Internally, hook, pane, transcript, PID, and stale-timeout observations are redu
 
 For older Codex versions that only support `notify`, tmux-scout still installs and chains the legacy notify hook. In that fallback mode, first-turn discovery may still depend on JSONL polling until Codex emits a completion notification.
 
-Gemini CLI, Kimi CLI, GitHub Copilot CLI, and OpenCode are tracked through a generic hook adapter. It maps their hook/plugin events onto the same session lifecycle model, so support quality depends on the payloads those CLIs expose for prompts, tool calls, approvals, and completion.
+Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, and Coco CLI are tracked through a generic hook adapter. It maps their hook/plugin events onto the same session lifecycle model, so support quality depends on the payloads those CLIs expose for prompts, tool calls, approvals, questions, subagents, and completion.
 
 ## Development
 

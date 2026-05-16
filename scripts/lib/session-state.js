@@ -1,6 +1,17 @@
 // Central session state reducer for tmux-scout.
 
 const { AGENT_EVENTS, normalizeAgentEvent } = require('./agent-events')
+const {
+  SESSION_CONTRACT_VERSION,
+  TERMINAL_SESSION_PHASES,
+  NON_TERMINAL_END_PHASES,
+  ACTIVE_TOOL_PHASES,
+  PENDING_INTERACTION_PHASES,
+  phaseFromLegacyStatus,
+  phaseForAgentEvent,
+  statusForPhase,
+  attentionForPhase
+} = require('./session-contract')
 
 const SOURCE_PRIORITY = {
   hook: 90,
@@ -17,9 +28,47 @@ const SOURCE_PRIORITY = {
 const PROTECTED_PHASE_MS = 120000
 const MAX_STATE_EVIDENCE = 20
 const EVIDENCE_DEDUPE_MS = 10000
-const TERMINAL_PHASES = new Set(['crashed', 'stale'])
-const NON_TERMINAL_END_PHASES = new Set(['completed', 'interrupted'])
-const ACTIVE_TOOL_PHASES = new Set(['running', 'waitingForApproval'])
+const TERMINAL_PHASES = TERMINAL_SESSION_PHASES
+const PENDING_RESOLUTION_EVENTS = new Set([
+  AGENT_EVENTS.PERMISSION_RESOLVED,
+  AGENT_EVENTS.QUESTION_ANSWERED
+])
+const TURN_START_EVENTS = new Set([
+  AGENT_EVENTS.PROMPT_SUBMIT
+])
+const TURN_END_EVENTS = new Set([
+  AGENT_EVENTS.STOP,
+  AGENT_EVENTS.STOP_FAILURE,
+  AGENT_EVENTS.TURN_COMPLETE,
+  AGENT_EVENTS.SESSION_END,
+  AGENT_EVENTS.INTERRUPTED,
+  AGENT_EVENTS.PROCESS_EXIT_DETECTED,
+  AGENT_EVENTS.STALE
+])
+const TOOL_CLEAR_EVENTS = new Set([
+  AGENT_EVENTS.SESSION_START,
+  AGENT_EVENTS.PROMPT_SUBMIT,
+  AGENT_EVENTS.POST_TOOL_USE,
+  AGENT_EVENTS.POST_TOOL_USE_FAILURE,
+  AGENT_EVENTS.PERMISSION_BYPASSED,
+  AGENT_EVENTS.STOP,
+  AGENT_EVENTS.STOP_FAILURE,
+  AGENT_EVENTS.TURN_COMPLETE,
+  AGENT_EVENTS.SESSION_END,
+  AGENT_EVENTS.INTERRUPTED,
+  AGENT_EVENTS.PROCESS_EXIT_DETECTED,
+  AGENT_EVENTS.STALE
+])
+const PLAN_APPROVAL_TOOLS = new Set(['exitplanmode', 'enterplanmode'])
+const GENERIC_WAIT_DETAILS = new Set([
+  'needsattention',
+  'needs attention',
+  'waiting',
+  'waitingforapproval',
+  'waiting for approval',
+  'waitingforanswer',
+  'waiting for answer'
+])
 
 function normalizeSource(source) {
   if (!source) return 'unknown'
@@ -36,72 +85,125 @@ function sourcePriority(source) {
 function currentPhase(session) {
   if (session.phase) return session.phase
   if (session.lifecycle && session.lifecycle.phase) return session.lifecycle.phase
-  if (session.status === 'crashed') return 'crashed'
-  if (session.status === 'stale') return 'stale'
-  if (session.status === 'interrupted') return 'interrupted'
-  if (session.needsAttention === 'waiting for answer') return 'waitingForAnswer'
-  if (session.needsAttention) return 'waitingForApproval'
-  if (session.status === 'working') return 'running'
-  if (session.status === 'completed') return 'completed'
-  if (session.status === 'idle') return 'idle'
-  return 'idle'
+  return phaseFromLegacyStatus(session.status, session.needsAttention) || 'idle'
 }
 
-function legacyStatusForPhase(phase) {
-  switch (phase) {
-    case 'idle': return 'idle'
-    case 'running': return 'working'
-    case 'waitingForApproval': return 'working'
-    case 'waitingForAnswer': return 'working'
-    case 'completed': return 'completed'
-    case 'interrupted': return 'interrupted'
-    case 'crashed': return 'crashed'
-    case 'stale': return 'stale'
-    default: return 'working'
+function isGenericWaitDetail(value) {
+  const text = compactEvidenceText(value, 200)
+  return text ? GENERIC_WAIT_DETAILS.has(text.toLowerCase()) : false
+}
+
+function isPlanApprovalReason(value) {
+  const text = compactEvidenceText(value, 200)
+  if (!text) return false
+  const normalized = text.toLowerCase()
+  return normalized.includes('plan approval') ||
+    normalized.includes('plan confirmation') ||
+    normalized.includes('confirm plan') ||
+    normalized.includes('implement this plan')
+}
+
+function pendingInteractionType(phase, event, pendingTool) {
+  if (phase === 'waitingForAnswer') return 'question'
+  const tool = String(pendingTool.tool || event.activeTool || '').toLowerCase()
+  if (PLAN_APPROVAL_TOOLS.has(tool) ||
+    isPlanApprovalReason(event.attentionReason) ||
+    isPlanApprovalReason(event.needsAttention)) {
+    return 'plan'
   }
+  return 'approval'
 }
 
-function attentionForPhase(phase, reason) {
-  if (phase === 'waitingForApproval') return reason || 'waiting for approval'
-  if (phase === 'waitingForAnswer') return reason || 'waiting for answer'
+function requestIdForEvent(event) {
+  return event.requestId || event.toolCallId || event.toolUseId || event.turnId
+}
+
+function samePendingInteraction(previous, phase, type, requestId, tool, details) {
+  if (!previous || previous.phase !== phase || previous.type !== type) return false
+  if (previous.requestId || requestId) return previous.requestId === requestId
+  if (previous.tool || tool) return previous.tool === tool && previous.details === details
+  return previous.details === details
+}
+
+function sameWaitRefresh(session, phase, event) {
+  return PENDING_INTERACTION_PHASES.has(phase) &&
+    session.pendingInteraction &&
+    session.pendingInteraction.phase === phase &&
+    event.pendingToolUse === undefined &&
+    event.activeTool === undefined
+}
+
+function fallbackPendingTool(session, sameWait) {
+  if (!sameWait) return null
+  if (session.pendingToolUse && typeof session.pendingToolUse === 'object') return session.pendingToolUse
+  const previous = session.pendingInteraction
+  if (previous && (previous.tool || previous.details)) {
+    return { tool: previous.tool, details: previous.details }
+  }
   return null
+}
+
+function pendingInteractionForPhase(session, phase, event, now) {
+  const sameWait = sameWaitRefresh(session, phase, event)
+  const previousInteraction = sameWait ? session.pendingInteraction : null
+  const pendingTool = event.pendingToolUse && typeof event.pendingToolUse === 'object'
+    ? event.pendingToolUse
+    : fallbackPendingTool(session, sameWait)
+  const type = pendingInteractionType(phase, event, pendingTool || {})
+  const tool = pendingTool && pendingTool.tool
+    ? String(pendingTool.tool)
+    : event.activeTool ? String(event.activeTool) : undefined
+  const rawReason = event.attentionReason || event.needsAttention
+  const reason = attentionForPhase(
+    phase,
+    rawReason && !isGenericWaitDetail(rawReason)
+      ? rawReason
+      : previousInteraction && previousInteraction.reason ? previousInteraction.reason : rawReason
+  )
+  const eventDetails = isGenericWaitDetail(event.details) ? undefined : event.details
+  const details = compactEvidenceText(
+    eventDetails ||
+      (pendingTool && pendingTool.details) ||
+      (previousInteraction && previousInteraction.details) ||
+      (!sameWait ? event.reason : undefined) ||
+      reason,
+    200
+  )
+  const requestId = requestIdForEvent(event) || (previousInteraction && previousInteraction.requestId)
+  const matchingPrevious = samePendingInteraction(session.pendingInteraction, phase, type, requestId, tool, details)
+    ? session.pendingInteraction
+    : null
+  const source = normalizeSource(event.source)
+  const priority = Number.isFinite(event.priority) ? event.priority : sourcePriority(source)
+  const interaction = {
+    type,
+    phase,
+    source,
+    stateSource: event.stateSource || session.stateSource,
+    rawEventName: event.rawEventName || event.type,
+    startedAt: matchingPrevious && Number.isFinite(matchingPrevious.startedAt) ? matchingPrevious.startedAt : now,
+    updatedAt: now,
+    reason,
+    details,
+    tool,
+    requestId,
+    turnId: event.turnId || (matchingPrevious && matchingPrevious.turnId),
+    transcriptPath: event.transcriptPath || session.transcriptPath,
+    tmuxPane: event.tmuxPane || session.tmuxPane,
+    pid: Number.isInteger(event.pid) ? event.pid : session.pid,
+    confidence: Number.isFinite(event.confidence) ? event.confidence : priority,
+    channelAlive: typeof event.channelAlive === 'boolean' ? event.channelAlive : undefined
+  }
+
+  const clean = {}
+  for (const [key, value] of Object.entries(interaction)) {
+    if (value !== undefined && value !== null && value !== '') clean[key] = value
+  }
+  return clean
 }
 
 function phaseForEvent(event) {
-  switch (event.type) {
-    case AGENT_EVENTS.SESSION_START: return 'idle'
-    case AGENT_EVENTS.PROMPT_SUBMIT: return 'running'
-    case AGENT_EVENTS.TOOL_USE: return 'running'
-    case AGENT_EVENTS.POST_TOOL_USE: return 'running'
-    case AGENT_EVENTS.POST_TOOL_USE_FAILURE: return 'running'
-    case AGENT_EVENTS.PERMISSION_BYPASSED: return 'running'
-    case AGENT_EVENTS.PERMISSION_REQUEST: return 'waitingForApproval'
-    case AGENT_EVENTS.QUESTION_ASKED: return 'waitingForAnswer'
-    case AGENT_EVENTS.STOP: return 'completed'
-    case AGENT_EVENTS.STOP_FAILURE: return 'completed'
-    case AGENT_EVENTS.TURN_COMPLETE: return 'completed'
-    case AGENT_EVENTS.SESSION_END: return 'completed'
-    case AGENT_EVENTS.INTERRUPTED: return 'interrupted'
-    case AGENT_EVENTS.PROCESS_EXIT_DETECTED: return 'crashed'
-    case AGENT_EVENTS.STALE: return 'stale'
-    case AGENT_EVENTS.PANE_STATE:
-    case AGENT_EVENTS.TRANSCRIPT_STATUS:
-      return event.phase || event.statusPhase || currentPhaseFromStatus(event.status, event.needsAttention)
-    default:
-      return event.phase
-  }
-}
-
-function currentPhaseFromStatus(status, needsAttention) {
-  if (needsAttention === 'waiting for answer') return 'waitingForAnswer'
-  if (needsAttention) return 'waitingForApproval'
-  if (status === 'working') return 'running'
-  if (status === 'completed') return 'completed'
-  if (status === 'interrupted') return 'interrupted'
-  if (status === 'crashed') return 'crashed'
-  if (status === 'stale') return 'stale'
-  if (status === 'idle') return 'idle'
-  return null
+  return phaseForAgentEvent(event)
 }
 
 function phaseDecision(session, event, nextPhase, now) {
@@ -147,19 +249,62 @@ function shouldApplyPhase(session, event, nextPhase, now) {
   return phaseDecision(session, event, nextPhase, now).apply
 }
 
+function updateTurnLifecycle(session, event, phase, now) {
+  if (event.type === AGENT_EVENTS.SESSION_START) {
+    session.currentTurnId = null
+    session.turnStartedAt = null
+    session.turnEndedAt = null
+    return
+  }
+
+  if (event.turnId) {
+    session.lastTurnId = event.turnId
+  }
+
+  if (TURN_START_EVENTS.has(event.type)) {
+    session.currentTurnId = event.turnId || null
+    session.turnStartedAt = now
+    session.turnEndedAt = null
+    return
+  }
+
+  if (event.turnId && !session.currentTurnId) {
+    session.currentTurnId = event.turnId
+    session.turnStartedAt = Number.isFinite(session.turnStartedAt) ? session.turnStartedAt : now
+    session.turnEndedAt = null
+  }
+
+  if (TURN_END_EVENTS.has(event.type) || TERMINAL_PHASES.has(phase) || NON_TERMINAL_END_PHASES.has(phase)) {
+    if (event.turnId && !session.currentTurnId) session.currentTurnId = event.turnId
+    if (session.currentTurnId || event.turnId || Number.isFinite(session.turnStartedAt)) {
+      session.turnEndedAt = now
+    }
+  }
+}
+
 function setPhase(session, phase, event, now) {
   const source = normalizeSource(event.source)
   const priority = Number.isFinite(event.priority) ? event.priority : sourcePriority(source)
-  const status = legacyStatusForPhase(phase)
+  const status = statusForPhase(phase)
 
+  session.stateContractVersion = SESSION_CONTRACT_VERSION
   session.phase = phase
   session.status = status
-  session.needsAttention = attentionForPhase(phase, event.attentionReason)
+  session.needsAttention = attentionForPhase(phase, event.attentionReason || event.needsAttention)
+  updateTurnLifecycle(session, event, phase, now)
 
   if (!ACTIVE_TOOL_PHASES.has(phase)) {
-    session.pendingToolUse = null
     session.activeTool = null
   }
+  if (!PENDING_INTERACTION_PHASES.has(phase)) {
+    session.pendingToolUse = null
+  } else if (event.pendingToolUse === undefined && !sameWaitRefresh(session, phase, event)) {
+    session.pendingToolUse = null
+  }
+
+  session.pendingInteraction = PENDING_INTERACTION_PHASES.has(phase)
+    ? pendingInteractionForPhase(session, phase, event, now)
+    : null
 
   if (event.type === AGENT_EVENTS.SESSION_END) {
     session.endedAt = event.endedAt || now
@@ -188,14 +333,29 @@ function compactEvidenceText(value, max = 160) {
   return text.length > max ? text.slice(0, max - 1) + '~' : text
 }
 
+function eventClearsPendingToolUse(event) {
+  return event.pendingToolUse === null ||
+    PENDING_RESOLUTION_EVENTS.has(event.type) ||
+    TOOL_CLEAR_EVENTS.has(event.type)
+}
+
+function eventClearsActiveTool(event) {
+  return event.activeTool === null ||
+    event.pendingToolUse === null ||
+    TOOL_CLEAR_EVENTS.has(event.type) ||
+    event.type === AGENT_EVENTS.QUESTION_ASKED ||
+    event.type === AGENT_EVENTS.PERMISSION_REQUEST
+}
+
+function activeToolAllowedForPhase(phase) {
+  return ACTIVE_TOOL_PHASES.has(phase)
+}
+
 function evidenceForEvent(session, event, nextPhase, previousPhase, applied, blockedReason, now) {
-  const pendingTool = event.pendingToolUse && event.pendingToolUse.tool
-    ? event.pendingToolUse.tool
-    : undefined
-  const explicitToolCleared = event.pendingToolUse === null || event.activeTool === null
-  const activeTool = event.activeTool !== undefined
+  const phase = nextPhase || event.phase || previousPhase
+  const activeTool = event.activeTool !== undefined && event.activeTool !== null && activeToolAllowedForPhase(phase)
     ? event.activeTool
-    : explicitToolCleared ? undefined : pendingTool || session.activeTool || undefined
+    : eventClearsActiveTool(event) ? undefined : session.activeTool || undefined
   return {
     type: event.type,
     source: normalizeSource(event.source),
@@ -281,14 +441,20 @@ function applySessionEvent(session, event) {
   )
 
   if (applied || !nextPhase) {
-    if (event.pendingToolUse !== undefined) session.pendingToolUse = event.pendingToolUse
+    const phase = currentPhase(session)
+    if (event.pendingToolUse !== undefined) {
+      session.pendingToolUse = event.pendingToolUse
+    } else if (eventClearsPendingToolUse(event)) {
+      session.pendingToolUse = null
+    }
     if (event.activeTool !== undefined) {
-      session.activeTool = event.activeTool
-    } else if (event.pendingToolUse && event.pendingToolUse.tool) {
-      session.activeTool = event.pendingToolUse.tool
-    } else if (event.pendingToolUse === null) {
+      if (event.activeTool === null || activeToolAllowedForPhase(phase)) {
+        session.activeTool = event.activeTool
+      }
+    } else if (eventClearsActiveTool(event)) {
       session.activeTool = null
     }
+    if (session.activeTool === undefined) session.activeTool = null
     session.lastEvent = {
       type: event.type,
       timestamp: now,

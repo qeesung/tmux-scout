@@ -4,6 +4,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATUS_FILE="$HOME/.tmux-scout/status.json"
+AUTO_PID=""
+AUTO_FLAG=""
+LINES_FILE=""
 
 # Restore PATH saved at plugin load time (includes nvm/fnm paths)
 if scout_path=$(tmux show-environment -g SCOUT_PATH 2>/dev/null); then
@@ -16,8 +19,18 @@ if [ "${1:-}" = "--generate" ]; then
   exit 0
 fi
 
+cleanup() {
+  if [ -n "$AUTO_PID" ]; then
+    kill "$AUTO_PID" 2>/dev/null || true
+    wait "$AUTO_PID" 2>/dev/null || true
+  fi
+  [ -n "$LINES_FILE" ] && rm -f "$LINES_FILE"
+  [ -n "$AUTO_FLAG" ] && rm -f "$AUTO_FLAG"
+}
+trap cleanup EXIT INT TERM HUP
+
 if [ ! -f "$STATUS_FILE" ]; then
-  tmux display-message "No Claude sessions found. Start a Claude instance first."
+  tmux display-message "No tmux-scout sessions found. Start an agent instance first."
   exit 0
 fi
 
@@ -33,8 +46,8 @@ touch "$AUTO_FLAG"
 LINES_FILE=$(mktemp /tmp/tmux-scout-lines.XXXXXX)
 node "$SCRIPT_DIR/index.js" "$STATUS_FILE" "$CURRENT_PANE" > "$LINES_FILE"
 lines=$(wc -l < "$LINES_FILE" | tr -d ' ')
-# items + header-line + fzf header + separator + prompt + border(2) + padding
-height=$((lines + 8))
+# items + header-line + separator + prompt + border(2) + padding
+height=$((lines + 6))
 [ "$height" -lt 12 ] && height=12
 [ "$height" -gt 30 ] && height=30
 
@@ -55,14 +68,13 @@ fzf_output=$(cat "$LINES_FILE" | fzf \
   --listen=$LISTEN_PORT \
   --tmux "center,85%,$height,border-native" \
   --ansi \
-  --no-mouse \
   --expect='ctrl-d' \
   --prompt='> ' \
   --color='border:bright-cyan,label:bright-white' \
   --delimiter='\t' \
   --with-nth=2 \
-  --header=$'\nEnter: jump | Ctrl-D: details | Ctrl-R: refresh | Ctrl-T: auto-refresh | Esc: cancel' \
   --header-lines=1 \
+  --bind="double-click:accept" \
   --bind="ctrl-r:reload($RELOAD_CMD)" \
   --bind="ctrl-t:execute-silent(if [ -f $AUTO_FLAG ]; then rm -f $AUTO_FLAG; else touch $AUTO_FLAG; fi)+reload($RELOAD_CMD)+transform:if [ -f $AUTO_FLAG ]; then printf \"change-border-label( tmux-scout · auto-refresh \$(date +%H:%M:%S) )\"; else printf 'change-border-label( tmux-scout )'; fi" \
   --preview='tmux capture-pane -pJ -t {1} 2>/dev/null | tail -40' \
@@ -80,8 +92,6 @@ fzf_output=$(cat "$LINES_FILE" | fzf \
   --cycle \
   || true)
 
-kill $AUTO_PID 2>/dev/null; wait $AUTO_PID 2>/dev/null
-rm -f "$LINES_FILE" "$AUTO_FLAG"
 [ -z "$fzf_output" ] && exit 0
 
 action="jump"
@@ -103,6 +113,7 @@ fi
 if [ "$action" = "details" ]; then
   session_id=$(printf '%s\n' "$selected" | cut -f3)
   bash "$SCRIPT_DIR/show-details.sh" "$STATUS_FILE" "$session_id" "$CURRENT_PANE"
+  cleanup
   exec "$0"
 fi
 

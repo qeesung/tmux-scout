@@ -101,6 +101,20 @@ function groupOrder(session, now) {
   return 5
 }
 
+function isCurrentPaneSession(session, pane) {
+  return Boolean(pane && session && session.tmuxPane === pane)
+}
+
+function compareSessions(left, right, now, pane) {
+  const g = groupOrder(left, now) - groupOrder(right, now)
+  if (g !== 0) return g
+
+  const current = Number(isCurrentPaneSession(right, pane)) - Number(isCurrentPaneSession(left, pane))
+  if (current !== 0) return current
+
+  return (right.lastUpdated || 0) - (left.lastUpdated || 0)
+}
+
 function isTerminalSession(session) {
   return session && (session.status === 'crashed' || session.status === 'stale' || session.status === 'interrupted')
 }
@@ -348,11 +362,7 @@ function run(file, pane, cached) {
   for (const session of active) {
     session._tmuxPaneSnapshot = session.tmuxPane ? panes.get(session.tmuxPane) : null
   }
-  active.sort((left, right) => {
-    const g = groupOrder(left, now) - groupOrder(right, now)
-    if (g !== 0) return g
-    return (right.lastUpdated || 0) - (left.lastUpdated || 0)
-  })
+  active.sort((left, right) => compareSessions(left, right, now, currentPane))
 
   const hStatus = 'STATUS'.padEnd(STATUS_WIDTH)
   const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)
@@ -370,7 +380,7 @@ function run(file, pane, cached) {
   }
 }
 
-module.exports = { run, getActiveSessions, formatLine, subagentDetail, evidenceDetail, waitCode }
+module.exports = { run, getActiveSessions, compareSessions, formatLine, subagentDetail, evidenceDetail, waitCode }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

@@ -20,7 +20,12 @@ const LIFECYCLE_FIELDS = new Set([
   'stateConfidence',
   'stateReason',
   'lastEvent',
-  'lifecycle'
+  'lifecycle',
+  'stateContractVersion',
+  'currentTurnId',
+  'turnStartedAt',
+  'turnEndedAt',
+  'lastTurnId'
 ])
 
 function defaultPaths(homeDir = os.homedir()) {

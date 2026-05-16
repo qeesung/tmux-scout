@@ -150,14 +150,15 @@ function pushField(lines, label, value) {
 }
 
 function formatHeader(session) {
-  const agent = agentDisplay(session.agentType).label
+  const agentInfo = agentDisplay(session.agentType)
+  const agent = agentInfo.label
   const project = path.basename(session.workingDirectory || '') || '-'
   const title = session.sessionTitle || session.lastUserPrompt || ''
   const status = statusLabel(session).padEnd(10)
   const lines = [
     colorText('tmux-scout', `${COLOR.cyan};${COLOR.bold}`) + colorText(' | session', COLOR.gray),
     colorText('--------------------------------------------------------------------------------', COLOR.gray),
-    `${colorText(status, statusColor(session))} ${colorText(agent, `${COLOR.cyan};${COLOR.bold}`)}   ${colorText(project, COLOR.white)}`
+    `${colorText(status, statusColor(session))} ${colorText(agent, `${agentInfo.color};${COLOR.bold}`)}   ${colorText(project, COLOR.white)}`
   ]
   if (title) lines.push(colorText(`"${truncateText(title, 120)}"`, COLOR.gray))
   lines.push('')

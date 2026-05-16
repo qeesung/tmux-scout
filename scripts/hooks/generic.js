@@ -80,6 +80,8 @@ function getSessionId(data) {
     data.conversation_id ||
     data.thread_id ||
     data.threadId ||
+    data.task_id ||
+    (data.extra && data.extra.task_id) ||
     data.id ||
     `${agentType}-${cleanPrompt(data.cwd || process.cwd() || 'unknown').replace(/[^a-zA-Z0-9_.-]+/g, '_')}`
 }
@@ -89,7 +91,7 @@ function getEventName(data) {
 }
 
 function getToolName(data) {
-  return data.tool_name || data.toolName || data.tool || 'unknown'
+  return data.tool_name || data.toolName || data.tool || data.server || 'unknown'
 }
 
 function parseJsonMaybe(value) {
@@ -102,7 +104,15 @@ function parseJsonMaybe(value) {
 }
 
 function getToolInput(data) {
-  return parseJsonMaybe(data.tool_input || data.toolInput || data.toolArgs || data.tool_args)
+  return parseJsonMaybe(data.tool_input ||
+    data.toolInput ||
+    data.toolArgs ||
+    data.tool_args ||
+    data.arguments ||
+    data.args ||
+    data.params ||
+    data.command ||
+    data.file_path)
 }
 
 function getToolDetails(toolName, toolInput) {
@@ -151,12 +161,13 @@ function latestAssistantFromCopilotTranscript(transcriptPath) {
 
 function isQuestionTool(toolName) {
   const name = String(toolName || '').toLowerCase()
-  return name === 'ask_user' || name.includes('askuserquestion') || name.includes('ask_user')
+  return name === 'ask_user' || name === 'clarify' || name.includes('askuserquestion') || name.includes('ask_user')
 }
 
 function isPermissionTool(agent, toolName) {
   const name = String(toolName || '').toLowerCase()
   if (agent === 'gemini') return false
+  if (agent === 'coco' || agent === 'cursor' || agent === 'hermes') return false
   if (agent === 'copilot-cli') {
     return !new Set([
       'view', 'glob', 'grep', 'rg', 'readbash', 'readpowershell',
@@ -256,6 +267,10 @@ function stop(data, sessionId, now, failure) {
   const lastAssistantMessage = data.last_assistant_message ||
     data.prompt_response ||
     data.assistant_message ||
+    data.response ||
+    data.output ||
+    data.text ||
+    (data.extra && data.extra.last_assistant_message) ||
     latestAssistantFromCopilotTranscript(data.transcriptPath || data.transcript_path)
   resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
   updateSession(sessionId, Object.assign(baseUpdates(data, now), {
@@ -311,6 +326,27 @@ function removeSubagent(sessionId, childId, now, activity) {
     lastSubagentUpdatedAt: now,
     lastEvent: { type: AGENT_EVENTS.SUBAGENT_STOP, timestamp: now, details: activity }
   })
+}
+
+function updateActivity(data, sessionId, now, details, eventType = AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE) {
+  updateSession(sessionId, Object.assign(baseUpdates(data, now), {
+    currentActivity: details || undefined,
+    lastEvent: { type: eventType, timestamp: now, details }
+  }))
+}
+
+function subagentId(data, now, prefix) {
+  return data.agent_id ||
+    data.agentId ||
+    data.child_session_id ||
+    data.childSessionId ||
+    data.child_id ||
+    data.childId ||
+    data.subagent_id ||
+    data.subagentId ||
+    data.agent_name ||
+    data.agentName ||
+    `${prefix}-subagent-${now}`
 }
 
 function handleGemini(data, sessionId, eventName, now) {
@@ -400,6 +436,178 @@ function handleOpenCode(data, sessionId, eventName, now) {
   if (eventName === 'SessionEnd') return sessionEnd(data, sessionId, now)
 }
 
+function cursorMcpToolName(data) {
+  const server = data.server || data.server_name || data.mcp_server || data.mcpServer
+  const tool = data.tool_name || data.toolName || data.tool || data.name || data.method
+  if (server && tool) return `MCP: ${server} -> ${tool}`
+  if (server) return `MCP: ${server}`
+  return tool || 'MCP'
+}
+
+function handleCursor(data, sessionId, eventName, now) {
+  if (eventName === 'sessionStart') return sessionStart(data, sessionId, now, data.session_title)
+  if (eventName === 'sessionEnd') return sessionEnd(data, sessionId, now)
+  if (eventName === 'beforeSubmitPrompt') {
+    return promptSubmit(data, sessionId, now, data.prompt || data.message || data.text || data.user_prompt)
+  }
+  if (eventName === 'beforeShellExecution') {
+    return toolUse(Object.assign({ tool_name: 'Shell' }, data, {
+      tool_input: data.tool_input || data.toolInput || { command: data.command }
+    }), sessionId, now)
+  }
+  if (eventName === 'afterShellExecution') {
+    const failed = Number.isFinite(data.exit_code) ? data.exit_code !== 0
+      : Number.isFinite(data.exitCode) ? data.exitCode !== 0
+        : Boolean(data.error || data.error_message)
+    return postToolUse(Object.assign({ tool_name: 'Shell' }, data, {
+      tool_input: data.tool_input || data.toolInput || { command: data.command }
+    }), sessionId, now, failed)
+  }
+  if (eventName === 'beforeMCPExecution') {
+    return toolUse(Object.assign({}, data, { tool_name: cursorMcpToolName(data) }), sessionId, now)
+  }
+  if (eventName === 'afterMCPExecution') {
+    return postToolUse(Object.assign({}, data, { tool_name: cursorMcpToolName(data) }), sessionId, now, Boolean(data.error || data.error_message))
+  }
+  if (eventName === 'beforeReadFile') {
+    return toolUse(Object.assign({ tool_name: 'ReadFile' }, data, {
+      tool_input: data.tool_input || data.toolInput || { file_path: data.file_path || data.path }
+    }), sessionId, now)
+  }
+  if (eventName === 'afterFileEdit') {
+    return postToolUse(Object.assign({ tool_name: 'EditFile' }, data, {
+      tool_input: data.tool_input || data.toolInput || { file_path: data.file_path || data.path }
+    }), sessionId, now, Boolean(data.error || data.error_message))
+  }
+  if (eventName === 'afterAgentResponse') {
+    const message = data.last_assistant_message || data.assistant_message || data.response || data.text || data.message
+    updateSession(sessionId, Object.assign(baseUpdates(data, now), {
+      lastAssistantMessage: message,
+      currentActivity: message,
+      lastEvent: { type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, timestamp: now, details: message }
+    }))
+    return
+  }
+  if (eventName === 'afterAgentThought') {
+    return updateActivity(data, sessionId, now, data.thought || data.text || data.message)
+  }
+  if (eventName === 'preToolUse') return toolUse(data, sessionId, now)
+  if (eventName === 'postToolUse') return postToolUse(data, sessionId, now, false)
+  if (eventName === 'stop') return stop(data, sessionId, now, false)
+}
+
+function notificationDetails(data) {
+  return data.question ||
+    data.message ||
+    data.text ||
+    data.reason ||
+    data.title ||
+    (data.details && typeof data.details === 'object' ? data.details.message || data.details.text || data.details.title : data.details)
+}
+
+function handleCoco(data, sessionId, eventName, now) {
+  const event = String(eventName || '').toLowerCase()
+  if (event === 'session_start') return sessionStart(data, sessionId, now, data.session_title)
+  if (event === 'session_end') return sessionEnd(data, sessionId, now)
+  if (event === 'user_prompt_submit') {
+    return promptSubmit(data, sessionId, now, data.prompt || data.message || data.text || data.user_prompt)
+  }
+  if (event === 'pre_tool_use') {
+    const toolName = getToolName(data)
+    if (isQuestionTool(toolName)) return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Coco is asking for input in the terminal')
+    return toolUse(data, sessionId, now)
+  }
+  if (event === 'post_tool_use') return postToolUse(data, sessionId, now, false)
+  if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
+  if (event === 'permission_request' || event === 'permission_prompt') return permissionRequest(data, sessionId, now)
+  if (event === 'elicitation_dialog' || event === 'idle_prompt') {
+    return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Coco is asking for input in the terminal')
+  }
+  if (event === 'notification') {
+    const type = String(data.notification_type || data.notificationType || data.kind || data.type || '').toLowerCase()
+    if (type === 'elicitation_dialog' || type === 'idle_prompt') {
+      return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Coco is asking for input in the terminal')
+    }
+    if (type === 'permission_prompt') return permissionRequest(data, sessionId, now)
+    return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
+  }
+  if (event === 'stop') return stop(data, sessionId, now, false)
+  if (event === 'subagent_start') {
+    const childId = subagentId(data, now, 'coco')
+    return upsertSubagent(sessionId, childId, {
+      nickname: data.agent_name || data.agent_type || data.agentName || 'subagent',
+      title: titleFromPrompt(data.prompt || data.description || data.task, 'subagent'),
+      lastToolActivity: data.prompt || data.description || data.task || undefined,
+      phase: 'running',
+      startedAt: now,
+      updatedAt: now
+    })
+  }
+  if (event === 'subagent_stop') {
+    return removeSubagent(sessionId, subagentId(data, now, 'coco'), now, data.response || data.reason)
+  }
+  if (event === 'pre_compact') {
+    updateSession(sessionId, { currentActivity: 'Compacting conversation...', lastEvent: { type: AGENT_EVENTS.PRE_COMPACT, timestamp: now }, lastUpdated: now })
+  }
+  if (event === 'post_compact') return updateActivity(data, sessionId, now, 'Conversation compacted')
+}
+
+function hermesPrompt(data) {
+  return data.user_message ||
+    data.userMessage ||
+    data.prompt ||
+    data.message ||
+    data.input ||
+    (data.extra && (data.extra.user_message || data.extra.prompt || data.extra.message))
+}
+
+function hermesResponse(data) {
+  return data.last_assistant_message ||
+    data.assistant_message ||
+    data.response ||
+    data.output ||
+    data.text ||
+    data.message ||
+    (data.extra && (data.extra.last_assistant_message || data.extra.response || data.extra.output))
+}
+
+function handleHermes(data, sessionId, eventName, now) {
+  const event = String(eventName || '').toLowerCase()
+  if (event === 'on_session_start' || event === 'on_session_reset') {
+    return sessionStart(data, sessionId, now, data.session_title)
+  }
+  if (event === 'pre_llm_call') return promptSubmit(data, sessionId, now, hermesPrompt(data))
+  if (event === 'post_llm_call') {
+    return stop(Object.assign({}, data, { last_assistant_message: hermesResponse(data) }), sessionId, now, false)
+  }
+  if (event === 'pre_tool_call') {
+    const toolName = getToolName(data)
+    if (isQuestionTool(toolName)) return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Hermes is asking for input in the terminal')
+    return toolUse(data, sessionId, now)
+  }
+  if (event === 'post_tool_call') return postToolUse(data, sessionId, now, Boolean(data.error || data.error_message))
+  if (event === 'pre_approval_request') return permissionRequest(data, sessionId, now)
+  if (event === 'post_approval_response') {
+    return postToolUse(Object.assign({ tool_name: data.tool_name || data.toolName || 'approval' }, data), sessionId, now, false)
+  }
+  if (event === 'on_session_finalize') return sessionEnd(data, sessionId, now)
+  if (event === 'on_session_end') return stop(data, sessionId, now, false)
+  if (event === 'subagent_start') {
+    const childId = subagentId(data, now, 'hermes')
+    return upsertSubagent(sessionId, childId, {
+      nickname: data.agent_name || data.agent_type || data.agentName || 'subagent',
+      title: titleFromPrompt(data.prompt || data.description || data.task, 'subagent'),
+      lastToolActivity: data.prompt || data.description || data.task || undefined,
+      phase: 'running',
+      startedAt: now,
+      updatedAt: now
+    })
+  }
+  if (event === 'subagent_stop') {
+    return removeSubagent(sessionId, subagentId(data, now, 'hermes'), now, data.response || data.reason)
+  }
+}
+
 function handlePayload(data) {
   const eventName = getEventName(data)
   const sessionId = String(getSessionId(data))
@@ -409,8 +617,11 @@ function handlePayload(data) {
   if (agentType === 'kimi') return handleKimi(data, sessionId, eventName, now)
   if (agentType === 'copilot-cli') return handleCopilot(data, sessionId, eventName, now)
   if (agentType === 'opencode') return handleOpenCode(data, sessionId, eventName, now)
+  if (agentType === 'cursor') return handleCursor(data, sessionId, eventName, now)
+  if (agentType === 'coco') return handleCoco(data, sessionId, eventName, now)
+  if (agentType === 'hermes') return handleHermes(data, sessionId, eventName, now)
 
-  if (/sessionstart/i.test(eventName)) return sessionStart(data, sessionId, now)
+  if (/session[_-]?start/i.test(eventName)) return sessionStart(data, sessionId, now)
   if (/prompt/i.test(eventName)) return promptSubmit(data, sessionId, now, data.prompt || data.message)
   if (/pre.*tool|before.*tool/i.test(eventName)) return toolUse(data, sessionId, now)
   if (/post.*tool|after.*tool/i.test(eventName)) return postToolUse(data, sessionId, now, false)

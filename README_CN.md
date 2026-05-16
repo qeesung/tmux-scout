@@ -123,6 +123,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 ### Agent 颜色
 
 选择器和会话详情中的 agent 标签会使用来自对应产品品牌色系的终端颜色。`xterm` 是 tmux/fzf 中使用的 256 色前景色代码。
+运行 `npm run agent-colors` 可以在当前终端中预览这些颜色。
 
 | Agent | 品牌色 | xterm |
 |---|---:|---:|

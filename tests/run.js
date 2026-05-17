@@ -934,21 +934,38 @@ test('agent registry provides display metadata and process scoring', () => {
 test('README agent color tables match registry', () => {
   function readColorRows(relativePath) {
     const lines = fs.readFileSync(path.join(__dirname, '..', relativePath), 'utf-8').split('\n')
-    const headerIndex = lines.findIndex(line => /^\| Agent \| .*xterm \|$/.test(line))
+    const headerIndex = lines.findIndex(line => /^\| Agent \| .*\| .*\| .*(?:color|颜色) \|$/i.test(line))
     assert.ok(headerIndex >= 0, `${relativePath} is missing agent color table`)
 
     const rows = []
     for (const line of lines.slice(headerIndex + 2)) {
       if (!line.startsWith('|')) break
       const cells = line.split('|').slice(1, -1).map(cell => cell.trim().replace(/`/g, ''))
-      rows.push({ agent: cells[0], brandColor: cells[1], xterm: cells[2] })
+      const [, colorHex] = cells[3].match(/(#[0-9a-f]{6})/i) || []
+      rows.push({
+        agent: cells[0],
+        label: cells[1],
+        flag: cells[2],
+        colorHex
+      })
     }
     return rows
   }
 
-  const expected = agentColorRows()
+  const expected = agentColorRows().map(row => ({
+    agent: row.agent,
+    label: row.label,
+    flag: row.flag,
+    colorHex: row.colorHex
+  }))
   assert.deepStrictEqual(readColorRows('README.md'), expected)
   assert.deepStrictEqual(readColorRows('README_CN.md'), expected)
+  const englishReadme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf-8')
+  const chineseReadme = fs.readFileSync(path.join(__dirname, '..', 'README_CN.md'), 'utf-8')
+  assert.ok(!englishReadme.includes('Brand color'))
+  assert.ok(!englishReadme.includes('xterm'))
+  assert.ok(!chineseReadme.includes('品牌色'))
+  assert.ok(!chineseReadme.includes('xterm'))
 })
 
 test('hook runtime resolves the real agent pid from the hook parent chain', () => {

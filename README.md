@@ -120,22 +120,22 @@ Each line shows:
 - Session title (first prompt)
 - Current tool details (for working sessions)
 
-### Agent Colors
+### Supported Agents and Colors
 
-Agent labels in the picker and session details use terminal colors chosen from each product's brand palette. The `xterm` value is the 256-color foreground code used in tmux/fzf.
-Run `npm run agent-colors` to preview the colors in your terminal.
+tmux-scout currently supports the agent CLIs below. The color sample is the actual foreground color used for the agent label in tmux/fzf, shown with the standard 256-color terminal palette. Your terminal theme may render the final color slightly differently.
+Run `npm run agent-colors` to preview the same colors in your terminal.
 
-| Agent | Brand color | xterm |
-|---|---:|---:|
-| claude | `#d97757` | `38;5;173` |
-| codex | `#10a37f` | `38;5;36` |
-| opencode | `#fab283` | `38;5;216` |
-| gemini | `#4285f4` | `38;5;69` |
-| copilot | `#8534f3` | `38;5;99` |
-| cursor | `#edecec` | `38;5;255` |
-| kimi | `#0d0f14` | `38;5;246` |
-| hermes | `#e5c07b` | `38;5;180` |
-| Trae | `#32f08c` | `38;5;84` |
+| Agent | Picker label | Setup flag | User-visible color |
+|---|---|---|---|
+| Claude Code | `claude` | `--claude` | ![#d7875f](docs/agent-colors/claude.svg) warm orange (`#d7875f`) |
+| Codex | `codex` | `--codex` | ![#00af87](docs/agent-colors/codex.svg) green (`#00af87`) |
+| OpenCode | `opencode` | `--opencode` | ![#ffaf87](docs/agent-colors/opencode.svg) peach (`#ffaf87`) |
+| Gemini CLI | `gemini` | `--gemini` | ![#5f87ff](docs/agent-colors/gemini.svg) blue (`#5f87ff`) |
+| GitHub Copilot CLI | `copilot` | `--copilot-cli` | ![#875fff](docs/agent-colors/copilot.svg) purple (`#875fff`) |
+| Cursor Agent | `cursor` | `--cursor` | ![#eeeeee](docs/agent-colors/cursor.svg) near-white (`#eeeeee`) |
+| Kimi CLI | `kimi` | `--kimi` | ![#949494](docs/agent-colors/kimi.svg) gray (`#949494`) |
+| Hermes | `hermes` | `--hermes` | ![#d7af87](docs/agent-colors/hermes.svg) sand (`#d7af87`) |
+| Trae CLI | `Trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) bright green (`#5fff87`) |
 
 ### Status Bar
 

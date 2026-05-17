@@ -273,6 +273,11 @@ Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, and Tr
 
 ## Development
 
+Project internals:
+
+- [Agent Integration Guide](docs/agent-integration.md) explains how to add or maintain an agent integration.
+- [Session State Contract](docs/session-contract.md) documents the persisted session/event contract.
+
 ```bash
 npm run check   # Syntax-check project JavaScript files
 npm test        # Run focused unit tests

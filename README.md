@@ -279,6 +279,25 @@ npm test        # Run focused unit tests
 npm run ci      # Run both checks
 ```
 
+### Flow Fixtures and Debugging
+
+Agent lifecycle regressions can be captured as JSON flow fixtures under `tests/fixtures/flow/<agent>/`.
+Each fixture replays real hook entrypoints into an isolated `HOME` and asserts the final session snapshot,
+state contract, and expected evidence stream.
+
+Useful debug commands:
+
+```bash
+node scripts/debug.js list
+node scripts/debug.js show <session-id> --plain
+node scripts/debug.js evidence <session-id>
+node scripts/debug.js inject --session-id debug-wait --agent codex --phase waitingForApproval
+node scripts/debug.js replay tests/fixtures/flow/claude/approval.json --show
+```
+
+The same commands are available through `scripts/setup.sh debug ...` when you want tmux-scout to restore
+the PATH captured from tmux.
+
 ## License
 
 MIT

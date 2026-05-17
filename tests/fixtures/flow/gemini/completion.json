@@ -1,0 +1,58 @@
+{
+  "name": "gemini completion flow",
+  "agent": "gemini",
+  "sessionId": "fixture-gemini-completion",
+  "payloadDefaults": {
+    "session_id": "fixture-gemini-completion",
+    "cwd": "/tmp/tmux-scout-fixtures/gemini"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "BeforeAgent",
+        "prompt": "summarize the project"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "BeforeTool",
+        "tool_name": "Shell",
+        "tool_input": {
+          "command": "npm test"
+        }
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "AfterTool",
+        "tool_name": "Shell",
+        "tool_input": {
+          "command": "npm test"
+        }
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "AfterAgent",
+        "prompt_response": "done"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "gemini",
+    "status": "completed",
+    "phase": "completed",
+    "needsAttention": null,
+    "pendingInteraction": null,
+    "pendingToolUse": null,
+    "activeTool": null,
+    "sessionTitle": "summarize the project",
+    "lastAssistantMessage": "done"
+  },
+  "expectEvidenceTypes": [
+    "prompt_submit",
+    "tool_use",
+    "post_tool_use",
+    "stop"
+  ]
+}

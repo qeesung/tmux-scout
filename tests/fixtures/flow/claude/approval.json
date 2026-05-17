@@ -1,0 +1,48 @@
+{
+  "name": "claude approval flow",
+  "agent": "claude",
+  "sessionId": "fixture-claude-approval",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-approval",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "run the test suite"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "npm test"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "working",
+    "phase": "waitingForApproval",
+    "needsAttention": "waiting for approval",
+    "pendingInteraction.type": "approval",
+    "pendingInteraction.tool": "Bash",
+    "pendingToolUse.details": "Bash: npm test",
+    "activeTool": null,
+    "sessionTitle": "run the test suite"
+  },
+  "expectEvidenceTypes": [
+    "session_start",
+    "prompt_submit",
+    "permission_request"
+  ]
+}

@@ -20,14 +20,18 @@ const { markInterrupted: markClaudeInterrupted, ClaudeTranscriptWatchManager } =
 const { startOptionalBridge, optionEnabled: watcherOptionEnabled } = require('../scripts/watcher')
 const { AGENT_EVENTS, normalizeAgentEventType, createAgentEvent } = require('../scripts/lib/agent-events')
 const {
+  FIELD_TYPES,
   SESSION_CONTRACT_VERSION,
   SESSION_PHASES,
+  SESSION_SCHEMAS,
   phaseFromLegacyStatus,
   phaseForAgentEvent,
   statusForPhase,
+  validateAgainstSchema,
   validateAgentEvent,
   validateSessionSnapshot
 } = require('../scripts/lib/session-contract')
+const { collectFixtureFiles, runFlowFixture, validateFixtureExpectations } = require('../scripts/lib/flow-fixtures')
 const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
@@ -1112,6 +1116,73 @@ test('session contract validates factual state invariants', () => {
   assert.ok(invalid.errors.includes('session.phase is required and must be canonical'))
 })
 
+test('session contract exports runtime schemas for debug and fixtures', () => {
+  assert.strictEqual(SESSION_SCHEMAS.AgentEvent.required.type, FIELD_TYPES.STRING)
+  assert.strictEqual(SESSION_SCHEMAS.SessionSnapshot.required.sessionId, FIELD_TYPES.STRING)
+  assert.strictEqual(SESSION_SCHEMAS.PendingInteraction.required.phase, FIELD_TYPES.STRING)
+  assert.strictEqual(SESSION_SCHEMAS.StateEvidence.required.timestamp, FIELD_TYPES.NUMBER)
+
+  const shape = validateAgainstSchema({
+    type: 'prompt_submit',
+    timestamp: 1000,
+    source: 'hook'
+  }, SESSION_SCHEMAS.AgentEvent)
+  assert.strictEqual(shape.valid, true)
+  assert.deepStrictEqual(shape.errors, [])
+  assert.deepStrictEqual(shape.warnings, [])
+
+  const invalidShape = validateAgainstSchema({
+    type: 'prompt_submit',
+    pendingToolUse: 'Bash'
+  }, SESSION_SCHEMAS.AgentEvent)
+  assert.strictEqual(invalidShape.valid, true)
+  assert.ok(invalidShape.warnings.includes('AgentEvent.pendingToolUse should be object when present'))
+})
+
+test('agent flow fixtures replay through real hook entrypoints', () => {
+  const files = collectFixtureFiles()
+  assert.ok(files.length >= 3)
+  for (const file of files) {
+    const result = runFlowFixture(file)
+    try {
+      assert.deepStrictEqual(result.errors, [], `${result.fixture.name}: ${result.errors.join('; ')}`)
+      assert.deepStrictEqual(result.warnings, [], `${result.fixture.name}: ${result.warnings.join('; ')}`)
+      assert.ok(result.session, `${result.fixture.name}: missing session`)
+    } finally {
+      result.cleanup()
+    }
+  }
+})
+
+test('flow fixture expectations can read status-prefixed paths', () => {
+  const session = {
+    sessionId: 'status-path-session',
+    agentType: 'claude',
+    phase: 'idle',
+    status: 'idle',
+    stateEvidence: []
+  }
+  const status = {
+    version: 1,
+    lastUpdated: 123,
+    sessions: {
+      [session.sessionId]: session
+    }
+  }
+  const result = validateFixtureExpectations({
+    name: 'status path fixture',
+    sessionId: session.sessionId,
+    expect: {
+      'status.version': 1,
+      'status.sessions.status-path-session.agentType': 'claude',
+      phase: 'idle'
+    }
+  }, status, session)
+
+  assert.deepStrictEqual(result.errors, [])
+  assert.deepStrictEqual(result.warnings, [])
+})
+
 test('codex hook enriches sessions with compact session meta fields', () => {
   const fields = codexHook.codexSessionMetaFields({
     _session_meta: {
@@ -1436,6 +1507,52 @@ test('session details render as an information panel', () => {
   assert.ok(plain.includes('source=process-tree'))
   assert.ok(plain.includes('State Stream'))
   assert.ok(plain.includes('PermissionRequest'))
+})
+
+test('debug CLI injects mock sessions and prints evidence', () => {
+  const dir = tempDir()
+  try {
+    const injectOutput = runScriptOutput('scripts/debug.js', [
+      'inject',
+      '--home', dir,
+      '--session-id', 'debug-wait',
+      '--agent', 'codex',
+      '--phase', 'waitingForApproval',
+      '--title', 'debug approval',
+      '--details', 'Bash: npm test'
+    ], dir)
+    assert.ok(injectOutput.includes('Injected debug-wait'))
+
+    const session = readScoutStatus(dir).sessions['debug-wait']
+    assert.strictEqual(session.agentType, 'codex')
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+    assert.strictEqual(session.stateEvidence[0].source, 'debug')
+
+    const output = runScriptOutput('scripts/debug.js', ['evidence', 'debug-wait', '--home', dir], dir)
+    assert.ok(output.includes('debug-wait'))
+    assert.ok(output.includes('debug:inject'))
+    assert.ok(output.includes('waitingForApproval'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('debug CLI replays flow fixtures into a supplied home', () => {
+  const dir = tempDir()
+  try {
+    const fixture = path.join(__dirname, 'fixtures', 'flow', 'claude', 'approval.json')
+    const output = stripAnsi(runScriptOutput('scripts/debug.js', ['replay', fixture, '--home', dir, '--show'], dir))
+    assert.ok(output.includes('Fixture: claude approval flow'))
+    assert.ok(output.includes('Result: ok'))
+    assert.ok(output.includes('tmux-scout | session'))
+
+    const session = readScoutStatus(dir).sessions['fixture-claude-approval']
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('generic hook tracks Gemini prompt, tool and completion events', () => {

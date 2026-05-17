@@ -279,6 +279,24 @@ npm test        # 运行聚焦单元测试
 npm run ci      # 同时运行以上检查
 ```
 
+### Flow Fixture 与调试
+
+Agent 生命周期回归可以沉淀为 `tests/fixtures/flow/<agent>/` 下的 JSON fixture。
+每个 fixture 都会把真实 hook 入口回放到隔离的 `HOME` 中，并校验最终 session snapshot、
+状态契约以及期望的 evidence stream。
+
+常用调试命令：
+
+```bash
+node scripts/debug.js list
+node scripts/debug.js show <session-id> --plain
+node scripts/debug.js evidence <session-id>
+node scripts/debug.js inject --session-id debug-wait --agent codex --phase waitingForApproval
+node scripts/debug.js replay tests/fixtures/flow/claude/approval.json --show
+```
+
+如果希望沿用 tmux 加载插件时捕获的 PATH，也可以通过 `scripts/setup.sh debug ...` 调用同一组命令。
+
 ## 许可证
 
 MIT

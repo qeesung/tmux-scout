@@ -71,11 +71,12 @@ const AGENTS = [
   },
   {
     id: 'coco',
-    label: 'coco',
+    aliases: ['trae'],
+    label: 'Trae',
     brandColor: '#32f08c',
     color: '38;5;84',
-    processNames: ['coco'],
-    commandIncludes: ['/coco']
+    processNames: ['trae', 'coco'],
+    commandIncludes: ['traecli', '/trae', '/coco']
   }
 ]
 

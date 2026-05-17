@@ -167,7 +167,7 @@ function isQuestionTool(toolName) {
 function isPermissionTool(agent, toolName) {
   const name = String(toolName || '').toLowerCase()
   if (agent === 'gemini') return false
-  if (agent === 'coco' || agent === 'cursor' || agent === 'hermes') return false
+  if (agent === 'coco' || agent === 'trae' || agent === 'cursor' || agent === 'hermes') return false
   if (agent === 'copilot-cli') {
     return !new Set([
       'view', 'glob', 'grep', 'rg', 'readbash', 'readpowershell',
@@ -514,26 +514,26 @@ function handleCoco(data, sessionId, eventName, now) {
   }
   if (event === 'pre_tool_use') {
     const toolName = getToolName(data)
-    if (isQuestionTool(toolName)) return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Coco is asking for input in the terminal')
+    if (isQuestionTool(toolName)) return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
     return toolUse(data, sessionId, now)
   }
   if (event === 'post_tool_use') return postToolUse(data, sessionId, now, false)
   if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
   if (event === 'permission_request' || event === 'permission_prompt') return permissionRequest(data, sessionId, now)
   if (event === 'elicitation_dialog' || event === 'idle_prompt') {
-    return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Coco is asking for input in the terminal')
+    return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
   }
   if (event === 'notification') {
     const type = String(data.notification_type || data.notificationType || data.kind || data.type || '').toLowerCase()
     if (type === 'elicitation_dialog' || type === 'idle_prompt') {
-      return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Coco is asking for input in the terminal')
+      return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
     }
     if (type === 'permission_prompt') return permissionRequest(data, sessionId, now)
     return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
   }
   if (event === 'stop') return stop(data, sessionId, now, false)
   if (event === 'subagent_start') {
-    const childId = subagentId(data, now, 'coco')
+    const childId = subagentId(data, now, agentType)
     return upsertSubagent(sessionId, childId, {
       nickname: data.agent_name || data.agent_type || data.agentName || 'subagent',
       title: titleFromPrompt(data.prompt || data.description || data.task, 'subagent'),
@@ -544,7 +544,7 @@ function handleCoco(data, sessionId, eventName, now) {
     })
   }
   if (event === 'subagent_stop') {
-    return removeSubagent(sessionId, subagentId(data, now, 'coco'), now, data.response || data.reason)
+    return removeSubagent(sessionId, subagentId(data, now, agentType), now, data.response || data.reason)
   }
   if (event === 'pre_compact') {
     updateSession(sessionId, { currentActivity: 'Compacting conversation...', lastEvent: { type: AGENT_EVENTS.PRE_COMPACT, timestamp: now }, lastUpdated: now })
@@ -618,7 +618,7 @@ function handlePayload(data) {
   if (agentType === 'copilot-cli') return handleCopilot(data, sessionId, eventName, now)
   if (agentType === 'opencode') return handleOpenCode(data, sessionId, eventName, now)
   if (agentType === 'cursor') return handleCursor(data, sessionId, eventName, now)
-  if (agentType === 'coco') return handleCoco(data, sessionId, eventName, now)
+  if (agentType === 'coco' || agentType === 'trae') return handleCoco(data, sessionId, eventName, now)
   if (agentType === 'hermes') return handleHermes(data, sessionId, eventName, now)
 
   if (/session[_-]?start/i.test(eventName)) return sessionStart(data, sessionId, now)

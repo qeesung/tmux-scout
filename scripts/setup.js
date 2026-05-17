@@ -281,7 +281,7 @@ function doDebug() {
 
 // Main dispatch
 if (!command || !['install', 'uninstall', 'status', 'doctor', 'debug', 'watcher', 'watchdog'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status|doctor|debug|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--coco] [--quiet] [--any]')
+  console.log('Usage: node setup.js <install|uninstall|status|doctor|debug|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--trae] [--quiet] [--any]')
   console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
   console.log('       node setup.js debug <list|show|evidence|inject|replay> [...]')
   process.exit(command ? 1 : 0)

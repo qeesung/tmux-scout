@@ -69,8 +69,9 @@ const HOOK_MANAGERS = [
   },
   {
     id: 'coco',
-    flag: '--coco',
-    label: 'Coco CLI',
+    flag: '--trae',
+    aliases: ['--coco'],
+    label: 'Trae CLI',
     detail: '(~/.trae/traecli.yaml)',
     module: coco
   }
@@ -83,9 +84,13 @@ for (const manager of HOOK_MANAGERS) {
 
 function selectManagers(flags) {
   const selectedFlags = flags || new Set()
-  const hasAgentFlag = HOOK_MANAGERS.some(manager => selectedFlags.has(manager.flag))
+  const hasAgentFlag = HOOK_MANAGERS.some(manager => managerFlags(manager).some(flag => selectedFlags.has(flag)))
   if (!hasAgentFlag) return [...HOOK_MANAGERS]
-  return HOOK_MANAGERS.filter(manager => selectedFlags.has(manager.flag))
+  return HOOK_MANAGERS.filter(manager => managerFlags(manager).some(flag => selectedFlags.has(flag)))
+}
+
+function managerFlags(manager) {
+  return [manager.flag, ...(manager.aliases || [])]
 }
 
 function claudeHealth(manager, status) {

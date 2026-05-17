@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// tmux-scout Coco / Trae CLI hook management.
+// tmux-scout Trae CLI hook management.
 
 const fs = require('fs')
 const path = require('path')
@@ -8,6 +8,7 @@ const { buildNodeHookCommand, extractHookPathFromCommand } = require('../lib/hoo
 
 const HOOK_PATH = path.join(__dirname, '..', 'hooks', 'generic.js')
 const HOOK_IDENTIFIER = 'tmux-scout/scripts/hooks/generic.js'
+const MANAGED_AGENT_NAMES = ['trae', 'coco']
 const HOOK_EVENTS = [
   { event: 'user_prompt_submit' },
   { event: 'pre_tool_use' },
@@ -58,12 +59,14 @@ function writeAtomic(filePath, content) {
 }
 
 function command() {
-  return buildNodeHookCommand(HOOK_PATH, ['--agent', 'coco'])
+  return buildNodeHookCommand(HOOK_PATH, ['--agent', 'trae'])
 }
 
 function containsScoutHook(text) {
   const value = String(text || '')
-  return (value.includes(HOOK_IDENTIFIER) || value.includes(HOOK_PATH)) && value.includes('--agent') && value.includes('coco')
+  return (value.includes(HOOK_IDENTIFIER) || value.includes(HOOK_PATH)) &&
+    value.includes('--agent') &&
+    MANAGED_AGENT_NAMES.some(agent => value.includes(agent))
 }
 
 function yamlString(value) {
@@ -173,7 +176,7 @@ function install() {
 
 function uninstall() {
   const targets = configCandidates().filter(candidate => fs.existsSync(candidate))
-  if (targets.length === 0) return { skipped: true, reason: 'Coco config not found' }
+  if (targets.length === 0) return { skipped: true, reason: 'Trae config not found' }
   let removed = false
   for (const target of targets) {
     const original = readConfig(target)
@@ -215,8 +218,8 @@ if (require.main === module) {
   const cmd = process.argv[2]
   const r = cmd === 'install' ? install() : cmd === 'uninstall' ? uninstall() : status()
   if (cmd === 'status' || !cmd) {
-    console.log(`Coco: ${r.installed === r.total ? 'hook installed' : 'hook not installed'}`)
+    console.log(`Trae: ${r.installed === r.total ? 'hook installed' : 'hook not installed'}`)
   } else {
-    console.log(`Coco: ${r.skipped ? r.reason : 'ok'}`)
+    console.log(`Trae: ${r.skipped ? r.reason : 'ok'}`)
   }
 }

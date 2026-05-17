@@ -38,7 +38,7 @@ const statusBar = require('../scripts/status-bar')
 const sync = require('../scripts/picker/sync')
 const { agentColorRows } = require('../scripts/dev/agent-colors')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
-const { HOOK_EVENTS: COCO_HOOK_EVENTS } = require('../scripts/setup/coco')
+const { HOOK_EVENTS: TRAE_HOOK_EVENTS } = require('../scripts/setup/coco')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
 const claudeHook = require('../scripts/hooks/claude')
 const codexHook = require('../scripts/hooks/codex')
@@ -265,6 +265,8 @@ test('setup manager registry selects agent managers by flags', () => {
   assert.deepStrictEqual(selectManagers(new Set(['--codex', '--quiet'])).map(manager => manager.id), ['codex'])
   assert.deepStrictEqual(selectManagers(new Set(['--copilot-cli'])).map(manager => manager.id), ['copilot-cli'])
   assert.deepStrictEqual(selectManagers(new Set(['--cursor'])).map(manager => manager.id), ['cursor'])
+  assert.deepStrictEqual(selectManagers(new Set(['--trae'])).map(manager => manager.id), ['coco'])
+  assert.deepStrictEqual(selectManagers(new Set(['--coco'])).map(manager => manager.id), ['coco'])
 })
 
 test('setup manager health normalizes partial hook states', () => {
@@ -367,7 +369,7 @@ test('Cursor setup manager preserves third-party hooks', () => {
   }
 })
 
-test('Coco setup manager preserves unrelated YAML and hooks', () => {
+test('Trae setup manager preserves unrelated YAML and hooks', () => {
   const dir = tempDir()
   try {
     const settingsPath = path.join(dir, '.trae', 'traecli.yaml')
@@ -390,7 +392,7 @@ test('Coco setup manager preserves unrelated YAML and hooks', () => {
     assert.ok(installed.includes('allowed_tools:'))
     assert.ok(installed.includes('command: "echo keep"'))
     assert.ok(installed.includes('--agent'))
-    assert.ok(installed.includes('coco'))
+    assert.ok(installed.includes('trae'))
     assert.ok(installed.includes('event: permission_request'))
     assert.ok(installed.includes('timeout: 86400'))
     assert.ok(installed.indexOf('event: permission_request') < installed.indexOf('model: default'))
@@ -398,13 +400,13 @@ test('Coco setup manager preserves unrelated YAML and hooks', () => {
     runScript('scripts/setup/coco.js', ['uninstall'], dir)
     const removed = fs.readFileSync(settingsPath, 'utf-8')
     assert.ok(removed.includes('command: "echo keep"'))
-    assert.ok(!removed.includes('--agent') || !removed.includes('coco'))
+    assert.ok(!removed.includes('--agent') || !removed.includes('trae'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('Coco setup manager removes managed hook matcher blocks cleanly', () => {
+test('Trae setup manager removes managed hook matcher blocks cleanly', () => {
   const dir = tempDir()
   try {
     const settingsPath = path.join(dir, '.trae', 'traecli.yaml')
@@ -416,13 +418,13 @@ test('Coco setup manager removes managed hook matcher blocks cleanly', () => {
 
     const reinstalled = fs.readFileSync(settingsPath, 'utf-8')
     const matcherLines = reinstalled.split('\n').filter(line => /^        - event: /.test(line))
-    assert.strictEqual(matcherLines.length, COCO_HOOK_EVENTS.length)
+    assert.strictEqual(matcherLines.length, TRAE_HOOK_EVENTS.length)
 
     runScript('scripts/setup/coco.js', ['uninstall'], dir)
     const removed = fs.readFileSync(settingsPath, 'utf-8')
     assert.ok(removed.includes('model: default'))
     assert.strictEqual(removed.split('\n').filter(line => /^        - event: /.test(line)).length, 0)
-    assert.ok(!removed.includes('--agent') || !removed.includes('coco'))
+    assert.ok(!removed.includes('--agent') || !removed.includes('trae'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -502,7 +504,7 @@ test('Hermes setup manager appends to commented existing event headers', () => {
   }
 })
 
-test('Coco setup manager preserves YAML without hooks and trailing newline', () => {
+test('Trae setup manager preserves YAML without hooks and trailing newline', () => {
   const dir = tempDir()
   try {
     const settingsPath = path.join(dir, '.trae', 'traecli.yaml')
@@ -514,7 +516,7 @@ test('Coco setup manager preserves YAML without hooks and trailing newline', () 
     const installed = fs.readFileSync(settingsPath, 'utf-8')
     assert.ok(installed.startsWith('model: default\n\nhooks:\n'))
     assert.ok(installed.includes('--agent'))
-    assert.ok(installed.includes('coco'))
+    assert.ok(installed.includes('trae'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -1669,17 +1671,17 @@ test('generic hook tracks Cursor prompt, shell and stop events', () => {
   }
 })
 
-test('generic hook maps Coco permission requests', () => {
+test('generic hook maps Trae permission requests', () => {
   const dir = tempDir()
   try {
-    const sessionId = 'coco-session'
-    runGenericHook('coco', {
+    const sessionId = 'trae-session'
+    runGenericHook('trae', {
       hook_event_name: 'user_prompt_submit',
       session_id: sessionId,
       cwd: '/tmp/demo',
       prompt: 'change the build script'
     }, dir)
-    runGenericHook('coco', {
+    runGenericHook('trae', {
       hook_event_name: 'permission_request',
       session_id: sessionId,
       cwd: '/tmp/demo',
@@ -1688,7 +1690,7 @@ test('generic hook maps Coco permission requests', () => {
     }, dir)
 
     const session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(session.agentType, 'coco')
+    assert.strictEqual(session.agentType, 'trae')
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.tool, 'Bash')

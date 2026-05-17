@@ -120,22 +120,22 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 - 会话标题（首条提示）
 - 当前工具详情（工作中的会话）
 
-### Agent 颜色
+### 支持的 Agent 和颜色
 
-选择器和会话详情中的 agent 标签会使用来自对应产品品牌色系的终端颜色。`xterm` 是 tmux/fzf 中使用的 256 色前景色代码。
-运行 `npm run agent-colors` 可以在当前终端中预览这些颜色。
+tmux-scout 目前支持下表中的 agent CLI。颜色示例是 tmux/fzf 中 agent 标签实际使用的前景色，按标准 256 色终端调色板展示；不同终端主题可能会有轻微差异。
+运行 `npm run agent-colors` 可以在当前终端中预览同一组颜色。
 
-| Agent | 品牌色 | xterm |
-|---|---:|---:|
-| claude | `#d97757` | `38;5;173` |
-| codex | `#10a37f` | `38;5;36` |
-| opencode | `#fab283` | `38;5;216` |
-| gemini | `#4285f4` | `38;5;69` |
-| copilot | `#8534f3` | `38;5;99` |
-| cursor | `#edecec` | `38;5;255` |
-| kimi | `#0d0f14` | `38;5;246` |
-| hermes | `#e5c07b` | `38;5;180` |
-| Trae | `#32f08c` | `38;5;84` |
+| Agent | 选择器显示 | 安装参数 | 用户看到的颜色 |
+|---|---|---|---|
+| Claude Code | `claude` | `--claude` | ![#d7875f](docs/agent-colors/claude.svg) 暖橙色 (`#d7875f`) |
+| Codex | `codex` | `--codex` | ![#00af87](docs/agent-colors/codex.svg) 绿色 (`#00af87`) |
+| OpenCode | `opencode` | `--opencode` | ![#ffaf87](docs/agent-colors/opencode.svg) 桃色 (`#ffaf87`) |
+| Gemini CLI | `gemini` | `--gemini` | ![#5f87ff](docs/agent-colors/gemini.svg) 蓝色 (`#5f87ff`) |
+| GitHub Copilot CLI | `copilot` | `--copilot-cli` | ![#875fff](docs/agent-colors/copilot.svg) 紫色 (`#875fff`) |
+| Cursor Agent | `cursor` | `--cursor` | ![#eeeeee](docs/agent-colors/cursor.svg) 近白色 (`#eeeeee`) |
+| Kimi CLI | `kimi` | `--kimi` | ![#949494](docs/agent-colors/kimi.svg) 灰色 (`#949494`) |
+| Hermes | `hermes` | `--hermes` | ![#d7af87](docs/agent-colors/hermes.svg) 沙色 (`#d7af87`) |
+| Trae CLI | `Trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) 亮绿色 (`#5fff87`) |
 
 ### 状态栏
 

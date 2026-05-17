@@ -270,10 +270,20 @@ function doDoctor() {
   process.exit(result.status || 0)
 }
 
+function doDebug() {
+  const commandIndex = args.indexOf(command)
+  const debugArgs = args.slice(commandIndex + 1)
+  const result = spawnSync(process.execPath, [path.join(__dirname, 'debug.js'), ...debugArgs], {
+    stdio: 'inherit'
+  })
+  process.exit(result.status || 0)
+}
+
 // Main dispatch
-if (!command || !['install', 'uninstall', 'status', 'doctor', 'watcher', 'watchdog'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status|doctor|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--coco] [--quiet] [--any]')
+if (!command || !['install', 'uninstall', 'status', 'doctor', 'debug', 'watcher', 'watchdog'].includes(command)) {
+  console.log('Usage: node setup.js <install|uninstall|status|doctor|debug|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--coco] [--quiet] [--any]')
   console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
+  console.log('       node setup.js debug <list|show|evidence|inject|replay> [...]')
   process.exit(command ? 1 : 0)
 }
 
@@ -282,6 +292,7 @@ try {
   else if (command === 'uninstall') doUninstall()
   else if (command === 'status') doStatus()
   else if (command === 'doctor') doDoctor()
+  else if (command === 'debug') doDebug()
   else if (command === 'watcher' || command === 'watchdog') doWatcher()
 } catch (e) {
   console.error('Error: ' + e.message)

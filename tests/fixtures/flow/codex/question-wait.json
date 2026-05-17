@@ -1,0 +1,46 @@
+{
+  "name": "codex answer wait flow",
+  "agent": "codex",
+  "sessionId": "fixture-codex-question",
+  "payloadDefaults": {
+    "session_id": "fixture-codex-question",
+    "cwd": "/tmp/tmux-scout-fixtures/codex",
+    "turn_id": "turn-codex-question"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "choose an implementation"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "Stop",
+        "last_assistant_message": "Which implementation should I use?\n1. Keep the current API\n2. Add a new adapter"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "codex",
+    "status": "working",
+    "phase": "waitingForAnswer",
+    "needsAttention": "waiting for answer",
+    "pendingInteraction.type": "question",
+    "pendingInteraction.turnId": "turn-codex-question",
+    "pendingToolUse": null,
+    "activeTool": null,
+    "lastEvent.type": "question_asked"
+  },
+  "expectEvidenceTypes": [
+    "session_start",
+    "prompt_submit",
+    "question_asked"
+  ]
+}

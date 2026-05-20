@@ -5,8 +5,9 @@ const path = require('path')
 const os = require('os')
 const net = require('net')
 const { applySessionEvent } = require('./session-state')
-const { createAgentEvent } = require('./agent-events')
+const { AGENT_EVENTS, createAgentEvent } = require('./agent-events')
 const { hookRuntimeContext } = require('./terminal-context')
+const { deleteSession: deleteRegistrySession, safeSessionId } = require('./session-registry')
 
 const LIFECYCLE_FIELDS = new Set([
   'status',
@@ -83,10 +84,6 @@ function readStdin() {
     process.stdin.on('end', () => resolve(input))
     process.stdin.on('error', () => resolve(input))
   })
-}
-
-function safeSessionId(sessionId) {
-  return String(sessionId).replace(/[/\\:]/g, '_')
 }
 
 function liveSessionState(updates) {
@@ -179,6 +176,16 @@ function updateSessionDirect(config, paths, sessionId, updates) {
 
   const lifecycleEvent = createLifecycleEvent(nextUpdates, adapterConfig)
   delete nextUpdates.lifecycleEvent
+
+  if (lifecycleEvent && lifecycleEvent.type === AGENT_EVENTS.SESSION_DELETE) {
+    const status = readStatus(paths)
+    const result = deleteRegistrySession(status, paths, sessionId, lifecycleEvent.reason || lifecycleEvent.details || 'session_delete')
+    if (result.changed) {
+      status.lastUpdated = Date.now()
+      writeJsonAtomic(paths.statusFile, status)
+    }
+    return null
+  }
 
   for (const [key, value] of Object.entries(nextUpdates)) {
     if (lifecycleEvent && LIFECYCLE_FIELDS.has(key)) continue

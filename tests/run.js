@@ -34,6 +34,7 @@ const {
 } = require('../scripts/lib/session-contract')
 const { collectFixtureFiles, runFlowFixture, validateFixtureExpectations } = require('../scripts/lib/flow-fixtures')
 const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
+const { DEFAULT_TERMINAL_DISPLAY_MS } = require('../scripts/lib/session-registry')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
 const sync = require('../scripts/picker/sync')
@@ -1370,10 +1371,44 @@ test('bridge server serializes hook updates through the same reducer', async () 
   }
 })
 
+test('bridge server applies session delete events to the registry', async () => {
+  const dir = tempDir()
+  let bridge
+  try {
+    const paths = defaultPaths(dir)
+    bridge = await startBridgeServer({ paths })
+    const context = createHookContext({
+      agentType: 'gemini',
+      defaultStateSource: 'gemini-hooks',
+      paths
+    })
+
+    context.updateSession('delete-session', {
+      status: 'working',
+      lastEvent: { type: AGENT_EVENTS.PROMPT_SUBMIT, timestamp: 1000, details: 'hello' }
+    })
+    await context.flush()
+    assert.ok(fs.existsSync(path.join(paths.sessionsDir, 'delete-session.json')))
+
+    context.updateSession('delete-session', {
+      lastEvent: { type: AGENT_EVENTS.SESSION_DELETE, timestamp: 2000, details: 'dismissed' }
+    })
+    await context.flush()
+
+    const status = JSON.parse(fs.readFileSync(paths.statusFile, 'utf-8'))
+    assert.strictEqual(status.sessions['delete-session'], undefined)
+    assert.strictEqual(fs.existsSync(path.join(paths.sessionsDir, 'delete-session.json')), false)
+  } finally {
+    if (bridge) bridge.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('agent event aliases normalize to persisted event names', () => {
   assert.strictEqual(normalizeAgentEventType('sessionStarted'), AGENT_EVENTS.SESSION_START)
   assert.strictEqual(normalizeAgentEventType('toolUseStarted'), AGENT_EVENTS.TOOL_USE)
   assert.strictEqual(normalizeAgentEventType('subagentStarted'), AGENT_EVENTS.SUBAGENT_START)
+  assert.strictEqual(normalizeAgentEventType('sessionDeleted'), AGENT_EVENTS.SESSION_DELETE)
   assert.strictEqual(normalizeAgentEventType('permissionResolved'), AGENT_EVENTS.PERMISSION_RESOLVED)
   assert.strictEqual(normalizeAgentEventType('questionAnswered'), AGENT_EVENTS.QUESTION_ANSWERED)
   assert.strictEqual(normalizeAgentEventType(AGENT_EVENTS.PERMISSION_REQUEST), AGENT_EVENTS.PERMISSION_REQUEST)
@@ -1408,6 +1443,7 @@ test('session contract maps events to canonical phases', () => {
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.PANE_STATE, status: 'crashed', needsAttention: 'waiting for approval' }), SESSION_PHASES.CRASHED)
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.TRANSCRIPT_STATUS, needsAttention: 'waiting for answer' }), SESSION_PHASES.WAITING_FOR_ANSWER)
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.PROCESS_EXIT_DETECTED }), SESSION_PHASES.INTERRUPTED)
+  assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.SESSION_DELETE }), undefined)
 
   const valid = validateAgentEvent(createAgentEvent('toolUseStarted', {
     source: 'hook',
@@ -1417,6 +1453,13 @@ test('session contract maps events to canonical phases', () => {
   }))
   assert.strictEqual(valid.valid, true)
   assert.deepStrictEqual(valid.errors, [])
+
+  const deleteValid = validateAgentEvent(createAgentEvent('sessionDeleted', {
+    source: 'debug',
+    timestamp: 1000
+  }))
+  assert.strictEqual(deleteValid.valid, true)
+  assert.deepStrictEqual(deleteValid.errors, [])
 
   const invalid = validateAgentEvent({
     type: AGENT_EVENTS.TOOL_USE,
@@ -3024,6 +3067,50 @@ test('sync marks sessions stale when their tmux pane vanishes', () => {
     assert.strictEqual(reloaded.sessions.activeGhost.terminalKind, 'paneGone')
     assert.strictEqual(reloaded.sessions.live.status, 'completed')
     assert.strictEqual(reloaded.sessions.unbound.status, 'completed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync prunes terminal sessions after their display window expires', () => {
+  const dir = tempDir()
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    const sessionsDir = path.join(scoutDir, 'sessions')
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.mkdirSync(sessionsDir, { recursive: true })
+    const now = Date.now()
+    const oldEndedAt = now - DEFAULT_TERMINAL_DISPLAY_MS - 1000
+    const session = {
+      sessionId: 'old-stale',
+      agentType: 'claude',
+      status: 'stale',
+      phase: 'stale',
+      tmuxPane: '%9999',
+      startedAt: now - 120000,
+      lastUpdated: oldEndedAt,
+      endedAt: oldEndedAt
+    }
+    fs.writeFileSync(path.join(sessionsDir, 'old-stale.json'), JSON.stringify(session, null, 2))
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        'old-stale': session
+      }
+    }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      registryNow: now
+    })
+
+    assert.strictEqual(result.status.sessions['old-stale'], undefined)
+    assert.strictEqual(fs.existsSync(path.join(sessionsDir, 'old-stale.json')), false)
+    assert.strictEqual(result.stats.registry.deleted, 1)
+    assert.strictEqual(result.stats.registry.terminal, 1)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

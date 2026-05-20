@@ -12,6 +12,7 @@ const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-t
 const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { findLatestCodexInterrupt } = require('../lib/codex-transcript-detector')
+const { pruneSessions } = require('../lib/session-registry')
 
 let statusFile = process.argv[2] || ''
 let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') : ''
@@ -54,6 +55,13 @@ function createStats(options = {}) {
     },
     evidence: {
       written: 0
+    },
+    registry: {
+      deleted: 0,
+      expired: 0,
+      terminal: 0,
+      hidden: 0,
+      overflow: 0
     }
   }
 }
@@ -61,7 +69,7 @@ function createStats(options = {}) {
 function ensureStats(options = {}) {
   const defaults = createStats(options)
   const stats = options.stats || defaults
-  for (const key of ['reconcile', 'codex', 'claudeTranscript', 'evidence']) {
+  for (const key of ['reconcile', 'codex', 'claudeTranscript', 'evidence', 'registry']) {
     stats[key] = Object.assign({}, defaults[key], stats[key] || {})
   }
   if (!stats.mode) stats.mode = defaults.mode
@@ -538,6 +546,33 @@ function syncCodexSessions(status, panes, options = {}, stats) {
   pruneCodexTranscriptScanState(status, options)
 }
 
+function pruneRegistrySessions(status, stats, options = {}) {
+  if (options.registryPrune === false) return { changed: false, deleted: [] }
+  const result = pruneSessions(status, { sessionsDir }, {
+    now: Number.isFinite(options.registryNow) ? options.registryNow : undefined,
+    retentionMs: options.sessionRetentionMs,
+    terminalDisplayMs: options.terminalDisplayMs,
+    maxSessions: options.maxSessions
+  })
+  if (!result.changed) return result
+
+  const now = Date.now()
+  status.lastUpdated = now
+  writeJsonAtomic(statusFile, status)
+
+  if (stats && stats.registry) {
+    stats.registry.deleted += result.deleted.length
+    for (const item of result.deleted) {
+      if (item.reason === 'terminal') stats.registry.terminal++
+      else if (item.reason === 'hidden') stats.registry.hidden++
+      else if (item.reason === 'overflow') stats.registry.overflow++
+      else stats.registry.expired++
+    }
+  }
+  pruneCodexTranscriptScanState(status, options)
+  return result
+}
+
 // --- Claude transcript helpers ---
 
 function readFileTail(filePath, maxBytes) {
@@ -731,11 +766,12 @@ function run(file, options = {}) {
   syncCodexSessions(status, panes, options, stats)
   if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats)
   sweepIdleClaudeSessions(status, stats, options)
+  pruneRegistrySessions(status, stats, options)
   stats.durationMs = Date.now() - stats.startedAt
   return { status, panes, stats }
 }
 
-module.exports = { run, isWatcherRunning, clearPidStateCache, createStats, sweepVanishedPanes, sweepDeadProcesses }
+module.exports = { run, isWatcherRunning, clearPidStateCache, createStats, sweepVanishedPanes, sweepDeadProcesses, pruneRegistrySessions }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

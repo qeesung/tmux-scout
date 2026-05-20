@@ -257,13 +257,13 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 └── codex-original-notify.json       # 备份的原始 Codex notify 命令
 ```
 
-超过 24 小时的会话会被自动清理。
+tmux-scout 会保留当前仍可见或近期可见的会话。隐藏的内部会话以及终端态的 `STALE` / `CRASH` 行会在短暂展示窗口后移除；带有明确 `endedAt` 的快照最多保留 24 小时后清理。
 
 ## Agent 兼容说明
 
 tmux-scout 现在优先使用 Codex event hook，可以近实时同步会话开始、提示提交、工具执行、审批等待和回合完成状态。这套生命周期跟踪方式参考了 the reference app 的实现。
 
-在默认 watchdog 路径下，tmux-scout 仍以 hook 作为主状态源，并增加 参考实现风格的校正机制：进程/pane 生命周期检查、带 offset 缓存的 Codex transcript 尾部增量读取、较低频的 JSONL 发现，以及周期性全量 reconcile。快速路径不会反复全量读取所有 transcript。
+在默认 watchdog 路径下，tmux-scout 仍以 hook 作为主状态源，并增加 参考实现风格的校正机制：进程/pane 生命周期检查、带 offset 缓存的 Codex transcript 尾部增量读取、registry 清理，以及周期性全量 reconcile。快速路径不会反复全量读取所有 transcript。
 
 内部会把 hook、pane、transcript、PID、stale timeout 等观察结果统一交给 session-state reducer。短时间竞态里，高置信度的 hook/PID 事件会压过低置信度的 pane/transcript 观察；但 crash/stale 这类终止事件仍会关闭已经死亡的会话。
 

@@ -140,6 +140,7 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     + (reconcile.paneVanished || 0)
     + (reconcile.pidBindings || 0)
   const evidence = stats && stats.evidence ? stats.evidence : {}
+  const registry = stats && stats.registry ? stats.registry : {}
   const claudeInterruptions = claudeTranscript.interrupted || 0
   const codexInterruptions = codex.interrupted || 0
   const claudeIdleInterruptions = claudeTranscript.idleInterrupted || 0
@@ -150,7 +151,7 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     startedAt,
     finishedAt,
     durationMs,
-    changes: reconcileChanges + codexInterruptions + claudeInterruptions,
+    changes: reconcileChanges + codexInterruptions + claudeInterruptions + (registry.deleted || 0),
     reconcileChanges,
     processExits: reconcile.processExits || 0,
     paneShellExits: reconcile.paneShellExits || 0,
@@ -163,7 +164,12 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     claudeTranscriptParseErrors: claudeTranscript.parseErrors || 0,
     claudeInterrupted: claudeInterruptions,
     claudeIdleInterrupted: claudeIdleInterruptions,
-    evidenceWritten: evidence.written || 0
+    evidenceWritten: evidence.written || 0,
+    registryDeleted: registry.deleted || 0,
+    registryExpired: registry.expired || 0,
+    registryTerminal: registry.terminal || 0,
+    registryHidden: registry.hidden || 0,
+    registryOverflow: registry.overflow || 0
   }
 }
 
@@ -189,6 +195,7 @@ function formatTickDiagnostics(summary) {
   if (summary.codexInterrupted > 0) parts.push(`codexInterrupted=${summary.codexInterrupted}`)
   if (summary.codexIdleInterrupted > 0) parts.push(`codexIdle=${summary.codexIdleInterrupted}`)
   if (summary.evidenceWritten > 0) parts.push(`evidence=${summary.evidenceWritten}`)
+  if (summary.registryDeleted > 0) parts.push(`deleted=${summary.registryDeleted}`)
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
 

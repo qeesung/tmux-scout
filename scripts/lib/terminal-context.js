@@ -2,7 +2,7 @@
 
 const os = require('os')
 const { execFileSync } = require('child_process')
-const { readProcessTable, findAgentProcessFromPane } = require('./process-tree')
+const { readProcessTable, findAgentProcessFromPane, isScoutHookProcess } = require('./process-tree')
 const { scoreAgentProcess } = require('./agents')
 
 function safeExec(file, args, timeout = 200) {
@@ -144,12 +144,6 @@ function processSummary(proc) {
   return String(proc.commandLine || proc.args || proc.command || proc.basename || '').trim() || null
 }
 
-function isScoutHookProcess(proc) {
-  const command = processSummary(proc) || ''
-  return /(?:^|\s|\/)scripts\/hooks\/[^/\s]+\.js(?:\s|$)/.test(command)
-    || /tmux-scout[^\s]*\/scripts\/hooks\/[^/\s]+\.js(?:\s|$)/.test(command)
-}
-
 function processFromTable(table, pid) {
   if (!table || !table.byPid || !Number.isInteger(pid) || pid <= 0) return null
   return table.byPid.get(pid) || null
@@ -165,10 +159,17 @@ function findAgentAncestor(startPid, agentType, table) {
   let pid = positiveInt(startPid)
   if (!pid) return null
   const seen = new Set()
+  // Return the NEAREST scoring ancestor, not the highest-scoring one. Walking past a
+  // real agent to an outer ancestor with a higher score would mis-bind nested
+  // same-type sessions (e.g. an inner claude under a parent claude). Shell processes
+  // already score 0 via SHELL_BASENAMES in scoreAgentProcess, so transient zsh
+  // wrappers can't win this loop.
   for (let depth = 0; depth < 16 && pid && !seen.has(pid); depth++) {
     seen.add(pid)
     const proc = processFromTable(table, pid)
-    if (proc && !isScoutHookProcess(proc) && scoreAgentProcess(proc, agentType) > 0) return proc
+    if (proc && !isScoutHookProcess(proc) && scoreAgentProcess(proc, agentType) > 0) {
+      return proc
+    }
     pid = parentFromTable(table, pid)
   }
   return null

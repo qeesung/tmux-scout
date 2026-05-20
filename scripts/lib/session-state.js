@@ -226,6 +226,25 @@ function phaseDecision(session, event, nextPhase, now) {
   const currentSource = normalizeSource(lifecycle.source || session.stateSource)
 
   if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== AGENT_EVENTS.SESSION_START) {
+    // Stale is inferred from pid liveness, not observed from the agent.
+    // A real hook event from the agent proves the inference was wrong, so allow
+    // recovery and bypass the subsequent priority guard — the inferred stale
+    // priority (95) would otherwise win against a hook event (90).
+    // Crashed remains one-way: it carries higher-confidence proof of exit.
+    //
+    // The event must be NEWER than the stale transition: a delayed hook generated
+    // before the stale decision can otherwise resurrect a session that has since
+    // exited (and would also move lastUpdated/endedAt backwards).
+    if (current === 'stale' && normalizeSource(event.source) === 'hook') {
+      const eventTimestamp = Number.isFinite(event.timestamp) ? event.timestamp : now
+      if (eventTimestamp > currentUpdatedAt) {
+        return { apply: true }
+      }
+      return {
+        apply: false,
+        blockedReason: `stale recovery requires hook event newer than stale transition (event ${eventTimestamp} <= stale ${currentUpdatedAt})`
+      }
+    }
     return { apply: false, blockedReason: `current phase ${current} is terminal` }
   }
   if (event.force) return { apply: true }

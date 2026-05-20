@@ -19,13 +19,17 @@ const LIFECYCLE_FIELDS = new Set([
   'stateSource',
   'stateConfidence',
   'stateReason',
+  'terminalKind',
+  'terminalReason',
+  'deferredCompletion',
   'lastEvent',
   'lifecycle',
   'stateContractVersion',
   'currentTurnId',
   'turnStartedAt',
   'turnEndedAt',
-  'lastTurnId'
+  'lastTurnId',
+  'preserveActiveTool'
 ])
 
 function defaultPaths(homeDir = os.homedir()) {
@@ -139,6 +143,7 @@ function createLifecycleEvent(updates, config) {
     attentionReason: updates.needsAttention || null,
     pendingToolUse: updates.pendingToolUse,
     activeTool: updates.activeTool,
+    preserveActiveTool: updates.preserveActiveTool,
     requestId: updates.requestId,
     toolCallId: updates.toolCallId,
     toolUseId: updates.toolUseId,

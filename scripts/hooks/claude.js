@@ -300,8 +300,14 @@ function updateSubagentToolActivity(data, fallbackSessionId, now) {
   if (!parentSessionId) return false
   const activity = subagentToolActivity(data)
   const agentType = getSubagentType(data)
+  const questionTool = isQuestionTool(data.tool_name)
+  const waitingEvent = data.hook_event_name === 'PermissionRequest'
   const patch = {
-    phase: data.hook_event_name === 'PostToolUseFailure' ? 'failed' : 'running',
+    phase: data.hook_event_name === 'PostToolUseFailure'
+      ? 'failed'
+      : waitingEvent
+        ? (questionTool ? 'waitingForAnswer' : 'waitingForApproval')
+        : 'running',
     lastToolActivity: activity,
     updatedAt: now,
     eventType: AGENT_EVENTS.SUBAGENT_TOOL_ACTIVITY
@@ -326,8 +332,8 @@ function handleClaudeHook(data) {
   const tmuxPane = process.env.TMUX_PANE || null
   const pid = Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null
 
-  if ((hook_event_name === 'PreToolUse' || hook_event_name === 'PostToolUse' || hook_event_name === 'PostToolUseFailure')
-    && getSubagentId(data)) {
+  const subagentId = getSubagentId(data)
+  if (subagentId && hook_event_name !== 'SubagentStart' && hook_event_name !== 'SubagentStop') {
     updateSubagentToolActivity(data, session_id, now)
     return
   }
@@ -443,7 +449,6 @@ function handleClaudeHook(data) {
     }
 
     case 'Stop':
-      resolvePendingInteraction(session_id, data, now, data.last_assistant_message)
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
@@ -455,7 +460,6 @@ function handleClaudeHook(data) {
       break
 
     case 'StopFailure':
-      resolvePendingInteraction(session_id, data, now, data.error_details || data.error_detail || data.error || data.message || data.reason)
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
@@ -509,7 +513,6 @@ function handleClaudeHook(data) {
       break
 
     case 'SessionEnd':
-      resolvePendingInteraction(session_id, data, now, reason)
       updateSession(session_id, {
         status: 'idle',
         endedAt: now,

@@ -142,6 +142,8 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
   const evidence = stats && stats.evidence ? stats.evidence : {}
   const claudeInterruptions = claudeTranscript.interrupted || 0
   const codexInterruptions = codex.interrupted || 0
+  const claudeIdleInterruptions = claudeTranscript.idleInterrupted || 0
+  const codexIdleInterruptions = codex.idleInterrupted || 0
 
   return {
     mode,
@@ -155,10 +157,12 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     paneVanished: reconcile.paneVanished || 0,
     pidBindings: reconcile.pidBindings || 0,
     codexInterrupted: codexInterruptions,
+    codexIdleInterrupted: codexIdleInterruptions,
     codexTranscriptRead: codex.filesRead || 0,
     claudeTranscriptRead: claudeTranscript.filesRead || 0,
     claudeTranscriptParseErrors: claudeTranscript.parseErrors || 0,
     claudeInterrupted: claudeInterruptions,
+    claudeIdleInterrupted: claudeIdleInterruptions,
     evidenceWritten: evidence.written || 0
   }
 }
@@ -181,7 +185,9 @@ function formatTickDiagnostics(summary) {
   if (Number.isFinite(summary.claudeTranscriptRead)) parts.push(`claudeRead=${summary.claudeTranscriptRead}`)
   if (summary.claudeTranscriptParseErrors > 0) parts.push(`claudeParseErrors=${summary.claudeTranscriptParseErrors}`)
   if (summary.claudeInterrupted > 0) parts.push(`claudeInterrupted=${summary.claudeInterrupted}`)
+  if (summary.claudeIdleInterrupted > 0) parts.push(`claudeIdle=${summary.claudeIdleInterrupted}`)
   if (summary.codexInterrupted > 0) parts.push(`codexInterrupted=${summary.codexInterrupted}`)
+  if (summary.codexIdleInterrupted > 0) parts.push(`codexIdle=${summary.codexIdleInterrupted}`)
   if (summary.evidenceWritten > 0) parts.push(`evidence=${summary.evidenceWritten}`)
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }

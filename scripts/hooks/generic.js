@@ -505,6 +505,11 @@ function notificationDetails(data) {
     (data.details && typeof data.details === 'object' ? data.details.message || data.details.text || data.details.title : data.details)
 }
 
+function isCocoCompletionIdleNotification(data) {
+  const details = notificationDetails(data)
+  return /agent finished and is waiting for your input/i.test(String(details || ''))
+}
+
 function handleCoco(data, sessionId, eventName, now) {
   const event = String(eventName || '').toLowerCase()
   if (event === 'session_start') return sessionStart(data, sessionId, now, data.session_title)
@@ -521,11 +526,17 @@ function handleCoco(data, sessionId, eventName, now) {
   if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
   if (event === 'permission_request' || event === 'permission_prompt') return permissionRequest(data, sessionId, now)
   if (event === 'elicitation_dialog' || event === 'idle_prompt') {
+    if (isCocoCompletionIdleNotification(data)) {
+      return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
+    }
     return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
   }
   if (event === 'notification') {
     const type = String(data.notification_type || data.notificationType || data.kind || data.type || '').toLowerCase()
     if (type === 'elicitation_dialog' || type === 'idle_prompt') {
+      if (isCocoCompletionIdleNotification(data)) {
+        return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
+      }
       return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
     }
     if (type === 'permission_prompt') return permissionRequest(data, sessionId, now)

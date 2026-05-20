@@ -45,6 +45,13 @@ const TURN_END_EVENTS = new Set([
   AGENT_EVENTS.PROCESS_EXIT_DETECTED,
   AGENT_EVENTS.STALE
 ])
+const DEFERRED_COMPLETION_EVENTS = new Set([
+  AGENT_EVENTS.STOP,
+  AGENT_EVENTS.STOP_FAILURE,
+  AGENT_EVENTS.TURN_COMPLETE,
+  AGENT_EVENTS.SESSION_END,
+  AGENT_EVENTS.INTERRUPTED
+])
 const TOOL_CLEAR_EVENTS = new Set([
   AGENT_EVENTS.SESSION_START,
   AGENT_EVENTS.PROMPT_SUBMIT,
@@ -247,6 +254,12 @@ function phaseDecision(session, event, nextPhase, now) {
     }
     return { apply: false, blockedReason: `current phase ${current} is terminal` }
   }
+  if (NON_TERMINAL_END_PHASES.has(current) &&
+    nextPhase === 'running' &&
+    event.type !== AGENT_EVENTS.PROMPT_SUBMIT &&
+    event.type !== AGENT_EVENTS.SESSION_START) {
+    return { apply: false, blockedReason: `current phase ${current} only reopens on a new turn` }
+  }
   if (event.force) return { apply: true }
   if (nextPhase === 'interrupted') return { apply: true }
   if (event.type === AGENT_EVENTS.PANE_STATE && nextPhase === 'running' && currentSource === 'transcript'
@@ -301,6 +314,108 @@ function updateTurnLifecycle(session, event, phase, now) {
   }
 }
 
+function terminalKindForEvent(event, phase) {
+  if (event.terminalKind) return event.terminalKind
+  if (event.type === AGENT_EVENTS.PROCESS_EXIT_DETECTED) return 'processExit'
+  if (event.type === AGENT_EVENTS.STALE) return 'stale'
+  if (event.type === AGENT_EVENTS.INTERRUPTED || phase === 'interrupted') return 'interrupted'
+  if (event.type === AGENT_EVENTS.STOP_FAILURE) return 'stopFailure'
+  if (phase === 'completed') return 'completed'
+  if (phase === 'crashed') return 'crashed'
+  return undefined
+}
+
+function isEndPhase(phase) {
+  return TERMINAL_PHASES.has(phase) || NON_TERMINAL_END_PHASES.has(phase)
+}
+
+function cleanDeferredCompletion(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!NON_TERMINAL_END_PHASES.has(value.phase)) return null
+  return value
+}
+
+function deferredCompletionForEvent(event, phase, now) {
+  const terminalKind = terminalKindForEvent(event, phase)
+  const reason = compactEvidenceText(event.reason || event.details || event.type, 200)
+  const deferred = {
+    phase,
+    type: event.type,
+    source: normalizeSource(event.source),
+    stateSource: event.stateSource,
+    rawEventName: event.rawEventName || event.type,
+    timestamp: now,
+    originalTimestamp: event.timestamp,
+    reason,
+    details: compactEvidenceText(event.details, 200),
+    turnId: event.turnId,
+    transcriptPath: event.transcriptPath,
+    tmuxPane: event.tmuxPane,
+    pid: Number.isInteger(event.pid) ? event.pid : undefined,
+    confidence: event.confidence,
+    priority: Number.isFinite(event.priority) ? event.priority : sourcePriority(event.source),
+    terminalKind,
+    terminalReason: reason
+  }
+  const clean = {}
+  for (const [key, value] of Object.entries(deferred)) {
+    if (value !== undefined && value !== null && value !== '') clean[key] = value
+  }
+  return clean
+}
+
+function shouldDeferCompletion(session, event, nextPhase) {
+  return PENDING_INTERACTION_PHASES.has(currentPhase(session)) &&
+    NON_TERMINAL_END_PHASES.has(nextPhase) &&
+    DEFERRED_COMPLETION_EVENTS.has(event.type)
+}
+
+function rememberDeferredCompletion(session, event, nextPhase, now) {
+  const next = deferredCompletionForEvent(event, nextPhase, now)
+  const previous = cleanDeferredCompletion(session.deferredCompletion)
+  if (!previous || next.phase === 'interrupted' || previous.phase !== 'interrupted') {
+    session.deferredCompletion = next
+  }
+}
+
+function eventFromDeferredCompletion(deferred, resolver, now) {
+  const source = deferred.source || normalizeSource(resolver.source)
+  const rawEventName = deferred.rawEventName
+    ? `${deferred.rawEventName}:${resolver.type}`
+    : resolver.rawEventName || resolver.type
+  return {
+    type: deferred.type,
+    source,
+    stateSource: deferred.stateSource || resolver.stateSource,
+    rawEventName,
+    timestamp: now,
+    originalTimestamp: deferred.originalTimestamp || deferred.timestamp,
+    reason: deferred.terminalReason || deferred.reason || resolver.reason,
+    details: deferred.details || resolver.details,
+    turnId: deferred.turnId || resolver.turnId,
+    transcriptPath: deferred.transcriptPath || resolver.transcriptPath,
+    tmuxPane: deferred.tmuxPane || resolver.tmuxPane,
+    pid: Number.isInteger(deferred.pid) ? deferred.pid : resolver.pid,
+    confidence: Number.isFinite(deferred.confidence) ? deferred.confidence : resolver.confidence,
+    priority: Number.isFinite(deferred.priority) ? deferred.priority : sourcePriority(source),
+    terminalKind: deferred.terminalKind,
+    terminalReason: deferred.terminalReason || deferred.reason,
+    force: true,
+    lastEvent: {
+      type: deferred.type,
+      timestamp: now,
+      details: deferred.details || deferred.terminalReason || deferred.reason,
+      turnId: deferred.turnId || resolver.turnId,
+      source,
+      rawEventName,
+      transcriptPath: deferred.transcriptPath || resolver.transcriptPath,
+      tmuxPane: deferred.tmuxPane || resolver.tmuxPane,
+      pid: Number.isInteger(deferred.pid) ? deferred.pid : resolver.pid,
+      resolvedBy: resolver.type
+    }
+  }
+}
+
 function setPhase(session, phase, event, now) {
   const source = normalizeSource(event.source)
   const priority = Number.isFinite(event.priority) ? event.priority : sourcePriority(source)
@@ -336,6 +451,16 @@ function setPhase(session, phase, event, now) {
   session.stateSource = event.stateSource || event.source || session.stateSource
   session.stateConfidence = Number.isFinite(event.confidence) ? event.confidence : priority
   session.stateReason = event.reason || event.details || event.type
+  if (isEndPhase(phase)) {
+    session.terminalKind = terminalKindForEvent(event, phase)
+    session.terminalReason = event.terminalReason || session.stateReason
+  } else {
+    session.terminalKind = null
+    session.terminalReason = null
+  }
+  if (!PENDING_INTERACTION_PHASES.has(phase)) {
+    session.deferredCompletion = null
+  }
   session.lifecycle = {
     phase,
     source,
@@ -359,8 +484,9 @@ function eventClearsPendingToolUse(event) {
 }
 
 function eventClearsActiveTool(event) {
-  return event.activeTool === null ||
-    event.pendingToolUse === null ||
+  if (event.activeTool === null) return true
+  if (event.preserveActiveTool) return false
+  return event.pendingToolUse === null ||
     TOOL_CLEAR_EVENTS.has(event.type) ||
     event.type === AGENT_EVENTS.QUESTION_ASKED ||
     event.type === AGENT_EVENTS.PERMISSION_REQUEST
@@ -449,31 +575,29 @@ function applySessionEvent(session, event) {
     }
   }
 
-  const nextPhase = phaseForEvent(event)
-  const decision = phaseDecision(session, event, nextPhase, now)
-  const applied = decision.apply
-  if (applied) setPhase(session, nextPhase, event, now)
+  const deferredCompletion = cleanDeferredCompletion(session.deferredCompletion)
+  const resolvingDeferred = Boolean(deferredCompletion && PENDING_RESOLUTION_EVENTS.has(event.type))
+  const phaseEvent = resolvingDeferred
+    ? eventFromDeferredCompletion(deferredCompletion, event, now)
+    : event
+  const nextPhase = resolvingDeferred ? deferredCompletion.phase : phaseForEvent(event)
+  const decision = phaseDecision(session, phaseEvent, nextPhase, now)
+  let applied = decision.apply
+  let deferredPhase = false
+  if (!resolvingDeferred && applied && shouldDeferCompletion(session, event, nextPhase)) {
+    rememberDeferredCompletion(session, event, nextPhase, now)
+    applied = false
+    deferredPhase = true
+    decision.blockedReason = 'deferred until pending interaction resolves'
+  }
+  if (applied) setPhase(session, nextPhase, phaseEvent, now)
 
   const evidenceChanged = appendStateEvidence(
     session,
-    evidenceForEvent(session, event, nextPhase, previousPhase, applied, decision.blockedReason, now)
+    evidenceForEvent(session, phaseEvent, nextPhase, previousPhase, applied, decision.blockedReason, now)
   )
 
-  if (applied || !nextPhase) {
-    const phase = currentPhase(session)
-    if (event.pendingToolUse !== undefined) {
-      session.pendingToolUse = event.pendingToolUse
-    } else if (eventClearsPendingToolUse(event)) {
-      session.pendingToolUse = null
-    }
-    if (event.activeTool !== undefined) {
-      if (event.activeTool === null || activeToolAllowedForPhase(phase)) {
-        session.activeTool = event.activeTool
-      }
-    } else if (eventClearsActiveTool(event)) {
-      session.activeTool = null
-    }
-    if (session.activeTool === undefined) session.activeTool = null
+  if (deferredPhase) {
     session.lastEvent = {
       type: event.type,
       timestamp: now,
@@ -483,10 +607,41 @@ function applySessionEvent(session, event) {
       rawEventName: event.rawEventName,
       transcriptPath: event.transcriptPath,
       tmuxPane: event.tmuxPane,
-      pid: event.pid
+      pid: event.pid,
+      deferred: true
     }
     if (event.lastEvent) {
       session.lastEvent = Object.assign({}, session.lastEvent, event.lastEvent)
+    }
+    session.lastUpdated = now
+  } else if (applied || !nextPhase) {
+    const phase = currentPhase(session)
+    if (phaseEvent.pendingToolUse !== undefined) {
+      session.pendingToolUse = phaseEvent.pendingToolUse
+    } else if (eventClearsPendingToolUse(phaseEvent)) {
+      session.pendingToolUse = null
+    }
+    if (phaseEvent.activeTool !== undefined) {
+      if (phaseEvent.activeTool === null || activeToolAllowedForPhase(phase)) {
+        session.activeTool = phaseEvent.activeTool
+      }
+    } else if (eventClearsActiveTool(phaseEvent)) {
+      session.activeTool = null
+    }
+    if (session.activeTool === undefined) session.activeTool = null
+    session.lastEvent = {
+      type: phaseEvent.type,
+      timestamp: now,
+      details: phaseEvent.details,
+      turnId: phaseEvent.turnId,
+      source: normalizeSource(phaseEvent.source),
+      rawEventName: phaseEvent.rawEventName,
+      transcriptPath: phaseEvent.transcriptPath,
+      tmuxPane: phaseEvent.tmuxPane,
+      pid: phaseEvent.pid
+    }
+    if (phaseEvent.lastEvent) {
+      session.lastEvent = Object.assign({}, session.lastEvent, phaseEvent.lastEvent)
     }
     session.lastUpdated = now
   }

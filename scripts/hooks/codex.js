@@ -546,7 +546,7 @@ function handleModernHook(data) {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
-        activeTool: null,
+        preserveActiveTool: true,
         lastTurnId: data.turn_id,
         lastEvent: { type: AGENT_EVENTS.POST_TOOL_USE, timestamp: now, details: toolName, turnId: data.turn_id }
       }))
@@ -558,7 +558,10 @@ function handleModernHook(data) {
         ? data.last_assistant_message
         : ''
       const wantsAnswer = codexStopWantsAnswer(data, lastAssistantMessage)
-      if (!wantsAnswer) resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
+      const existing = readSession(sessionId)
+      if (!wantsAnswer && !(existing && existing.pendingInteraction)) {
+        resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
+      }
       updateSession(sessionId, Object.assign({}, base, {
         status: wantsAnswer ? 'working' : 'completed',
         needsAttention: wantsAnswer ? 'waiting for answer' : null,

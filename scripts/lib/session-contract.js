@@ -61,6 +61,7 @@ const SESSION_CONTRACT_VERSION = 1
  * @property {string=} toolCallId
  * @property {string=} toolUseId
  * @property {boolean=} force
+ * @property {boolean=} preserveActiveTool
  *
  * @typedef {Object} SessionSnapshot
  * @property {string} sessionId
@@ -140,6 +141,7 @@ const AGENT_EVENT_SCHEMA = Object.freeze({
     tmuxPane: FIELD_TYPES.STRING,
     pid: FIELD_TYPES.NUMBER,
     force: FIELD_TYPES.BOOLEAN,
+    preserveActiveTool: FIELD_TYPES.BOOLEAN,
     updates: FIELD_TYPES.OBJECT
   })
 })
@@ -220,6 +222,9 @@ const SESSION_SNAPSHOT_SCHEMA = Object.freeze({
     stateSource: FIELD_TYPES.STRING,
     stateConfidence: FIELD_TYPES.NUMBER,
     stateReason: FIELD_TYPES.STRING,
+    terminalKind: FIELD_TYPES.STRING,
+    terminalReason: FIELD_TYPES.STRING,
+    deferredCompletion: FIELD_TYPES.OBJECT,
     lifecycle: FIELD_TYPES.OBJECT,
     lastEvent: FIELD_TYPES.OBJECT,
     stateEvidence: FIELD_TYPES.ARRAY,
@@ -272,7 +277,7 @@ const AGENT_EVENT_PHASES = Object.freeze({
   [AGENT_EVENTS.TURN_COMPLETE]: SESSION_PHASES.COMPLETED,
   [AGENT_EVENTS.SESSION_END]: SESSION_PHASES.COMPLETED,
   [AGENT_EVENTS.INTERRUPTED]: SESSION_PHASES.INTERRUPTED,
-  [AGENT_EVENTS.PROCESS_EXIT_DETECTED]: SESSION_PHASES.CRASHED,
+  [AGENT_EVENTS.PROCESS_EXIT_DETECTED]: SESSION_PHASES.INTERRUPTED,
   [AGENT_EVENTS.STALE]: SESSION_PHASES.STALE
 })
 

@@ -19,6 +19,8 @@ const pidStateCache = new Map()
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = DEFAULT_TAIL_BYTES
 const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
 const CODEX_TRANSCRIPT_SETTLE_GATE_MS = 3000
+const CLAUDE_IDLE_INTERRUPT_THRESHOLD_MS = 120000
+const CODEX_STUCK_INTERRUPT_THRESHOLD_MS = 180000
 
 function createStats(options = {}) {
   return {
@@ -36,6 +38,7 @@ function createStats(options = {}) {
       discovered: 0,
       updated: 0,
       interrupted: 0,
+      idleInterrupted: 0,
       stale: 0,
       filesRead: 0,
       skippedSettling: 0,
@@ -45,6 +48,7 @@ function createStats(options = {}) {
     },
     claudeTranscript: {
       interrupted: 0,
+      idleInterrupted: 0,
       filesRead: 0,
       parseErrors: 0
     },
@@ -129,6 +133,10 @@ function hasTrackedPid(session) {
   return Number.isInteger(session.pid) && session.pid > 0
 }
 
+function isRecordedProcessExit(session) {
+  return currentPhase(session) === 'interrupted' && session.terminalKind === 'processExit'
+}
+
 function getPidState(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return 'unknown'
   if (pidStateCache.has(pid)) return pidStateCache.get(pid)
@@ -203,8 +211,9 @@ function sweepPidBindings(status, panes, processTable, stats) {
 function exitEventForSession(session, reason, source, now) {
   const phase = currentPhase(session)
   const active = phase === 'running' || phase === 'waitingForApproval' || phase === 'waitingForAnswer'
-  if (active) {
-    session.crashReason = reason
+  if (active && source !== 'pane') {
+    session.terminalKind = 'processExit'
+    session.terminalReason = reason
     return {
       type: AGENT_EVENTS.PROCESS_EXIT_DETECTED,
       source,
@@ -216,12 +225,16 @@ function exitEventForSession(session, reason, source, now) {
   }
 
   session.staleReason = reason
+  session.terminalKind = source === 'pane' ? 'paneGone' : 'stale'
+  session.terminalReason = reason
   return {
     type: AGENT_EVENTS.STALE,
     source,
     timestamp: now,
     reason,
     details: reason,
+    terminalKind: source === 'pane' ? 'paneGone' : 'stale',
+    terminalReason: reason,
     force: true
   }
 }
@@ -231,9 +244,10 @@ function sweepDeadProcesses(status, panes, processTable, stats) {
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (isHiddenCodexSession(session)) continue
+    if (!session || isHiddenCodexSession(session)) continue
     const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
-    if (!session || session.endedAt || !pane || !hasTrackedPid(session)) continue
+    if (isRecordedProcessExit(session)) continue
+    if (session.endedAt || !pane || !hasTrackedPid(session)) continue
     if (getPidState(session.pid) !== 'dead') continue
 
     // Stored pid is dead, but the agent may still be alive under the pane —
@@ -332,6 +346,30 @@ function codexTranscriptSettleGateMs(options) {
     return Math.max(0, options.codexTranscriptSettleGateMs)
   }
   return CODEX_TRANSCRIPT_SETTLE_GATE_MS
+}
+
+function optionDisabled(options, key) {
+  return options && options[key] === false
+}
+
+function thresholdMs(options, key, fallback) {
+  if (options && Number.isFinite(options[key])) return Math.max(0, options[key])
+  return fallback
+}
+
+function activeSubagentCount(session) {
+  return Array.isArray(session && session.activeSubagents)
+    ? session.activeSubagents.filter(Boolean).length
+    : 0
+}
+
+function lastSessionActivityAt(session) {
+  return Math.max(
+    Number.isFinite(session.lastHookAt) ? session.lastHookAt : 0,
+    Number.isFinite(session.lastUpdated) ? session.lastUpdated : 0,
+    session.lastEvent && Number.isFinite(session.lastEvent.timestamp) ? session.lastEvent.timestamp : 0,
+    session.pendingToolUse && Number.isFinite(session.pendingToolUse.timestamp) ? session.pendingToolUse.timestamp : 0
+  )
 }
 
 function latestTurnKey(session) {
@@ -451,9 +489,52 @@ function sweepInterruptedCodexTranscripts(status, stats, options = {}) {
   }
 }
 
+function sweepStuckCodexSessions(status, stats, options = {}) {
+  if (optionDisabled(options, 'stuckSweep') || optionDisabled(options, 'idleInterrupt')) return
+  const now = Date.now()
+  const maxIdleMs = thresholdMs(options, 'codexStuckInterruptMs', CODEX_STUCK_INTERRUPT_THRESHOLD_MS)
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (isHiddenCodexSession(session)) continue
+    if (!session || session.agentType !== 'codex' || session.endedAt) continue
+    if (currentPhase(session) !== 'running') continue
+    if (!session.activeTool) continue
+    if (session.pendingToolUse || session.pendingInteraction || activeSubagentCount(session) > 0) continue
+
+    const lastActivityAt = lastSessionActivityAt(session)
+    if (!lastActivityAt || now - lastActivityAt < maxIdleMs) continue
+
+    const stat = session.transcriptPath ? statTranscriptFile(session.transcriptPath) : null
+    if (stat && Number.isFinite(stat.mtimeMs) && now - stat.mtimeMs < maxIdleMs) continue
+
+    const updated = applySessionUpdate(status, sessionId, session, {
+      type: AGENT_EVENTS.INTERRUPTED,
+      source: 'transcript',
+      timestamp: now,
+      reason: `Codex active tool ${session.activeTool} idle for ${Math.floor((now - lastActivityAt) / 1000)}s`,
+      details: 'codex active tool idle without a stop hook',
+      rawEventName: 'codex_stuck_sweep',
+      transcriptPath: session.transcriptPath,
+      force: true
+    }, stats)
+    if (updated && stats && stats.codex) {
+      stats.codex.interrupted++
+      stats.codex.idleInterrupted++
+    }
+    changed = updated || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
 function syncCodexSessions(status, panes, options = {}, stats) {
   if (options.codexMode === 'none' || options.codexTranscript === false) return
   sweepInterruptedCodexTranscripts(status, stats, options)
+  sweepStuckCodexSessions(status, stats, options)
   pruneCodexTranscriptScanState(status, options)
 }
 
@@ -577,6 +658,44 @@ function sweepInterruptedClaudeTranscripts(status, stats) {
   }
 }
 
+function sweepIdleClaudeSessions(status, stats, options = {}) {
+  if (options.claudeIdleInterrupt !== true) return
+  if (optionDisabled(options, 'stuckSweep') || optionDisabled(options, 'idleInterrupt')) return
+  const now = Date.now()
+  const maxIdleMs = thresholdMs(options, 'claudeIdleInterruptMs', CLAUDE_IDLE_INTERRUPT_THRESHOLD_MS)
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (!session || session.agentType !== 'claude' || session.endedAt) continue
+    if (currentPhase(session) !== 'running') continue
+    if (session.activeTool || session.pendingInteraction || activeSubagentCount(session) > 0) continue
+
+    const lastActivityAt = lastSessionActivityAt(session)
+    if (!lastActivityAt || now - lastActivityAt < maxIdleMs) continue
+
+    const updated = applySessionUpdate(status, sessionId, session, {
+      type: AGENT_EVENTS.INTERRUPTED,
+      source: 'stale',
+      timestamp: now,
+      reason: `Claude session idle for ${Math.floor((now - lastActivityAt) / 1000)}s without an active tool`,
+      details: 'claude idle without active tool',
+      rawEventName: 'claude_idle_sweep',
+      transcriptPath: session.transcriptPath,
+      force: true
+    }, stats)
+    if (updated && stats && stats.claudeTranscript) {
+      stats.claudeTranscript.interrupted++
+      stats.claudeTranscript.idleInterrupted++
+    }
+    changed = updated || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    writeJsonAtomic(statusFile, status)
+  }
+}
+
 // --- Main ---
 
 function isPidAlive(pid) {
@@ -611,6 +730,7 @@ function run(file, options = {}) {
   if (options.reconcile !== false) reconcileSessions(status, panes, stats)
   syncCodexSessions(status, panes, options, stats)
   if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats)
+  sweepIdleClaudeSessions(status, stats, options)
   stats.durationMs = Date.now() - stats.startedAt
   return { status, panes, stats }
 }

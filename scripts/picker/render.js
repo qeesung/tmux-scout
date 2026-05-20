@@ -81,6 +81,23 @@ function isShellCommand(command) {
   return new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh', 'nu']).has(command)
 }
 
+function phaseForSession(session) {
+  if (!session) return 'idle'
+  if (session.phase) return session.phase
+  if (session.status === 'crashed') return 'crashed'
+  if (session.status === 'stale') return 'stale'
+  if (session.status === 'interrupted') return 'interrupted'
+  if (session.needsAttention === 'waiting for answer') return 'waitingForAnswer'
+  if (session.needsAttention) return 'waitingForApproval'
+  if (session.status === 'working') return 'running'
+  if (session.status === 'completed') return 'completed'
+  return 'idle'
+}
+
+function isWaitingPhase(phase) {
+  return phase === 'waitingForApproval' || phase === 'waitingForAnswer'
+}
+
 function canUseShellFallback(session) {
   if (session.agentType === 'codex') return true
   const lastEventType = session && session.lastEvent ? session.lastEvent.type : null
@@ -88,16 +105,16 @@ function canUseShellFallback(session) {
 }
 
 function isNeedsAttention(session, now) {
-  if (session.needsAttention) return true
-  return false
+  return Boolean(session && (session.needsAttention || session.pendingInteraction || isWaitingPhase(phaseForSession(session))))
 }
 
 function groupOrder(session, now) {
+  const phase = phaseForSession(session)
   if (isNeedsAttention(session, now)) return 0
-  if (session.status === 'working') return 1
-  if (session.status === 'interrupted') return 2
-  if (session.status === 'completed') return 3
-  if (session.status === 'crashed' || session.status === 'stale') return 4
+  if (phase === 'running') return 1
+  if (phase === 'interrupted') return 2
+  if (phase === 'completed') return 3
+  if (phase === 'crashed' || phase === 'stale') return 4
   return 5
 }
 
@@ -116,7 +133,8 @@ function compareSessions(left, right, now, pane) {
 }
 
 function isTerminalSession(session) {
-  return session && (session.status === 'crashed' || session.status === 'stale' || session.status === 'interrupted')
+  const phase = phaseForSession(session)
+  return session && (phase === 'crashed' || phase === 'stale' || phase === 'interrupted')
 }
 
 function isRecentlyTerminal(session, now) {
@@ -129,15 +147,16 @@ function isActiveSession(session, panes, now = Date.now()) {
   if (!session) return false
   if (isHiddenCodexSession(session)) return false
   if (isRecentlyTerminal(session, now)) return true
-  if (session.endedAt || session.status === 'crashed' || session.status === 'stale') return false
+  const phase = phaseForSession(session)
+  if (session.endedAt || phase === 'crashed' || phase === 'stale') return false
 
   // Discovered from JSONL but hook hasn't fired yet — no pane bound
   if (!session.tmuxPane) {
-    if (session.status === 'completed') return false
+    if (phase === 'completed') return false
     if (String(session.stateSource || '').endsWith('-hooks')) return false
     const lastSeen = session.lastUpdated || session.startedAt || 0
     if (lastSeen && now - lastSeen > TERMINAL_DISPLAY_MS) return false
-    return session.status !== 'idle'
+    return phase !== 'idle'
   }
   const pane = panes.get(session.tmuxPane)
   if (!pane || pane.paneDead) {
@@ -158,10 +177,11 @@ function getActiveSessions(status, panes) {
   const now = Date.now()
 
   function paneActivityRank(session) {
-    if (isNeedsAttention(session, now) || session.status === 'working') return 0
-    if (session.status === 'completed' || session.status === 'idle') return 1
-    if (session.status === 'interrupted') return 2
-    if (session.status === 'crashed' || session.status === 'stale') return 3
+    const phase = phaseForSession(session)
+    if (isNeedsAttention(session, now) || phase === 'running') return 0
+    if (phase === 'completed' || phase === 'idle') return 1
+    if (phase === 'interrupted') return 2
+    if (phase === 'crashed' || phase === 'stale') return 3
     return 4
   }
 
@@ -234,12 +254,13 @@ function waitCode(session) {
 }
 
 function statusTag(session, now) {
+  const phase = phaseForSession(session)
   if (isNeedsAttention(session, now)) return formatField(`W:${waitCode(session)}`, STATUS_WIDTH, '31')
-  if (session.status === 'working') return formatField('BUSY', STATUS_WIDTH, '33')
-  if (session.status === 'interrupted') return formatField('INT', STATUS_WIDTH, '35')
-  if (session.status === 'crashed') return formatField('CRASH', STATUS_WIDTH, '31')
-  if (session.status === 'stale') return formatField('STALE', STATUS_WIDTH, '90')
-  if (session.status === 'completed') return formatField('DONE', STATUS_WIDTH, '32')
+  if (phase === 'running') return formatField('BUSY', STATUS_WIDTH, '33')
+  if (phase === 'interrupted') return formatField('INT', STATUS_WIDTH, '35')
+  if (phase === 'crashed') return formatField('CRASH', STATUS_WIDTH, '31')
+  if (phase === 'stale') return formatField('STALE', STATUS_WIDTH, '90')
+  if (phase === 'completed') return formatField('DONE', STATUS_WIDTH, '32')
   return formatField('IDLE', STATUS_WIDTH, '34')
 }
 
@@ -261,7 +282,8 @@ function attentionDetail(session) {
   const source = pending.source && pending.source !== 'unknown'
     ? ` · ${pending.source}`
     : ''
-  return tool ? `${reason}: ${cleanText(tool, '')}${source}` : `${reason}${source}`
+  const deferred = session.deferredCompletion ? ' · turn ended' : ''
+  return tool ? `${reason}: ${cleanText(tool, '')}${source}${deferred}` : `${reason}${source}${deferred}`
 }
 
 function subagentDetail(session) {
@@ -327,7 +349,7 @@ function formatLine(session, now, currentPane) {
   const window = formatField(windowName, WINDOW_WIDTH, '36')
   const project = formatField(projectName, PROJECT_WIDTH, '37')
   const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n\t]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
-  const terminalReason = session.crashReason || session.staleReason || session.stateReason
+  const terminalReason = session.terminalReason || session.crashReason || session.staleReason || session.stateReason
   const subagents = subagentDetail(session)
   const evidence = evidenceDetail(session, now)
   const detail = isTerminalSession(session) && terminalReason

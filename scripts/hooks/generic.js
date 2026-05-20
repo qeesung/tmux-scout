@@ -90,6 +90,14 @@ function getEventName(data) {
   return eventOverride || data.hook_event_name || data.event_type || data.type || ''
 }
 
+function normalizeHookEventName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[\s-]+/g, '_')
+    .toLowerCase()
+}
+
 function getToolName(data) {
   return data.tool_name || data.toolName || data.tool || data.server || 'unknown'
 }
@@ -511,7 +519,7 @@ function isCocoCompletionIdleNotification(data) {
 }
 
 function handleCoco(data, sessionId, eventName, now) {
-  const event = String(eventName || '').toLowerCase()
+  const event = normalizeHookEventName(eventName)
   if (event === 'session_start') return sessionStart(data, sessionId, now, data.session_title)
   if (event === 'session_end') return sessionEnd(data, sessionId, now)
   if (event === 'user_prompt_submit') {
@@ -532,7 +540,7 @@ function handleCoco(data, sessionId, eventName, now) {
     return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
   }
   if (event === 'notification') {
-    const type = String(data.notification_type || data.notificationType || data.kind || data.type || '').toLowerCase()
+    const type = normalizeHookEventName(data.notification_type || data.notificationType || data.kind || data.type || '')
     if (type === 'elicitation_dialog' || type === 'idle_prompt') {
       if (isCocoCompletionIdleNotification(data)) {
         return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)

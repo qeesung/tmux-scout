@@ -2125,6 +2125,44 @@ test('generic hook maps Trae permission requests', () => {
   }
 })
 
+test('generic hook maps Trae PascalCase busy events', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'trae-pascal-busy'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('trae', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'fix trae busy status'
+    }), dir)
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'trae')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.sessionTitle, 'fix trae busy status')
+
+    runGenericHook('trae', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+
+    runGenericHook('trae', Object.assign({}, base, {
+      hook_event_name: 'Notification',
+      notification_type: 'IdlePrompt',
+      message: 'Agent finished and is waiting for your input'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.NOTIFICATION)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('generic hook does not reopen Trae completion idle notifications as waits', () => {
   const dir = tempDir()
   try {

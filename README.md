@@ -257,13 +257,16 @@ Session data is stored in `~/.tmux-scout/`:
 └── codex-original-notify.json       # Backup of original Codex notify command
 ```
 
-Sessions older than 24 hours are automatically cleaned up.
+tmux-scout keeps live and recently visible sessions in the registry. Hidden
+internal sessions and terminal `STALE` / `CRASH` rows are removed after their
+short display window, while snapshots with an explicit `endedAt` are retained
+for up to 24 hours before cleanup.
 
 ## Agent Compatibility Notes
 
 tmux-scout now prefers Codex's event hook mechanism, which gives near-real-time updates for session start, prompt submission, tool activity, approval waits, and turn completion. This is the same style of lifecycle tracking used by Flux Desktop App.
 
-With the default watchdog path, tmux-scout keeps hooks as the primary state source and adds Flux-style reconciliation: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, lower-frequency JSONL discovery, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
+With the default watchdog path, tmux-scout keeps hooks as the primary state source and adds Flux-style reconciliation: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, registry pruning, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
 
 Internally, hook, pane, transcript, PID, and stale-timeout observations are reduced through a shared session-state model. Higher-confidence hook/PID events win over lower-confidence pane/transcript observations for short races, while terminal crash/stale events still close dead sessions.
 

@@ -11,7 +11,7 @@ try {
   const sync = require('./sync')
   const watcherRunning = sync.isWatcherRunning()
   cached = sync.run(statusFile, watcherRunning
-    ? { reconcile: false, codexMode: 'none', paneGroundTruth: false, stuckSweep: false }
+    ? { reconcile: false, codexMode: 'none', paneGroundTruth: false, stuckSweep: false, registryPrune: false }
     : {})
 } catch (_) {}
 require('./render').run(statusFile, currentPane, cached)

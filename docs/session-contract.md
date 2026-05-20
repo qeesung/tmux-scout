@@ -16,6 +16,15 @@ contract change.
 and debug commands. Per-session files mirror individual snapshots for easier
 inspection and recovery.
 
+The aggregate registry is maintained by `scripts/lib/session-registry.js`.
+It supports explicit session deletion and periodic pruning of snapshots that no
+longer need to be shown:
+
+- hidden Codex/internal sessions after the short terminal display window
+- `crashed` / `stale` terminal sessions after the same display window
+- sessions with an explicit `endedAt` older than the 24-hour retention window
+- old inactive snapshots when the registry exceeds its capacity cap
+
 ## Snapshot Shape
 
 Every session snapshot should include:
@@ -90,6 +99,9 @@ The reducer records accepted and rejected observations in `stateEvidence`.
 Evidence entries include source, raw event name, phase, previous phase, timestamp,
 details, and an optional blocked reason.
 
+`session_delete` is the canonical delete event. It does not map to a phase;
+the registry removes the aggregate entry and its per-session JSON file.
+
 ## Source Priority
 
 tmux-scout accepts observations from hooks, transcript readers, pane/process
@@ -110,6 +122,15 @@ files. If the bridge is unavailable, hooks fall back to direct atomic writes.
 Readers should treat files as eventually consistent and re-read on each render.
 Writers must not assume they are the only producer unless they are inside the
 bridge server.
+
+The watchdog reconciliation loop follows the same shape as Flux Desktop's
+coordinator loop, scoped to tmux:
+
+1. reconcile tmux panes and tracked PIDs
+2. scan known Codex/Claude transcripts for missed interruption signals
+3. apply stale/stuck fallbacks
+4. prune expired registry entries and remove their per-session files
+5. let picker/status bar render the current `status.json` snapshot
 
 ## Validation
 

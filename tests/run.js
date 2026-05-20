@@ -15,6 +15,7 @@ const { AGENTS, agentDisplay, scoreAgentProcess } = require('../scripts/lib/agen
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
 const { resolveAgentProcess } = require('../scripts/lib/terminal-context')
+const { isScoutHookProcess } = require('../scripts/lib/process-tree')
 const { startBridgeServer } = require('../scripts/lib/bridge-server')
 const { markInterrupted: markClaudeInterrupted, ClaudeTranscriptWatchManager } = require('../scripts/lib/claude-transcript-watcher')
 const { startOptionalBridge, optionEnabled: watcherOptionEnabled } = require('../scripts/watcher')
@@ -994,6 +995,331 @@ test('hook runtime resolves the real agent pid from the hook parent chain', () =
   assert.strictEqual(resolved.pid, 100)
   assert.strictEqual(resolved.pidSource, 'parent-chain')
   assert.strictEqual(resolved.pidCommand, 'codex')
+})
+
+test('hook runtime skips quoted sh wrapper around scout hook script', () => {
+  const wrapperCmd = "/bin/sh -c [ -e '/Users/bytedance/repos/tmux-scout/scripts/hooks/claude.js' ] || exit 0; node '/Users/bytedance/repos/tmux-scout/scripts/hooks/claude.js'"
+  const hookCmd = "node /Users/bytedance/repos/tmux-scout/scripts/hooks/claude.js"
+  const processes = [
+    { pid: 100, ppid: 1, command: '/opt/homebrew/bin/claude', args: 'claude --dangerously-skip-permissions', commandLine: 'claude --dangerously-skip-permissions', basename: 'claude' },
+    { pid: 200, ppid: 100, command: '/bin/sh', args: wrapperCmd, commandLine: wrapperCmd, basename: 'sh' },
+    { pid: 300, ppid: 200, command: process.execPath, args: hookCmd, commandLine: hookCmd, basename: 'node' }
+  ]
+  const byPid = new Map()
+  const childrenByPpid = new Map()
+  for (const proc of processes) {
+    byPid.set(proc.pid, proc)
+    if (!childrenByPpid.has(proc.ppid)) childrenByPpid.set(proc.ppid, [])
+    childrenByPpid.get(proc.ppid).push(proc)
+  }
+
+  const resolved = resolveAgentProcess({
+    agentType: 'claude',
+    hookPid: 300,
+    parentPid: 200,
+    processTable: { byPid, childrenByPpid },
+    panePidResolver: () => null
+  })
+
+  assert.strictEqual(resolved.pid, 100, 'should resolve to the real claude process, not the sh wrapper')
+  assert.strictEqual(resolved.pidSource, 'parent-chain')
+  assert.ok(resolved.pidCommand && resolved.pidCommand.startsWith('claude'), 'pidCommand should describe the real claude process')
+})
+
+test('hook filter identifies quoted sh wrappers around scout hook scripts', () => {
+  const wrapperCmd = "/bin/sh -c [ -e '/Users/x/scripts/hooks/claude.js' ] || exit 0; node '/Users/x/scripts/hooks/claude.js'"
+  assert.strictEqual(
+    isScoutHookProcess({ basename: 'sh', commandLine: wrapperCmd, command: '/bin/sh' }),
+    true,
+    'sh wrapper that quotes the hook script path should still be classified as a scout hook'
+  )
+  assert.strictEqual(
+    isScoutHookProcess({ basename: 'claude', commandLine: 'claude --dangerously-skip-permissions', command: '/usr/local/bin/claude' }),
+    false
+  )
+})
+
+test('agent scoring matches real agent binaries including node-wrapped JS entrypoints', () => {
+  assert.strictEqual(
+    scoreAgentProcess({ basename: 'claude', commandLine: 'claude --dangerously-skip-permissions', command: '/usr/local/bin/claude' }, 'claude'),
+    100
+  )
+  assert.strictEqual(
+    scoreAgentProcess({ basename: 'node', commandLine: 'node /usr/local/bin/claude', command: '/usr/bin/node' }, 'claude'),
+    70,
+    'invoking claude via node wrapper still matches via /claude path needle'
+  )
+  assert.strictEqual(
+    scoreAgentProcess({ basename: 'node', commandLine: 'node /Users/foo/.claude/local/claude.js --resume', command: '/usr/bin/node' }, 'claude'),
+    70,
+    'node-wrapped claude.js entrypoint must match (regex accepts .js/.mjs/.cjs suffix)'
+  )
+  assert.ok(
+    scoreAgentProcess({ basename: 'node', commandLine: 'node /opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js', command: '/usr/bin/node' }, 'codex') > 0,
+    'npm-style codex install (node /path/to/codex.js) must still match the codex agent'
+  )
+})
+
+test('agent scoring rejects transient shells spawned by claude with /tmp/claude-XXX-cwd in argv', () => {
+  const transientShellCmd = "/bin/zsh -c source /Users/foo/.claude/shell-snapshots/snap.sh && eval 'ls' && pwd -P >| /tmp/claude-abc123-cwd"
+  assert.strictEqual(
+    scoreAgentProcess({ basename: 'zsh', commandLine: transientShellCmd, command: '/bin/zsh' }, 'claude'),
+    0,
+    'transient zsh that claude spawns for Bash tool calls must not be scored as a claude agent process'
+  )
+  // Even non-shell processes whose argv mentions /tmp/claude-XXX-cwd must not match.
+  assert.strictEqual(
+    scoreAgentProcess({ basename: 'cat', commandLine: 'cat /tmp/claude-abc123-cwd', command: '/bin/cat' }, 'claude'),
+    0,
+    'argv mentioning /tmp/claude-XXX-cwd must not match the anchored claude needle'
+  )
+  // Shell-basename exclusion applies to every agent, not just claude.
+  assert.strictEqual(
+    scoreAgentProcess({ basename: 'bash', commandLine: '/bin/bash -c "codex"', command: '/bin/bash' }, 'codex'),
+    0,
+    'shells are never agent processes regardless of needle matches'
+  )
+})
+
+test('hook runtime ancestor walk skips transient shells and returns the real claude', () => {
+  // pid 300 is the hook process. Walking up: pid 200 is a transient zsh whose argv contains
+  // /tmp/claude-XXX-cwd (would have scored 70 under the old loose regex), pid 100 is the real
+  // claude binary. The shell-basename exclusion makes the zsh score 0, so the walk steps past
+  // it and binds to the real claude — regardless of first-match vs. highest-scorer semantics.
+  const processes = [
+    { pid: 100, ppid: 1, command: '/opt/homebrew/bin/claude', args: 'claude --dangerously-skip-permissions', commandLine: 'claude --dangerously-skip-permissions', basename: 'claude' },
+    { pid: 200, ppid: 100, command: '/bin/zsh', args: "zsh -c 'pwd -P >| /tmp/claude-abc-cwd'", commandLine: "zsh -c 'pwd -P >| /tmp/claude-abc-cwd'", basename: 'zsh' },
+    { pid: 300, ppid: 200, command: process.execPath, args: 'node scripts/hooks/claude.js', commandLine: 'node scripts/hooks/claude.js', basename: 'node' }
+  ]
+  const byPid = new Map()
+  const childrenByPpid = new Map()
+  for (const proc of processes) {
+    byPid.set(proc.pid, proc)
+    if (!childrenByPpid.has(proc.ppid)) childrenByPpid.set(proc.ppid, [])
+    childrenByPpid.get(proc.ppid).push(proc)
+  }
+
+  const resolved = resolveAgentProcess({
+    agentType: 'claude',
+    hookPid: 300,
+    parentPid: 200,
+    processTable: { byPid, childrenByPpid },
+    panePidResolver: () => null
+  })
+
+  assert.strictEqual(resolved.pid, 100, 'should walk past the transient zsh and bind to the real claude')
+  assert.strictEqual(resolved.pidSource, 'parent-chain')
+})
+
+test('hook runtime ancestor walk binds to the NEAREST agent in a nested same-type chain', () => {
+  // Outer claude wraps a child shell which wraps an inner claude which wraps the hook.
+  // Both claudes score, but the inner pid is the real owner of this hook event — binding
+  // to the outer would mean a child session's PID never dies when the inner process exits.
+  const processes = [
+    { pid: 100, ppid: 1, command: '/opt/homebrew/bin/claude', args: 'claude', commandLine: 'claude', basename: 'claude' },
+    { pid: 200, ppid: 100, command: '/bin/zsh', args: 'zsh -c claude', commandLine: 'zsh -c claude', basename: 'zsh' },
+    { pid: 300, ppid: 200, command: '/usr/bin/node', args: 'node /usr/local/bin/claude.js', commandLine: 'node /usr/local/bin/claude.js', basename: 'node' },
+    { pid: 400, ppid: 300, command: process.execPath, args: 'node scripts/hooks/claude.js', commandLine: 'node scripts/hooks/claude.js', basename: 'node' }
+  ]
+  const byPid = new Map()
+  const childrenByPpid = new Map()
+  for (const proc of processes) {
+    byPid.set(proc.pid, proc)
+    if (!childrenByPpid.has(proc.ppid)) childrenByPpid.set(proc.ppid, [])
+    childrenByPpid.get(proc.ppid).push(proc)
+  }
+
+  const resolved = resolveAgentProcess({
+    agentType: 'claude',
+    hookPid: 400,
+    parentPid: 300,
+    processTable: { byPid, childrenByPpid },
+    panePidResolver: () => null
+  })
+
+  assert.strictEqual(resolved.pid, 300, 'should bind to the inner claude (nearest ancestor), not the outer claude binary')
+  assert.strictEqual(resolved.pidSource, 'parent-chain')
+})
+
+test('sync sweepDeadProcesses rebinds to a live agent under the pane instead of marking stale', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+
+    const liveClaudePid = process.pid // the test process is alive by definition
+    const deadPid = 0x7fffffff // arbitrary high pid that's certain to be missing
+    const panePid = 555000
+    const now = Date.now()
+
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        stuck: {
+          sessionId: 'stuck',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          tmuxPane: '%42',
+          pid: deadPid,
+          pidSource: 'parent-chain',
+          startedAt: now - 60000,
+          lastUpdated: now - 30000
+        }
+      }
+    }))
+
+    const initResult = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+
+    // Build a fake process table: pane shell → claude (the test process, alive).
+    // claude.startedAtMs predates session.startedAt — this is the same long-lived
+    // agent, the original pid binding was just wrong.
+    const byPid = new Map()
+    const childrenByPpid = new Map()
+    const paneShell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+    const claudeProc = { pid: liveClaudePid, ppid: panePid, command: '/opt/homebrew/bin/claude', args: 'claude --dangerously-skip-permissions', commandLine: 'claude --dangerously-skip-permissions', basename: 'claude', startedAtMs: now - 120000 }
+    byPid.set(paneShell.pid, paneShell)
+    byPid.set(claudeProc.pid, claudeProc)
+    childrenByPpid.set(1, [paneShell])
+    childrenByPpid.set(panePid, [claudeProc])
+
+    const panes = new Map([['%42', { paneId: '%42', panePid, currentCommand: 'claude', paneDead: false }]])
+    panes.tmuxAvailable = true
+
+    const stats = sync.createStats()
+    sync.clearPidStateCache()
+    sync.sweepDeadProcesses(initResult.status, panes, { byPid, childrenByPpid }, stats)
+
+    const reloaded = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(reloaded.sessions.stuck.status, 'working', 'session must remain working — the agent is still alive under the pane')
+    assert.strictEqual(reloaded.sessions.stuck.pid, liveClaudePid, 'session.pid must be rebound to the live claude descendant')
+    assert.strictEqual(reloaded.sessions.stuck.pidSource, 'process-tree')
+    assert.strictEqual(stats.reconcile.pidBindings, 1)
+    assert.strictEqual(stats.reconcile.processExits, 0, 'no STALE/PROCESS_EXIT_DETECTED should be emitted when the pane still has a live agent')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync sweepDeadProcesses refuses to rebind to an agent that started AFTER the session (rapid restart)', () => {
+  // Scenario: the original agent process exited, then the user started a fresh agent
+  // in the same pane. The new process is NOT the same session — sync must mark the
+  // old session stale instead of silently rebinding to the new process.
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+
+    const newAgentPid = process.pid
+    const deadPid = 0x7fffffff
+    const panePid = 555100
+    const now = Date.now()
+
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        old: {
+          sessionId: 'old',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          tmuxPane: '%43',
+          pid: deadPid,
+          pidSource: 'parent-chain',
+          startedAt: now - 120000,
+          lastUpdated: now - 30000
+        }
+      }
+    }))
+
+    const initResult = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+
+    // Fresh claude started AFTER the old session began — startedAtMs > session.startedAt.
+    const byPid = new Map()
+    const childrenByPpid = new Map()
+    const paneShell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+    const freshClaude = { pid: newAgentPid, ppid: panePid, command: '/opt/homebrew/bin/claude', args: 'claude', commandLine: 'claude', basename: 'claude', startedAtMs: now - 5000 }
+    byPid.set(paneShell.pid, paneShell)
+    byPid.set(freshClaude.pid, freshClaude)
+    childrenByPpid.set(1, [paneShell])
+    childrenByPpid.set(panePid, [freshClaude])
+
+    const panes = new Map([['%43', { paneId: '%43', panePid, currentCommand: 'claude', paneDead: false }]])
+    panes.tmuxAvailable = true
+
+    const stats = sync.createStats()
+    sync.clearPidStateCache()
+    sync.sweepDeadProcesses(initResult.status, panes, { byPid, childrenByPpid }, stats)
+
+    const reloaded = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.notStrictEqual(reloaded.sessions.old.pid, newAgentPid, 'must NOT rebind to a fresh agent that started after the session')
+    assert.strictEqual(stats.reconcile.pidBindings, 0, 'no rebind should happen when the live agent post-dates the session')
+    assert.strictEqual(stats.reconcile.processExits, 1, 'STALE/PROCESS_EXIT_DETECTED must fire so the new agent can claim a fresh session')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('phaseDecision stale recovery requires a hook event newer than the stale transition', () => {
+  const staleAt = Date.now() - 1000
+  const baseSession = () => ({
+    sessionId: 'recover',
+    agentType: 'claude',
+    phase: 'stale',
+    status: 'stale',
+    endedAt: staleAt,
+    stateSource: 'pid',
+    stateConfidence: 95,
+    lifecycle: { phase: 'stale', source: 'pid', priority: 95, updatedAt: staleAt }
+  })
+
+  // Hook event newer than stale transition — recovers.
+  const fresh = baseSession()
+  const freshResult = applySessionEvent(fresh, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'claude-hooks',
+    timestamp: staleAt + 5000
+  })
+  assert.strictEqual(freshResult.applied, true, 'hook event newer than stale transition must recover')
+  assert.strictEqual(currentPhase(fresh), 'running')
+  assert.strictEqual(fresh.endedAt, null, 'recovery must clear endedAt so the picker shows the session again')
+
+  // Hook event delivered late but generated BEFORE the stale transition — blocked.
+  const lateDelivery = baseSession()
+  const lateResult = applySessionEvent(lateDelivery, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'claude-hooks',
+    timestamp: staleAt - 5000
+  })
+  assert.strictEqual(lateResult.applied, false, 'delayed hook with old timestamp must not resurrect a stale session')
+  assert.strictEqual(currentPhase(lateDelivery), 'stale')
+  assert.strictEqual(lateDelivery.endedAt, staleAt, 'endedAt must not be cleared by an old event')
+
+  // Transcript-sourced events are never allowed to recover, regardless of timestamp.
+  const transcriptSession = baseSession()
+  const transcriptResult = applySessionEvent(transcriptSession, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'transcript',
+    timestamp: staleAt + 5000
+  })
+  assert.strictEqual(transcriptResult.applied, false, 'transcript-sourced events must not resurrect stale sessions')
+  assert.strictEqual(currentPhase(transcriptSession), 'stale')
 })
 
 test('watchdog option is enabled by default and can be explicitly disabled', () => {

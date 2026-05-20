@@ -2,6 +2,11 @@
 
 const path = require('path')
 
+// Shells are never agent processes themselves. We exclude them so a transient
+// shell whose argv happens to contain "/claude-XXXX-cwd" (or similar tmp-file
+// patterns from agent CLIs) can't be misidentified as the agent.
+const SHELL_BASENAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'tcsh', 'csh', 'nu'])
+
 // `color` is the terminal foreground chosen from the product palette for legibility.
 const AGENTS = [
   {
@@ -10,7 +15,9 @@ const AGENTS = [
     brandColor: '#d97757',
     color: '38;5;173',
     processNames: ['claude'],
-    commandIncludes: ['claude-code', '/claude']
+    // Anchored so /tmp/claude-XXXX-cwd (Claude Code tmp marker) does NOT match.
+    // Accepts `claude`, `claude.js`/`.mjs`/`.cjs` so `node /path/claude.js` still matches.
+    commandIncludes: ['claude-code', /(^|\/)claude(\.[cm]?js)?(\s|$)/]
   },
   {
     id: 'codex',
@@ -18,7 +25,7 @@ const AGENTS = [
     brandColor: '#10a37f',
     color: '38;5;36',
     processNames: ['codex'],
-    commandIncludes: ['/codex']
+    commandIncludes: [/\/codex\b/]
   },
   {
     id: 'opencode',
@@ -34,7 +41,7 @@ const AGENTS = [
     brandColor: '#4285f4',
     color: '38;5;69',
     processNames: ['gemini'],
-    commandIncludes: ['gemini-cli', '/gemini']
+    commandIncludes: ['gemini-cli', /\/gemini\b/]
   },
   {
     id: 'copilot-cli',
@@ -51,7 +58,7 @@ const AGENTS = [
     brandColor: '#edecec',
     color: '38;5;255',
     processNames: ['cursor'],
-    commandIncludes: ['cursor-agent', '/cursor']
+    commandIncludes: ['cursor-agent', /\/cursor\b/]
   },
   {
     id: 'kimi',
@@ -59,7 +66,7 @@ const AGENTS = [
     brandColor: '#0d0f14',
     color: '38;5;246',
     processNames: ['kimi'],
-    commandIncludes: ['/kimi']
+    commandIncludes: [/\/kimi\b/]
   },
   {
     id: 'hermes',
@@ -67,7 +74,7 @@ const AGENTS = [
     brandColor: '#e5c07b',
     color: '38;5;180',
     processNames: ['hermes'],
-    commandIncludes: ['/hermes']
+    commandIncludes: [/\/hermes\b/]
   },
   {
     id: 'coco',
@@ -76,7 +83,7 @@ const AGENTS = [
     brandColor: '#32f08c',
     color: '38;5;84',
     processNames: ['trae', 'coco'],
-    commandIncludes: ['traecli', '/trae', '/coco']
+    commandIncludes: ['traecli', /\/trae\b/, /\/coco\b/]
   }
 ]
 
@@ -109,6 +116,13 @@ function agentDisplay(agentType) {
   }
 }
 
+function matchesNeedle(needle, command) {
+  if (!needle) return false
+  if (needle instanceof RegExp) return needle.test(command)
+  const lowered = normalizeAgentType(needle)
+  return lowered.length > 0 && command.includes(lowered)
+}
+
 function scoreAgentProcess(proc, agentType) {
   const config = agentConfig(agentType)
   const name = String(proc && proc.basename ? proc.basename : '').toLowerCase()
@@ -116,13 +130,14 @@ function scoreAgentProcess(proc, agentType) {
   const commandPath = String(proc && proc.command || '').toLowerCase()
   const basename = path.basename(commandPath).toLowerCase()
   const processNames = (config.processNames || []).map(normalizeAgentType)
-  const needles = (config.commandIncludes || []).map(normalizeAgentType)
+  const needles = config.commandIncludes || []
 
   if (!config.id || config.id === 'unknown') return 0
+  if (SHELL_BASENAMES.has(name) || SHELL_BASENAMES.has(basename)) return 0
   if (processNames.includes(name) || processNames.includes(basename)) return 100
   if (name.includes(config.id) || basename.includes(config.id)) return 80
   if ((config.aliases || []).some(alias => name.includes(alias) || basename.includes(alias))) return 75
-  if (needles.some(needle => needle && command.includes(needle))) return 70
+  if (needles.some(needle => matchesNeedle(needle, command))) return 70
   return 0
 }
 

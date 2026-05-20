@@ -226,7 +226,7 @@ function exitEventForSession(session, reason, source, now) {
   }
 }
 
-function sweepDeadProcesses(status, panes, stats) {
+function sweepDeadProcesses(status, panes, processTable, stats) {
   const now = Date.now()
   let changed = false
 
@@ -235,6 +235,28 @@ function sweepDeadProcesses(status, panes, stats) {
     const pane = session && session.tmuxPane ? panes.get(session.tmuxPane) : null
     if (!session || session.endedAt || !pane || !hasTrackedPid(session)) continue
     if (getPidState(session.pid) !== 'dead') continue
+
+    // Stored pid is dead, but the agent may still be alive under the pane —
+    // the previous binding could have been a transient child process. Rebind
+    // to a live descendant ONLY when it has been running since before the
+    // session started; a newer process is a fresh agent that needs its own
+    // session, not a continuation of the dead one.
+    const liveAgent = findAgentProcessFromPane(pane.panePid, session.agentType, processTable)
+    if (liveAgent && getPidState(liveAgent.pid) !== 'dead') {
+      const sessionStartedAt = Number.isFinite(session.startedAt) ? session.startedAt : null
+      const procStartedAt = Number.isFinite(liveAgent.startedAtMs) ? liveAgent.startedAtMs : null
+      if (procStartedAt !== null && sessionStartedAt !== null && procStartedAt <= sessionStartedAt) {
+        session.pid = liveAgent.pid
+        session.pidSource = 'process-tree'
+        session.pidCommand = liveAgent.commandLine || liveAgent.args || liveAgent.command
+        session.pidBoundAt = now
+        session.lastUpdated = now
+        writeJsonAtomic(sessionFilePath(sessionId), session)
+        if (stats) stats.reconcile.pidBindings++
+        changed = true
+        continue
+      }
+    }
 
     const reason = `pid ${session.pid} exited while pane ${session.tmuxPane} remained open`
     const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pid', now), stats)
@@ -274,8 +296,10 @@ function sweepVanishedPanes(status, panes, stats) {
 function reconcileSessions(status, panes, stats) {
   const processTable = readProcessTable()
   sweepVanishedPanes(status, panes, stats)
-  sweepDeadProcesses(status, panes, stats)
+  // Rebind before liveness check so a stale binding gets a chance to move
+  // to a live agent descendant before sweepDeadProcesses sees the dead pid.
   sweepPidBindings(status, panes, processTable, stats)
+  sweepDeadProcesses(status, panes, processTable, stats)
 }
 
 // --- Codex transcript helpers ---
@@ -591,7 +615,7 @@ function run(file, options = {}) {
   return { status, panes, stats }
 }
 
-module.exports = { run, isWatcherRunning, clearPidStateCache, createStats, sweepVanishedPanes }
+module.exports = { run, isWatcherRunning, clearPidStateCache, createStats, sweepVanishedPanes, sweepDeadProcesses }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

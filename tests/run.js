@@ -1210,6 +1210,119 @@ test('sync sweepDeadProcesses rebinds to a live agent under the pane instead of 
   }
 })
 
+test('sync discovers tmux agent panes without an existing hook snapshot', () => {
+  const now = Date.now()
+  const panePid = 555050
+  const agentPid = 555051
+  const status = { version: 1, lastUpdated: now, sessions: {} }
+  const panes = new Map([['%77', {
+    paneId: '%77',
+    panePid,
+    currentCommand: 'zsh',
+    paneDead: false,
+    sessionName: 'work',
+    windowIndex: 3,
+    windowName: 'agent'
+  }]])
+  panes.tmuxAvailable = true
+
+  const processTable = (agentStartedAtMs) => {
+    const paneShell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+    const claudeProc = { pid: agentPid, ppid: panePid, command: '/opt/homebrew/bin/claude', args: 'claude', commandLine: 'claude', basename: 'claude', startedAtMs: agentStartedAtMs }
+    return {
+      byPid: new Map([[paneShell.pid, paneShell], [claudeProc.pid, claudeProc]]),
+      childrenByPpid: new Map([[1, [paneShell]], [panePid, [claudeProc]]])
+    }
+  }
+  const stats = sync.createStats()
+
+  const changed = sync.discoverPaneSessions(status, panes, processTable(now - 300000), stats, {
+    now,
+    writeSession: false,
+    writeStatus: false
+  })
+
+  const id = sync.discoverySessionId('claude', '%77')
+  const session = status.sessions[id]
+  assert.strictEqual(changed, true)
+  assert.ok(session, 'discovered session should be registered')
+  assert.strictEqual(session.agentType, 'claude')
+  assert.strictEqual(session.tmuxPane, '%77')
+  assert.strictEqual(session.pid, agentPid)
+  assert.strictEqual(session.phase, SESSION_PHASES.IDLE)
+  assert.strictEqual(session.status, 'idle')
+  assert.strictEqual(session.stateSource, 'pane-discovery')
+  assert.strictEqual(session.stateEvidence[0].rawEventName, 'tmux_pane_discovered')
+  assert.strictEqual(stats.reconcile.paneDiscoveries, 1)
+
+  const second = sync.discoverPaneSessions(status, panes, processTable(now - 299003), stats, {
+    now: now + 1000,
+    writeSession: false,
+    writeStatus: false
+  })
+  assert.strictEqual(second, false, 'unchanged discovery should not rewrite every tick')
+  assert.strictEqual(stats.reconcile.discoveryUpdates, 0)
+})
+
+test('sync removes discovered placeholder when a real hook session exists in the same pane', () => {
+  const now = Date.now()
+  const panePid = 555060
+  const agentPid = 555061
+  const placeholderId = sync.discoverySessionId('trae', '%78')
+  const status = {
+    version: 1,
+    lastUpdated: now,
+    sessions: {
+      [placeholderId]: {
+        sessionId: placeholderId,
+        agentType: 'trae',
+        phase: 'idle',
+        status: 'idle',
+        tmuxPane: '%78',
+        pid: agentPid,
+        stateSource: 'pane-discovery',
+        lastEvent: { type: AGENT_EVENTS.DISCOVERED, rawEventName: 'tmux_pane_discovered' }
+      },
+      real: {
+        sessionId: 'real',
+        agentType: 'coco',
+        phase: 'running',
+        status: 'working',
+        tmuxPane: '%78',
+        pid: agentPid,
+        stateSource: 'hook',
+        lastUpdated: now
+      }
+    }
+  }
+  const panes = new Map([['%78', {
+    paneId: '%78',
+    panePid,
+    currentCommand: 'trae',
+    paneDead: false,
+    sessionName: 'work',
+    windowIndex: 4,
+    windowName: 'trae'
+  }]])
+  panes.tmuxAvailable = true
+  const paneShell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+  const traeProc = { pid: agentPid, ppid: panePid, command: '/usr/local/bin/trae', args: 'trae', commandLine: 'trae', basename: 'trae', startedAtMs: now - 300000 }
+  const byPid = new Map([[paneShell.pid, paneShell], [traeProc.pid, traeProc]])
+  const childrenByPpid = new Map([[1, [paneShell]], [panePid, [traeProc]]])
+  const stats = sync.createStats()
+
+  const changed = sync.discoverPaneSessions(status, panes, { byPid, childrenByPpid }, stats, {
+    now,
+    writeSession: false,
+    writeStatus: false
+  })
+
+  assert.strictEqual(changed, true)
+  assert.strictEqual(status.sessions[placeholderId], undefined)
+  assert.ok(status.sessions.real, 'real hook session should remain')
+  assert.strictEqual(stats.reconcile.discoveryReplacements, 1)
+})
+
 test('sync sweepDeadProcesses refuses to rebind to an agent that started AFTER the session (rapid restart)', () => {
   // Scenario: the original agent process exited, then the user started a fresh agent
   // in the same pane. The new process is NOT the same session — sync must mark the
@@ -4929,7 +5042,9 @@ test('codex jsonl discovery remains disabled for subagent sessions', () => {
     ].join('\n') + '\n')
 
     const statusFile = path.join(dir, '.tmux-scout', 'status.json')
-    const result = sync.run(statusFile)
+    const result = sync.run(statusFile, {
+      paneDiscovery: false
+    })
     assert.deepStrictEqual(Object.keys(result.status.sessions), [])
     assert.strictEqual(fs.existsSync(statusFile), false)
   } finally {

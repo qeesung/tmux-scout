@@ -139,6 +139,9 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     + (reconcile.paneShellExits || 0)
     + (reconcile.paneVanished || 0)
     + (reconcile.pidBindings || 0)
+    + (reconcile.paneDiscoveries || 0)
+    + (reconcile.discoveryUpdates || 0)
+    + (reconcile.discoveryReplacements || 0)
   const evidence = stats && stats.evidence ? stats.evidence : {}
   const registry = stats && stats.registry ? stats.registry : {}
   const claudeInterruptions = claudeTranscript.interrupted || 0
@@ -157,6 +160,9 @@ function summarizeStats(stats, durationMs, mode, startedAt, finishedAt) {
     paneShellExits: reconcile.paneShellExits || 0,
     paneVanished: reconcile.paneVanished || 0,
     pidBindings: reconcile.pidBindings || 0,
+    paneDiscoveries: reconcile.paneDiscoveries || 0,
+    discoveryUpdates: reconcile.discoveryUpdates || 0,
+    discoveryReplacements: reconcile.discoveryReplacements || 0,
     codexInterrupted: codexInterruptions,
     codexIdleInterrupted: codexIdleInterruptions,
     codexTranscriptRead: codex.filesRead || 0,
@@ -187,6 +193,9 @@ function formatTickDiagnostics(summary) {
   if (Number.isFinite(summary.durationMs)) parts.push(`duration=${summary.durationMs}ms`)
   if (Number.isFinite(summary.changes)) parts.push(`changes=${summary.changes}`)
   if (Number.isFinite(summary.reconcileChanges)) parts.push(`reconcile=${summary.reconcileChanges}`)
+  if (summary.paneDiscoveries > 0) parts.push(`discover=${summary.paneDiscoveries}`)
+  if (summary.discoveryUpdates > 0) parts.push(`discoverUpdate=${summary.discoveryUpdates}`)
+  if (summary.discoveryReplacements > 0) parts.push(`discoverReplace=${summary.discoveryReplacements}`)
   if (Number.isFinite(summary.codexTranscriptRead)) parts.push(`codexRead=${summary.codexTranscriptRead}`)
   if (Number.isFinite(summary.claudeTranscriptRead)) parts.push(`claudeRead=${summary.claudeTranscriptRead}`)
   if (summary.claudeTranscriptParseErrors > 0) parts.push(`claudeParseErrors=${summary.claudeTranscriptParseErrors}`)

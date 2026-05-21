@@ -11,8 +11,9 @@ const { DEFAULT_TAIL_BYTES } = require('../lib/jsonl-tail-reader')
 const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-tree')
 const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { AGENT_EVENTS } = require('../lib/agent-events')
+const { AGENTS, agentConfig } = require('../lib/agents')
 const { findLatestCodexInterrupt } = require('../lib/codex-transcript-detector')
-const { pruneSessions } = require('../lib/session-registry')
+const { deleteSession, pruneSessions } = require('../lib/session-registry')
 
 let statusFile = process.argv[2] || ''
 let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') : ''
@@ -33,7 +34,10 @@ function createStats(options = {}) {
       processExits: 0,
       paneShellExits: 0,
       paneVanished: 0,
-      pidBindings: 0
+      pidBindings: 0,
+      paneDiscoveries: 0,
+      discoveryUpdates: 0,
+      discoveryReplacements: 0
     },
     codex: {
       discovered: 0,
@@ -101,6 +105,209 @@ function writeJsonAtomic(filePath, data) {
 
 function sessionFilePath(sessionId) {
   return path.join(sessionsDir, sessionId.replace(/[/\\:]/g, '_') + '.json')
+}
+
+function sameAgentType(left, right) {
+  return agentConfig(left).id === agentConfig(right).id
+}
+
+function discoveryAgentType(agent, proc) {
+  if (!agent || agent.id !== 'coco') return agent && agent.id
+  const text = String(proc && (proc.basename || proc.command || proc.commandLine || proc.args) || '').toLowerCase()
+  if (text.includes('trae')) return 'trae'
+  if (text.includes('coco')) return 'coco'
+  return 'trae'
+}
+
+function discoverySessionId(agentType, paneId) {
+  return `tmux-pane:${paneId}:${agentType}`
+}
+
+function isDiscoverySession(session) {
+  return Boolean(session && (
+    session.stateSource === 'pane-discovery' ||
+    (session.discovery && session.discovery.source === 'tmux-pane') ||
+    (session.lastEvent && session.lastEvent.type === AGENT_EVENTS.DISCOVERED)
+  ))
+}
+
+function isLiveRealPaneSession(session, paneId, agentType) {
+  if (!session || isDiscoverySession(session)) return false
+  if (session.tmuxPane !== paneId) return false
+  if (!sameAgentType(session.agentType, agentType)) return false
+  const phase = currentPhase(session)
+  return !session.endedAt && phase !== 'crashed' && phase !== 'stale'
+}
+
+function bestAgentProcessForPane(pane, processTable) {
+  if (!pane || pane.paneDead || !Number.isInteger(pane.panePid)) return null
+  let best = null
+  for (const agent of AGENTS) {
+    const proc = findAgentProcessFromPane(pane.panePid, agent.id, processTable)
+    if (!proc) continue
+    if (!best || (proc.score || 0) > (best.proc.score || 0)) {
+      best = { agent, proc, agentType: discoveryAgentType(agent, proc) }
+    }
+  }
+  return best
+}
+
+function discoveryMetadata(sessionId, pane, hit, now) {
+  const proc = hit.proc
+  const command = String(proc.commandLine || proc.args || proc.command || '').trim()
+  return {
+    sessionId,
+    agentType: hit.agentType,
+    startedAt: Number.isFinite(proc.startedAtMs) ? proc.startedAtMs : now,
+    workingDirectory: undefined,
+    tmuxPane: pane.paneId,
+    tmuxSessionName: pane.sessionName,
+    tmuxWindowIndex: pane.windowIndex,
+    tmuxWindowName: pane.windowName,
+    pid: proc.pid,
+    pidSource: 'process-tree',
+    pidCommand: command,
+    discoveredAt: now,
+    discovery: {
+      source: 'tmux-pane',
+      paneId: pane.paneId,
+      panePid: pane.panePid,
+      currentCommand: pane.currentCommand,
+      processCommand: command,
+      processStartedAt: Number.isFinite(proc.startedAtMs) ? proc.startedAtMs : undefined
+    }
+  }
+}
+
+function compactObject(value) {
+  const clean = {}
+  for (const [key, item] of Object.entries(value || {})) {
+    if (item !== undefined && item !== null && item !== '') clean[key] = item
+  }
+  return clean
+}
+
+function metadataChanged(session, metadata) {
+  for (const [key, value] of Object.entries(metadata)) {
+    if (key === 'discovery') continue
+    if (session[key] !== value) return true
+  }
+  const previous = session.discovery || {}
+  const next = metadata.discovery || {}
+  for (const [key, value] of Object.entries(next)) {
+    if (previous[key] !== value) return true
+  }
+  return false
+}
+
+function preserveStableDiscoveryMetadata(session, metadata) {
+  if (!session || !metadata) return
+  if (Number.isFinite(session.discoveredAt)) metadata.discoveredAt = session.discoveredAt
+  if (session.pid !== metadata.pid) return
+
+  if (Number.isFinite(session.startedAt)) metadata.startedAt = session.startedAt
+  if (!metadata.discovery) metadata.discovery = {}
+  if (Number.isFinite(session.discovery && session.discovery.processStartedAt)) {
+    metadata.discovery.processStartedAt = session.discovery.processStartedAt
+  }
+}
+
+function writeSessionIfNeeded(sessionId, session, options = {}) {
+  if (options.writeSession === false) return
+  writeJsonAtomic(sessionFilePath(sessionId), session)
+}
+
+function writeStatusIfNeeded(status, options = {}) {
+  if (options.writeStatus === false || !statusFile) return
+  writeJsonAtomic(statusFile, status)
+}
+
+function removeDiscoverySession(status, sessionId, stats, options = {}) {
+  let changed = false
+  if (options.writeSession === false) {
+    changed = Object.prototype.hasOwnProperty.call(status.sessions || {}, sessionId)
+    if (changed) delete status.sessions[sessionId]
+  } else {
+    changed = deleteSession(status, { sessionsDir }, sessionId, 'replaced-by-real-session').changed
+  }
+  if (!changed) return false
+  if (stats && stats.reconcile) stats.reconcile.discoveryReplacements++
+  writeStatusIfNeeded(status, options)
+  return true
+}
+
+function upsertDiscoverySession(status, sessionId, pane, hit, stats, options = {}) {
+  const now = Number.isFinite(options.now) ? options.now : Date.now()
+  const existing = status.sessions[sessionId]
+  const phase = existing ? currentPhase(existing) : null
+  const replace = existing && (existing.endedAt || phase === 'crashed' || phase === 'stale')
+  const base = replace ? null : existing
+  const metadata = compactObject(discoveryMetadata(sessionId, pane, hit, now))
+  metadata.discovery = compactObject(metadata.discovery)
+  preserveStableDiscoveryMetadata(base, metadata)
+  if (base && !metadataChanged(base, metadata)) return false
+  if (replace) {
+    if (options.writeSession === false) delete status.sessions[sessionId]
+    else deleteSession(status, { sessionsDir }, sessionId, 'discovery-reused')
+  }
+
+  const session = base || {
+    sessionId,
+    agentType: hit.agentType,
+    startedAt: metadata.startedAt || now
+  }
+  const before = JSON.stringify(session)
+  const event = {
+    type: AGENT_EVENTS.DISCOVERED,
+    source: 'pane',
+    stateSource: 'pane-discovery',
+    rawEventName: 'tmux_pane_discovered',
+    timestamp: now,
+    phase: 'idle',
+    details: `${hit.agentType} process discovered in tmux pane ${pane.paneId}`,
+    pid: hit.proc.pid,
+    tmuxPane: pane.paneId,
+    updates: metadata
+  }
+  applySessionEvent(session, event)
+  if (!session.sessionTitle) session.sessionTitle = `${hit.agentType} session`
+  status.sessions[sessionId] = session
+  writeSessionIfNeeded(sessionId, session, options)
+
+  if (before !== JSON.stringify(session)) {
+    if (stats && stats.reconcile) {
+      if (base) stats.reconcile.discoveryUpdates++
+      else stats.reconcile.paneDiscoveries++
+    }
+    return true
+  }
+  return false
+}
+
+function discoverPaneSessions(status, panes, processTable, stats, options = {}) {
+  if (!status || !status.sessions || !panes || panes.tmuxAvailable !== true) return false
+  let changed = false
+
+  for (const pane of panes.values()) {
+    if (!pane || pane.paneDead) continue
+    const hit = bestAgentProcessForPane(pane, processTable)
+    if (!hit || !hit.agentType) continue
+    const sessionId = discoverySessionId(hit.agentType, pane.paneId)
+    const hasRealSession = Object.values(status.sessions || {}).some(session => {
+      return isLiveRealPaneSession(session, pane.paneId, hit.agentType)
+    })
+    if (hasRealSession) {
+      changed = removeDiscoverySession(status, sessionId, stats, options) || changed
+      continue
+    }
+    changed = upsertDiscoverySession(status, sessionId, pane, hit, stats, options) || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = Number.isFinite(options.now) ? options.now : Date.now()
+    writeStatusIfNeeded(status, options)
+  }
+  return changed
 }
 
 // --- tmux pane snapshot ---
@@ -315,8 +522,11 @@ function sweepVanishedPanes(status, panes, stats) {
   }
 }
 
-function reconcileSessions(status, panes, stats) {
+function reconcileSessions(status, panes, stats, options = {}) {
   const processTable = readProcessTable()
+  if (options.paneDiscovery !== false) {
+    discoverPaneSessions(status, panes, processTable, stats)
+  }
   sweepVanishedPanes(status, panes, stats)
   // Rebind before liveness check so a stale binding gets a chance to move
   // to a live agent descendant before sweepDeadProcesses sees the dead pid.
@@ -762,7 +972,7 @@ function run(file, options = {}) {
   if (!statusFile) return { status: null, panes: new Map(), stats }
   const status = readJson(statusFile, { version: 1, lastUpdated: Date.now(), sessions: {} })
   const panes = getPaneSnapshot()
-  if (options.reconcile !== false) reconcileSessions(status, panes, stats)
+  if (options.reconcile !== false) reconcileSessions(status, panes, stats, options)
   syncCodexSessions(status, panes, options, stats)
   if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats)
   sweepIdleClaudeSessions(status, stats, options)
@@ -771,7 +981,18 @@ function run(file, options = {}) {
   return { status, panes, stats }
 }
 
-module.exports = { run, isWatcherRunning, clearPidStateCache, createStats, sweepVanishedPanes, sweepDeadProcesses, pruneRegistrySessions }
+module.exports = {
+  run,
+  isWatcherRunning,
+  clearPidStateCache,
+  createStats,
+  sweepVanishedPanes,
+  sweepDeadProcesses,
+  pruneRegistrySessions,
+  discoverPaneSessions,
+  discoverySessionId,
+  isDiscoverySession
+}
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

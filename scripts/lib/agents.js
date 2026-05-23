@@ -79,7 +79,7 @@ const AGENTS = [
   {
     id: 'coco',
     aliases: ['trae'],
-    label: 'Trae',
+    label: 'trae',
     brandColor: '#32f08c',
     color: '38;5;84',
     processNames: ['trae', 'coco'],

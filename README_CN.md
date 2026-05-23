@@ -135,7 +135,7 @@ tmux-scout 目前支持下表中的 agent CLI。颜色示例是 tmux/fzf 中 age
 | Cursor Agent | `cursor` | `--cursor` | ![#eeeeee](docs/agent-colors/cursor.svg) 近白色 (`#eeeeee`) |
 | Kimi CLI | `kimi` | `--kimi` | ![#949494](docs/agent-colors/kimi.svg) 灰色 (`#949494`) |
 | Hermes | `hermes` | `--hermes` | ![#d7af87](docs/agent-colors/hermes.svg) 沙色 (`#d7af87`) |
-| Trae CLI | `Trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) 亮绿色 (`#5fff87`) |
+| Trae CLI | `trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) 亮绿色 (`#5fff87`) |
 
 ### 状态栏
 

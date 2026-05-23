@@ -928,6 +928,7 @@ test('agent registry provides display metadata and process scoring', () => {
     assert.match(agent.color, /^38;5;(?:1[6-9]|[2-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/)
   }
   assert.deepStrictEqual(agentDisplay('codex'), { label: 'codex', color: '38;5;36' })
+  assert.deepStrictEqual(agentDisplay('trae'), { label: 'trae', color: '38;5;84' })
   assert.strictEqual(scoreAgentProcess({ basename: 'opencode', commandLine: '/usr/bin/opencode' }, 'opencode'), 100)
   assert.strictEqual(scoreAgentProcess({ basename: 'gh', commandLine: 'gh copilot suggest' }, 'copilot-cli'), 70)
   assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)

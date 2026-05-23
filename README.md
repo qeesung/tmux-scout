@@ -135,7 +135,7 @@ Run `npm run agent-colors` to preview the same colors in your terminal.
 | Cursor Agent | `cursor` | `--cursor` | ![#eeeeee](docs/agent-colors/cursor.svg) near-white (`#eeeeee`) |
 | Kimi CLI | `kimi` | `--kimi` | ![#949494](docs/agent-colors/kimi.svg) gray (`#949494`) |
 | Hermes | `hermes` | `--hermes` | ![#d7af87](docs/agent-colors/hermes.svg) sand (`#d7af87`) |
-| Trae CLI | `Trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) bright green (`#5fff87`) |
+| Trae CLI | `trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) bright green (`#5fff87`) |
 
 ### Status Bar
 

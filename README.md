@@ -1,5 +1,7 @@
 # tmux-scout
 
+![tmux-scout feature overview](https://github.com/user-attachments/assets/d08bc43d-9fbe-40fa-a391-ec9654f9f0d3)
+
 A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, and Trae CLI sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
 
 [中文文档](README_CN.md)

@@ -1,5 +1,7 @@
 # tmux-scout
 
+![tmux-scout 功能总览](https://github.com/user-attachments/assets/4305c4ed-bc1e-4f36-848d-3ebb76cc4dd4)
+
 一个用于监控和导航 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Gemini CLI、Kimi CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Hermes 和 Trae CLI 会话的 tmux 插件。提供实时 fzf 选择器在 agent 面板间快速跳转，状态栏组件显示会话计数，以及自动检测崩溃的会话。
 
 [English](README.md)

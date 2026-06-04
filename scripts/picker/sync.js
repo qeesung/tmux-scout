@@ -348,6 +348,16 @@ function hasTrackedPid(session) {
   return Number.isInteger(session.pid) && session.pid > 0
 }
 
+// Agents with a daemon/worker model (e.g. Claude Code) rotate the pid we track
+// mid-session. While the agent's hooks are still firing it is demonstrably alive,
+// so pid-liveness inference must not declare a crash. Matches the 2-minute window
+// session-details uses to flag a session's state as possibly stale.
+const HOOK_LIVENESS_GRACE_MS = 2 * 60 * 1000
+
+function hasRecentHookActivity(session, now) {
+  return Number.isFinite(session.lastHookAt) && (now - session.lastHookAt) < HOOK_LIVENESS_GRACE_MS
+}
+
 function isRecordedProcessExit(session) {
   return currentPhase(session) === 'interrupted' && session.terminalKind === 'processExit'
 }
@@ -474,7 +484,13 @@ function sweepDeadProcesses(status, panes, processTable, stats) {
     if (liveAgent && getPidState(liveAgent.pid) !== 'dead') {
       const sessionStartedAt = Number.isFinite(session.startedAt) ? session.startedAt : null
       const procStartedAt = Number.isFinite(liveAgent.startedAtMs) ? liveAgent.startedAtMs : null
-      if (procStartedAt !== null && sessionStartedAt !== null && procStartedAt <= sessionStartedAt) {
+      const startedBeforeSession = procStartedAt !== null && sessionStartedAt !== null && procStartedAt <= sessionStartedAt
+      // A newer live process under the pane is normally a fresh agent that needs its
+      // own session, so we only adopt one that predates the session. But when the
+      // agent's hooks are still firing, this session is alive in this pane and the
+      // tracked pid was simply rotated (daemon/worker model), so rebind to the live
+      // worker even if it is newer than the session.
+      if (startedBeforeSession || hasRecentHookActivity(session, now)) {
         session.pid = liveAgent.pid
         session.pidSource = 'process-tree'
         session.pidCommand = liveAgent.commandLine || liveAgent.args || liveAgent.command
@@ -486,6 +502,13 @@ function sweepDeadProcesses(status, panes, processTable, stats) {
         continue
       }
     }
+
+    // No live agent process resolved under the pane, but if the agent's hooks are
+    // still firing it is alive despite the recorded pid being gone — defer rather
+    // than infer a false crash. lastHookAt keeps advancing even while a session
+    // holds a terminal phase, so this also lets a recovered session settle without
+    // flapping back to crashed on the next sweep.
+    if (hasRecentHookActivity(session, now)) continue
 
     const reason = `pid ${session.pid} exited while pane ${session.tmuxPane} remained open`
     const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pid', now), stats)

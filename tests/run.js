@@ -1447,6 +1447,187 @@ test('phaseDecision stale recovery requires a hook event newer than the stale tr
   assert.strictEqual(currentPhase(transcriptSession), 'stale')
 })
 
+test('phaseDecision recovers a pid-inferred crash on a newer hook but keeps observed crashes terminal', () => {
+  // A daemon/worker agent (e.g. Claude Code) rotates the pid we track mid-session,
+  // which trips the pid-exit crash inference even though the session is alive. A newer
+  // hook event from the agent proves the inference wrong and must recover the session;
+  // a crash observed from any non-pid source carries stronger proof and stays one-way.
+  const crashedAt = Date.now() - 1000
+  const pidCrash = () => ({
+    sessionId: 'recover-crash',
+    agentType: 'claude',
+    phase: 'crashed',
+    status: 'crashed',
+    endedAt: crashedAt,
+    stateSource: 'pid',
+    stateConfidence: 95,
+    lifecycle: { phase: 'crashed', source: 'pid', priority: 95, updatedAt: crashedAt }
+  })
+
+  // Hook event newer than the crash transition — recovers and clears endedAt.
+  const fresh = pidCrash()
+  const freshResult = applySessionEvent(fresh, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'claude-hooks',
+    timestamp: crashedAt + 5000
+  })
+  assert.strictEqual(freshResult.applied, true, 'hook newer than a pid-inferred crash must recover')
+  assert.strictEqual(currentPhase(fresh), 'running')
+  assert.strictEqual(fresh.endedAt, null, 'recovery must clear endedAt so the picker shows the session again')
+
+  // Delayed hook generated BEFORE the crash transition — blocked.
+  const late = pidCrash()
+  const lateResult = applySessionEvent(late, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'claude-hooks',
+    timestamp: crashedAt - 5000
+  })
+  assert.strictEqual(lateResult.applied, false, 'a hook older than the crash transition must not resurrect it')
+  assert.strictEqual(currentPhase(late), 'crashed')
+
+  // Crash observed from a non-pid source must remain one-way.
+  const observed = pidCrash()
+  observed.stateSource = 'notify'
+  observed.lifecycle = { phase: 'crashed', source: 'notify', priority: 40, updatedAt: crashedAt }
+  const observedResult = applySessionEvent(observed, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'claude-hooks',
+    timestamp: crashedAt + 5000
+  })
+  assert.strictEqual(observedResult.applied, false, 'a non-pid (observed) crash must remain one-way')
+  assert.strictEqual(currentPhase(observed), 'crashed')
+})
+
+test('sync sweepDeadProcesses rebinds to a newer worker while the agent hooks are active (daemon pid rotation)', () => {
+  // Same shape as the rapid-restart guard above, but the session's hooks are still
+  // firing (recent lastHookAt). That proves the session is alive in this pane and the
+  // tracked pid was merely rotated by a daemon/worker model, so sync must rebind to the
+  // live worker instead of inferring a crash — even though it started after the session.
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+
+    const newAgentPid = process.pid
+    const deadPid = 0x7fffffff
+    const panePid = 555200
+    const now = Date.now()
+
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        live: {
+          sessionId: 'live',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          tmuxPane: '%51',
+          pid: deadPid,
+          pidSource: 'parent-chain',
+          startedAt: now - 120000,
+          lastHookAt: now - 1000,
+          lastUpdated: now - 1000
+        }
+      }
+    }))
+
+    const initResult = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+
+    const byPid = new Map()
+    const childrenByPpid = new Map()
+    const paneShell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+    const rotatedWorker = { pid: newAgentPid, ppid: panePid, command: '/opt/homebrew/bin/claude', args: 'claude', commandLine: 'claude', basename: 'claude', startedAtMs: now - 5000 }
+    byPid.set(paneShell.pid, paneShell)
+    byPid.set(rotatedWorker.pid, rotatedWorker)
+    childrenByPpid.set(1, [paneShell])
+    childrenByPpid.set(panePid, [rotatedWorker])
+
+    const panes = new Map([['%51', { paneId: '%51', panePid, currentCommand: 'claude', paneDead: false }]])
+    panes.tmuxAvailable = true
+
+    const stats = sync.createStats()
+    sync.clearPidStateCache()
+    sync.sweepDeadProcesses(initResult.status, panes, { byPid, childrenByPpid }, stats)
+
+    const reloaded = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(reloaded.sessions.live.pid, newAgentPid, 'must rebind to the live worker while hooks are active')
+    assert.strictEqual(reloaded.sessions.live.status, 'working', 'an alive session must not be marked terminal')
+    assert.strictEqual(stats.reconcile.pidBindings, 1, 'exactly one rebind should occur')
+    assert.strictEqual(stats.reconcile.processExits, 0, 'no crash should be inferred while hooks are active')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync sweepDeadProcesses defers instead of crashing while hooks are active and no live worker is found', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+
+    const deadPid = 0x7fffffff
+    const panePid = 555300
+    const now = Date.now()
+
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        live: {
+          sessionId: 'live',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          tmuxPane: '%52',
+          pid: deadPid,
+          pidSource: 'parent-chain',
+          startedAt: now - 120000,
+          lastHookAt: now - 1000,
+          lastUpdated: now - 1000
+        }
+      }
+    }))
+
+    const initResult = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false
+    })
+
+    // Pane exists but resolves no live agent process under it.
+    const byPid = new Map()
+    const childrenByPpid = new Map()
+    const paneShell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+    byPid.set(paneShell.pid, paneShell)
+    childrenByPpid.set(1, [paneShell])
+
+    const panes = new Map([['%52', { paneId: '%52', panePid, currentCommand: 'zsh', paneDead: false }]])
+    panes.tmuxAvailable = true
+
+    const stats = sync.createStats()
+    sync.clearPidStateCache()
+    sync.sweepDeadProcesses(initResult.status, panes, { byPid, childrenByPpid }, stats)
+
+    const reloaded = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(reloaded.sessions.live.status, 'working', 'a session with live hooks must not be crashed when no worker is resolved')
+    assert.strictEqual(stats.reconcile.processExits, 0, 'no crash should be inferred while hooks are active')
+    assert.strictEqual(stats.reconcile.pidBindings, 0, 'nothing to rebind to')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('watchdog option is enabled by default and can be explicitly disabled', () => {
   assert.strictEqual(watcherOptionEnabled(''), true)
   assert.strictEqual(watcherOptionEnabled(undefined), true)

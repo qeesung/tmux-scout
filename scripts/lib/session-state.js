@@ -233,23 +233,30 @@ function phaseDecision(session, event, nextPhase, now) {
   const currentSource = normalizeSource(lifecycle.source || session.stateSource)
 
   if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== AGENT_EVENTS.SESSION_START) {
-    // Stale is inferred from pid liveness, not observed from the agent.
+    // Stale, and crashes inferred purely from pid liveness, are guesses about the
+    // process rather than something observed from the agent. Agents with a
+    // daemon/worker model (e.g. Claude Code) rotate the tracked pid mid-session,
+    // which trips the pid-exit inference even though the session is still alive.
     // A real hook event from the agent proves the inference was wrong, so allow
-    // recovery and bypass the subsequent priority guard — the inferred stale
+    // recovery and bypass the subsequent priority guard — the inferred pid
     // priority (95) would otherwise win against a hook event (90).
-    // Crashed remains one-way: it carries higher-confidence proof of exit.
     //
-    // The event must be NEWER than the stale transition: a delayed hook generated
-    // before the stale decision can otherwise resurrect a session that has since
-    // exited (and would also move lastUpdated/endedAt backwards).
-    if (current === 'stale' && normalizeSource(event.source) === 'hook') {
+    // The event must be NEWER than the terminal transition: a delayed hook
+    // generated before the decision could otherwise resurrect a session that has
+    // since exited (and would also move lastUpdated/endedAt backwards).
+    //
+    // A crash from any non-pid source carries stronger proof of exit and stays
+    // one-way.
+    const pidInferred = currentSource === 'pid' || currentSource === 'process'
+    const recoverable = current === 'stale' || (current === 'crashed' && pidInferred)
+    if (recoverable && normalizeSource(event.source) === 'hook') {
       const eventTimestamp = Number.isFinite(event.timestamp) ? event.timestamp : now
       if (eventTimestamp > currentUpdatedAt) {
         return { apply: true }
       }
       return {
         apply: false,
-        blockedReason: `stale recovery requires hook event newer than stale transition (event ${eventTimestamp} <= stale ${currentUpdatedAt})`
+        blockedReason: `${current} recovery requires hook event newer than ${current} transition (event ${eventTimestamp} <= ${current} ${currentUpdatedAt})`
       }
     }
     return { apply: false, blockedReason: `current phase ${current} is terminal` }

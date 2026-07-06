@@ -1,0 +1,48 @@
+{
+  "name": "traex permission bypass flow",
+  "agent": "traex",
+  "sessionId": "fixture-traex-bypass",
+  "payloadDefaults": {
+    "session_id": "fixture-traex-bypass",
+    "cwd": "/tmp/tmux-scout-fixtures/traex"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "auto-approve the traex chores"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "npm test"
+        },
+        "permission_mode": "bypass_permissions"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "traex",
+    "status": "working",
+    "phase": "running",
+    "needsAttention": null,
+    "pendingInteraction": null,
+    "pendingToolUse": null,
+    "activeTool": null,
+    "sessionTitle": "auto-approve the traex chores"
+  },
+  "expectEvidenceTypes": [
+    "session_start",
+    "prompt_submit",
+    "permission_bypassed"
+  ]
+}

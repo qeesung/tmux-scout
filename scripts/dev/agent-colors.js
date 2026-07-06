@@ -12,7 +12,8 @@ const AGENT_DOCS = {
   cursor: { name: 'Cursor Agent', flag: '--cursor', colorName: 'near-white', slug: 'cursor' },
   kimi: { name: 'Kimi CLI', flag: '--kimi', colorName: 'gray', slug: 'kimi' },
   hermes: { name: 'Hermes', flag: '--hermes', colorName: 'sand', slug: 'hermes' },
-  coco: { name: 'Trae CLI', flag: '--trae', colorName: 'bright green', slug: 'trae' }
+  coco: { name: 'Trae CLI', flag: '--trae', colorName: 'bright green', slug: 'trae' },
+  traex: { name: 'Traex CLI', flag: '--traex', colorName: 'mint', slug: 'traex' }
 }
 
 const XTERM_STEPS = [0, 95, 135, 175, 215, 255]

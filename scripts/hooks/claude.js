@@ -3,7 +3,7 @@
 // Tracks Claude session status with tmux pane mapping
 
 const path = require('path')
-const { createHookContext, liveSessionState, readStdin } = require('../lib/hook-adapter')
+const { createHookContext, liveSessionState, readStdin, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 
 const hookContext = createHookContext({
@@ -308,7 +308,9 @@ function updateSubagentToolActivity(data, fallbackSessionId, now) {
       : waitingEvent
         ? (questionTool ? 'waitingForAnswer' : 'waitingForApproval')
         : 'running',
-    lastToolActivity: activity,
+    // Keep the prior meaningful tool line when this update carries only a
+    // generic placeholder (undefined here is dropped by upsertSubagent).
+    lastToolActivity: isMeaningfulSubagentActivity(activity) ? activity : undefined,
     updatedAt: now,
     eventType: AGENT_EVENTS.SUBAGENT_TOOL_ACTIVITY
   }

@@ -9,6 +9,7 @@ const opencode = require('./opencode')
 const cursor = require('./cursor')
 const hermes = require('./hermes')
 const coco = require('./coco')
+const traex = require('./traex')
 
 const HOOK_MANAGERS = [
   {
@@ -74,6 +75,13 @@ const HOOK_MANAGERS = [
     label: 'Trae CLI',
     detail: '(~/.trae/traecli.yaml)',
     module: coco
+  },
+  {
+    id: 'traex',
+    flag: '--traex',
+    label: 'Traex CLI',
+    detail: '(~/.trae/traecli.toml)',
+    module: traex
   }
 ]
 

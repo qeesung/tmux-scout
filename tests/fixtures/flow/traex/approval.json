@@ -1,0 +1,48 @@
+{
+  "name": "traex approval flow",
+  "agent": "traex",
+  "sessionId": "fixture-traex-approval",
+  "payloadDefaults": {
+    "session_id": "fixture-traex-approval",
+    "cwd": "/tmp/tmux-scout-fixtures/traex"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "run the traex test suite"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "npm test"
+        }
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "traex",
+    "status": "working",
+    "phase": "waitingForApproval",
+    "needsAttention": "waiting for approval",
+    "sessionTitle": "run the traex test suite",
+    "pendingInteraction.type": "approval",
+    "pendingInteraction.tool": "Bash",
+    "pendingToolUse.details": "Bash: npm test",
+    "activeTool": null
+  },
+  "expectEvidenceTypes": [
+    "session_start",
+    "prompt_submit",
+    "permission_request"
+  ]
+}

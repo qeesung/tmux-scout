@@ -8,12 +8,12 @@ const { execSync } = require('child_process')
 const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { agentDisplay } = require('../lib/agents')
 const { AGENT_EVENTS } = require('../lib/agent-events')
+const { isVisibleInPicker } = require('../lib/session-contract')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
 
 const pidStateCache = new Map()
-const TERMINAL_DISPLAY_MS = 5 * 60 * 1000
 const STATUS_WIDTH = 6
 const AGENT_WIDTH = 9
 const WINDOW_WIDTH = 20
@@ -137,27 +137,16 @@ function isTerminalSession(session) {
   return session && (phase === 'crashed' || phase === 'stale' || phase === 'interrupted')
 }
 
-function isRecentlyTerminal(session, now) {
-  if (!isTerminalSession(session)) return false
-  const ts = session.endedAt || session.lastUpdated || 0
-  return ts > 0 && now - ts < TERMINAL_DISPLAY_MS
-}
-
 function isActiveSession(session, panes, now = Date.now()) {
   if (!session) return false
   if (isHiddenCodexSession(session)) return false
-  if (isRecentlyTerminal(session, now)) return true
-  const phase = phaseForSession(session)
-  if (session.endedAt || phase === 'crashed' || phase === 'stale') return false
 
-  // Discovered from JSONL but hook hasn't fired yet — no pane bound
-  if (!session.tmuxPane) {
-    if (phase === 'completed') return false
-    if (String(session.stateSource || '').endsWith('-hooks')) return false
-    const lastSeen = session.lastUpdated || session.startedAt || 0
-    if (lastSeen && now - lastSeen > TERMINAL_DISPLAY_MS) return false
-    return phase !== 'idle'
-  }
+  // Phase/lifecycle visibility lives in the contract module (pure + testable).
+  // 'pane' means the verdict depends on runtime pane/PID liveness, resolved here.
+  const verdict = isVisibleInPicker(session, { now })
+  if (verdict === 'hidden') return false
+  if (verdict === 'visible') return true
+
   const pane = panes.get(session.tmuxPane)
   if (!pane || pane.paneDead) {
     return false

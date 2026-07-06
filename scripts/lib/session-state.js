@@ -281,11 +281,21 @@ function shouldApplyPhase(session, event, nextPhase, now) {
   return phaseDecision(session, event, nextPhase, now).apply
 }
 
+// A new turn is a clean slate: an error surfaced in turn N (via stop_failure /
+// post_tool_use_failure) must not bleed into turn N+1. Mirrors the reference app's
+// SessionState reducer clearing error/errorDetail on sessionStarted/turnStarted.
+function clearTurnErrorResidue(session) {
+  session.error = null
+  session.errorDetail = null
+  session.lastToolError = null
+}
+
 function updateTurnLifecycle(session, event, phase, now) {
   if (event.type === AGENT_EVENTS.SESSION_START) {
     session.currentTurnId = null
     session.turnStartedAt = null
     session.turnEndedAt = null
+    clearTurnErrorResidue(session)
     return
   }
 
@@ -297,6 +307,7 @@ function updateTurnLifecycle(session, event, phase, now) {
     session.currentTurnId = event.turnId || null
     session.turnStartedAt = now
     session.turnEndedAt = null
+    clearTurnErrorResidue(session)
     return
   }
 
@@ -434,6 +445,9 @@ function setPhase(session, phase, event, now) {
     session.pendingToolUse = null
   } else if (event.pendingToolUse === undefined && !sameWaitRefresh(session, phase, event)) {
     session.pendingToolUse = null
+  }
+  if (isEndPhase(phase)) {
+    session.activeSubagents = []
   }
 
   session.pendingInteraction = PENDING_INTERACTION_PHASES.has(phase)

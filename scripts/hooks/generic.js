@@ -3,7 +3,7 @@
 
 const fs = require('fs')
 const path = require('path')
-const { createHookContext, readStdin, liveSessionState } = require('../lib/hook-adapter')
+const { createHookContext, readStdin, liveSessionState, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 
 function argValue(names) {
@@ -232,7 +232,11 @@ function toolUse(data, sessionId, now) {
 function permissionRequest(data, sessionId, now, question) {
   const toolName = getToolName(data)
   const toolInput = getToolInput(data)
-  const details = question || getToolDetails(toolName, toolInput)
+  const details = question ||
+    data.permission_description ||
+    data.permissionDescription ||
+    data.description ||
+    getToolDetails(toolName, toolInput)
   const eventType = question ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.PERMISSION_REQUEST
   updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
     status: 'working',
@@ -268,6 +272,21 @@ function postToolUse(data, sessionId, now, failure) {
     activeTool: null,
     lastToolError: failure ? (rawError || true) : undefined,
     lastEvent: { type: failure ? AGENT_EVENTS.POST_TOOL_USE_FAILURE : AGENT_EVENTS.POST_TOOL_USE, timestamp: now, details }
+  })))
+}
+
+function permissionBypassed(data, sessionId, now) {
+  const toolName = getToolName(data)
+  const details = data.permission_description ||
+    data.permissionDescription ||
+    getToolDetails(toolName, getToolInput(data))
+  resolvePendingInteraction(sessionId, data, now, details)
+  updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
+    status: 'working',
+    needsAttention: null,
+    pendingToolUse: null,
+    activeTool: null,
+    lastEvent: { type: AGENT_EVENTS.PERMISSION_BYPASSED, timestamp: now, details }
   })))
 }
 
@@ -355,6 +374,38 @@ function subagentId(data, now, prefix) {
     data.agent_name ||
     data.agentName ||
     `${prefix}-subagent-${now}`
+}
+
+function subagentPatch(data, now, defaultNickname) {
+  const nested = data.subagent && typeof data.subagent === 'object' ? data.subagent : {}
+  const task = data.task_description ||
+    data.taskDescription ||
+    data.description ||
+    data.prompt ||
+    data.task ||
+    data.message ||
+    nested.task_description ||
+    nested.description ||
+    nested.prompt ||
+    nested.task
+  const nickname = data.agent_name ||
+    data.agentName ||
+    data.agent_type ||
+    data.agentType ||
+    nested.name ||
+    nested.agent_name ||
+    nested.agent_type ||
+    defaultNickname ||
+    'subagent'
+  return {
+    nickname,
+    title: titleFromPrompt(task, 'subagent'),
+    lastToolActivity: isMeaningfulSubagentActivity(task) ? task : undefined,
+    transcriptPath: data.transcript_path || data.transcriptPath || nested.transcript_path || nested.transcriptPath,
+    phase: 'running',
+    startedAt: now,
+    updatedAt: now
+  }
 }
 
 function handleGemini(data, sessionId, eventName, now) {
@@ -571,6 +622,57 @@ function handleCoco(data, sessionId, eventName, now) {
   if (event === 'post_compact') return updateActivity(data, sessionId, now, 'Conversation compacted')
 }
 
+function isBypassedPermissionMode(data) {
+  const mode = normalizeHookEventName(data.permission_mode || data.permissionMode || data.mode || '')
+  return mode === 'auto' || mode === 'bypass_permissions' || mode === 'bypasspermissions'
+}
+
+function isIdlePromptNotification(data) {
+  return normalizeHookEventName(data.notification_type || data.notificationType || data.kind || data.type || '') === 'idle_prompt'
+}
+
+function questionPrompt(data, fallback) {
+  return data.question_text ||
+    data.questionText ||
+    data.question ||
+    data.prompt ||
+    data.message ||
+    notificationDetails(data) ||
+    fallback
+}
+
+function handleTraex(data, sessionId, eventName, now) {
+  const event = normalizeHookEventName(eventName)
+  if (event === 'session_start') return sessionStart(data, sessionId, now, data.session_title)
+  if (event === 'session_end') return sessionEnd(data, sessionId, now)
+  if (event === 'user_prompt_submit') {
+    return promptSubmit(data, sessionId, now, data.prompt || data.message || data.text || data.user_prompt)
+  }
+  if (event === 'pre_tool_use') {
+    const toolName = getToolName(data)
+    if (isQuestionTool(toolName)) return permissionRequest(data, sessionId, now, questionPrompt(data, 'Traex is asking for input in the terminal'))
+    return toolUse(data, sessionId, now)
+  }
+  if (event === 'permission_request') {
+    if (isBypassedPermissionMode(data)) return permissionBypassed(data, sessionId, now)
+    return permissionRequest(data, sessionId, now)
+  }
+  if (event === 'post_tool_use') return postToolUse(data, sessionId, now, false)
+  if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
+  if (event === 'notification') {
+    if (isIdlePromptNotification(data)) return stop(data, sessionId, now, false)
+    return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
+  }
+  if (event === 'stop') return stop(data, sessionId, now, false)
+  if (event === 'stop_failure') return stop(data, sessionId, now, true)
+  if (event === 'subagent_start') return upsertSubagent(sessionId, subagentId(data, now, 'traex'), subagentPatch(data, now, 'subagent'))
+  if (event === 'subagent_stop') return removeSubagent(sessionId, subagentId(data, now, 'traex'), now, data.response || data.reason)
+  if (event === 'pre_compact') {
+    return updateSession(sessionId, { currentActivity: 'Compacting conversation...', lastEvent: { type: AGENT_EVENTS.PRE_COMPACT, timestamp: now }, lastUpdated: now })
+  }
+  if (event === 'post_compact') return updateActivity(data, sessionId, now, 'Conversation compacted')
+}
+
 function hermesPrompt(data) {
   return data.user_message ||
     data.userMessage ||
@@ -638,6 +740,7 @@ function handlePayload(data) {
   if (agentType === 'opencode') return handleOpenCode(data, sessionId, eventName, now)
   if (agentType === 'cursor') return handleCursor(data, sessionId, eventName, now)
   if (agentType === 'coco' || agentType === 'trae') return handleCoco(data, sessionId, eventName, now)
+  if (agentType === 'traex') return handleTraex(data, sessionId, eventName, now)
   if (agentType === 'hermes') return handleHermes(data, sessionId, eventName, now)
 
   if (/session[_-]?start/i.test(eventName)) return sessionStart(data, sessionId, now)

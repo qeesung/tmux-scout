@@ -93,6 +93,22 @@ function liveSessionState(updates) {
   }, updates)
 }
 
+// A subagent's rendered tool line (activeSubagents[].lastToolActivity) should
+// only be overwritten with a *meaningful* value. Generic placeholders like
+// "Thinking…", "Prompt: …", or the bare tool fallbacks ("unknown"/"Tool")
+// would clobber the last real tool line, so callers keep the prior value when
+// this returns false. Mirrors the reference app's shouldUseActivityAsSubagentToolLine.
+function isMeaningfulSubagentActivity(activity) {
+  if (activity === undefined || activity === null) return false
+  const text = String(activity).trim()
+  if (!text) return false
+  if (/^prompt:/i.test(text)) return false
+  if (/^processing prompt/i.test(text)) return false
+  if (/^thinking(?:\.{0,3}|…)$/i.test(text)) return false
+  if (/^(unknown|tool)$/i.test(text)) return false
+  return true
+}
+
 function resolvePid(data) {
   const payloadPid = Number.parseInt(data && data.pid, 10)
   if (Number.isInteger(payloadPid) && payloadPid > 0) return payloadPid
@@ -357,6 +373,7 @@ module.exports = {
   readJson,
   readStdin,
   liveSessionState,
+  isMeaningfulSubagentActivity,
   createHookContext,
   updateSessionDirect,
   sendUpdateToBridge

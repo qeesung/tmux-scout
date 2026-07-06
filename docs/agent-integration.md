@@ -46,12 +46,12 @@ Use these common mappings:
 | New agent session | `session_start` | `idle` |
 | User submits prompt | `prompt_submit` | `running` |
 | Tool starts | `tool_use` | `running` |
-| Tool finishes | `tool_result` | `running` unless it closes a pending wait |
-| Permission requested | `approval_wait` | `waitingForApproval` |
-| User answer requested | `answer_wait` | `waitingForAnswer` |
-| Plan confirmation requested | `approval_wait` with plan reason/type | `waitingForApproval` |
-| Agent finishes turn | `turn_complete` | `completed` |
-| User interrupts | `interrupt` | `interrupted` |
+| Tool finishes | `post_tool_use` / `post_tool_use_failure` | `running` unless it resolves a deferred completion |
+| Permission requested | `permission_request` | `waitingForApproval` |
+| User answer requested | `question_asked` | `waitingForAnswer` |
+| Plan confirmation requested | `permission_request` with plan reason/type | `waitingForApproval` |
+| Agent finishes turn | `stop` / `turn_complete` / `session_end` | `completed` |
+| User interrupts | `interrupted` | `interrupted` |
 | Process or pane dies | `pane_state` / reconcile event | `crashed` or `stale` |
 
 When the agent gives a stable request id or turn id, pass it through. It lets the
@@ -79,6 +79,18 @@ Waiting state is represented as `pendingInteraction` plus the legacy
   states when possible.
 - `doctor` should report missing binaries, parse failures, unsupported config
   versions, and permission problems without mutating user config.
+
+## Current Built-ins
+
+tmux-scout currently ships first-class metadata, setup manager registration, and
+hook/runtime mapping for:
+
+Claude Code, Codex, Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode,
+Cursor Agent, Hermes, Trae CLI, and Traex CLI.
+
+Trae CN is not a separate built-in id or setup flag yet. Treat it as covered
+only when it uses the same local config shape and hook payloads as the Trae or
+Traex integrations; otherwise add it as a new integration with its own tests.
 
 ## Contributor Checklist
 

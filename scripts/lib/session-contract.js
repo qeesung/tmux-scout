@@ -211,6 +211,9 @@ const SESSION_SNAPSHOT_SCHEMA = Object.freeze({
     sessionTitle: FIELD_TYPES.STRING,
     lastUserPrompt: FIELD_TYPES.STRING,
     lastAssistantMessage: FIELD_TYPES.STRING,
+    error: FIELD_TYPES.STRING,
+    errorDetail: FIELD_TYPES.STRING,
+    lastToolError: FIELD_TYPES.ANY,
     needsAttention: FIELD_TYPES.STRING,
     pendingToolUse: FIELD_TYPES.OBJECT,
     pendingInteraction: FIELD_TYPES.OBJECT,
@@ -327,6 +330,57 @@ function phaseForAgentEvent(event) {
     return AGENT_EVENT_PHASES[type]
   }
   return canonicalPhase(input.phase)
+}
+
+const DEFAULT_PICKER_TERMINAL_DISPLAY_MS = 5 * 60 * 1000
+
+// Terminal-ish phases that still linger in the picker for a short window so a
+// crash/interrupt is visible before it disappears.
+const PICKER_TERMINAL_DISPLAY_PHASES = new Set([
+  SESSION_PHASES.CRASHED,
+  SESSION_PHASES.STALE,
+  SESSION_PHASES.INTERRUPTED
+])
+
+// Phase/lifecycle-based picker visibility, factored out of picker/render.js so
+// it is pure and unit-testable (mirrors the reference app's isVisibleInIsland). It
+// deliberately does NOT resolve runtime pane / PID liveness — that stays in
+// render.js — and leaves the agent-specific isHiddenCodexSession filter to the
+// caller to keep this contract module dependency-light.
+//
+// Returns one of:
+//   'visible' — show regardless of pane/PID liveness (e.g. recently terminal)
+//   'hidden'  — never show
+//   'pane'    — bound to a tmux pane; render.js decides via pane/PID liveness
+function isVisibleInPicker(session, options = {}) {
+  if (!session || typeof session !== 'object') return 'hidden'
+  const now = Number.isFinite(options.now) ? options.now : Date.now()
+  const terminalDisplayMs = Number.isFinite(options.terminalDisplayMs)
+    ? options.terminalDisplayMs
+    : DEFAULT_PICKER_TERMINAL_DISPLAY_MS
+  const phase = session.phase ||
+    phaseFromLegacyStatus(session.status, session.needsAttention) ||
+    SESSION_PHASES.IDLE
+
+  if (PICKER_TERMINAL_DISPLAY_PHASES.has(phase)) {
+    const ts = session.endedAt || session.lastUpdated || 0
+    if (ts > 0 && now - ts < terminalDisplayMs) return 'visible'
+  }
+
+  if (session.endedAt || phase === SESSION_PHASES.CRASHED || phase === SESSION_PHASES.STALE) {
+    return 'hidden'
+  }
+
+  if (!session.tmuxPane) {
+    // Discovered from JSONL but no hook has bound a pane yet.
+    if (phase === SESSION_PHASES.COMPLETED) return 'hidden'
+    if (String(session.stateSource || '').endsWith('-hooks')) return 'hidden'
+    const lastSeen = session.lastUpdated || session.startedAt || 0
+    if (lastSeen && now - lastSeen > terminalDisplayMs) return 'hidden'
+    return phase !== SESSION_PHASES.IDLE ? 'visible' : 'hidden'
+  }
+
+  return 'pane'
 }
 
 function isTimestampLike(value) {
@@ -512,6 +566,7 @@ module.exports = {
   PENDING_INTERACTION_PHASES,
   AGENT_EVENT_PHASES,
   canonicalPhase,
+  isVisibleInPicker,
   statusForPhase,
   attentionForPhase,
   phaseFromLegacyStatus,

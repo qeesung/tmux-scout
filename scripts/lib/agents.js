@@ -84,6 +84,14 @@ const AGENTS = [
     color: '38;5;84',
     processNames: ['trae', 'coco'],
     commandIncludes: ['traecli', /\/trae\b/, /\/coco\b/]
+  },
+  {
+    id: 'traex',
+    label: 'traex',
+    brandColor: '#00ff87',
+    color: '38;5;48',
+    processNames: ['traex'],
+    commandIncludes: ['traex-cli', /\/traex\b/]
   }
 ]
 

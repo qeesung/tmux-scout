@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // tmux-scout unified hook setup
-// Usage: node setup.js <install|uninstall|status> [--agent flags] [--quiet] [--any]
+// Usage: node setup.js <install|uninstall|status> [--claude|--codex|--gemini|--kimi|--copilot-cli|--opencode|--cursor|--hermes|--trae|--traex] [--quiet] [--any]
 
 const path = require('path')
 const { spawnSync } = require('child_process')

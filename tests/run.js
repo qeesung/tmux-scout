@@ -28,6 +28,7 @@ const {
   phaseFromLegacyStatus,
   phaseForAgentEvent,
   statusForPhase,
+  isVisibleInPicker,
   validateAgainstSchema,
   validateAgentEvent,
   validateSessionSnapshot
@@ -41,6 +42,7 @@ const sync = require('../scripts/picker/sync')
 const { agentColorRows } = require('../scripts/dev/agent-colors')
 const { HOOK_EVENTS: CLAUDE_HOOK_EVENTS } = require('../scripts/setup/claude')
 const { HOOK_EVENTS: TRAE_HOOK_EVENTS } = require('../scripts/setup/coco')
+const { HOOK_EVENTS: TRAEX_HOOK_EVENTS } = require('../scripts/setup/traex')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
 const claudeHook = require('../scripts/hooks/claude')
 const codexHook = require('../scripts/hooks/codex')
@@ -261,14 +263,16 @@ test('hook scripts expose lightweight adapters', () => {
 })
 
 test('setup manager registry selects agent managers by flags', () => {
-  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco'])
-  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco'])
+  const expectedManagers = ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco', 'traex']
+  assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), expectedManagers)
+  assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), expectedManagers)
   assert.deepStrictEqual(selectManagers(new Set(['--claude'])).map(manager => manager.id), ['claude'])
   assert.deepStrictEqual(selectManagers(new Set(['--codex', '--quiet'])).map(manager => manager.id), ['codex'])
   assert.deepStrictEqual(selectManagers(new Set(['--copilot-cli'])).map(manager => manager.id), ['copilot-cli'])
   assert.deepStrictEqual(selectManagers(new Set(['--cursor'])).map(manager => manager.id), ['cursor'])
   assert.deepStrictEqual(selectManagers(new Set(['--trae'])).map(manager => manager.id), ['coco'])
   assert.deepStrictEqual(selectManagers(new Set(['--coco'])).map(manager => manager.id), ['coco'])
+  assert.deepStrictEqual(selectManagers(new Set(['--traex'])).map(manager => manager.id), ['traex'])
 })
 
 test('setup manager health normalizes partial hook states', () => {
@@ -427,6 +431,52 @@ test('Trae setup manager removes managed hook matcher blocks cleanly', () => {
     assert.ok(removed.includes('model: default'))
     assert.strictEqual(removed.split('\n').filter(line => /^        - event: /.test(line)).length, 0)
     assert.ok(!removed.includes('--agent') || !removed.includes('trae'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Traex setup manager preserves unrelated TOML and enables hooks feature', () => {
+  const dir = tempDir()
+  try {
+    const configPath = path.join(dir, '.trae', 'traecli.toml')
+    fs.mkdirSync(path.dirname(configPath), { recursive: true })
+    fs.writeFileSync(configPath, [
+      'model = "default"',
+      '',
+      '[features]',
+      'experimental = true',
+      '',
+      '[[hooks.SessionStart]]',
+      '[[hooks.SessionStart.hooks]]',
+      'type = "command"',
+      'command = "echo keep"',
+      ''
+    ].join('\n'))
+
+    runScript('scripts/setup/traex.js', ['install'], dir)
+    runScript('scripts/setup/traex.js', ['status'], dir)
+    runScript('scripts/setup/traex.js', ['install'], dir)
+
+    const installed = fs.readFileSync(configPath, 'utf-8')
+    assert.ok(installed.includes('model = "default"'))
+    assert.ok(installed.includes('experimental = true'))
+    assert.ok(installed.includes('command = "echo keep"'))
+    assert.ok(installed.includes('[features]\nhooks = true'))
+    assert.ok(installed.includes('scripts/hooks/generic.js'))
+    assert.ok(installed.includes('--agent'))
+    assert.ok(installed.includes('traex'))
+    assert.ok(installed.includes('[[hooks.PermissionRequest]]'))
+    assert.ok(installed.includes('timeout = 86400'))
+    assert.strictEqual(installed.split('\n').filter(line => line === '[[hooks.SessionStart]]').length, 2)
+    assert.strictEqual(installed.split('\n').filter(line => line === '[[hooks.PreToolUse]]').length, 1)
+    assert.strictEqual(TRAEX_HOOK_EVENTS.length, 12)
+
+    runScript('scripts/setup/traex.js', ['uninstall'], dir)
+    const removed = fs.readFileSync(configPath, 'utf-8')
+    assert.ok(removed.includes('command = "echo keep"'))
+    assert.ok(removed.includes('hooks = true'))
+    assert.ok(!removed.includes('--agent') || !removed.includes('traex'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -902,7 +952,8 @@ test('new setup managers do not report standalone uninstall as installed', () =>
       'scripts/setup/gemini.js',
       'scripts/setup/kimi.js',
       'scripts/setup/copilot-cli.js',
-      'scripts/setup/opencode.js'
+      'scripts/setup/opencode.js',
+      'scripts/setup/traex.js'
     ]) {
       const output = runScriptOutput(script, ['uninstall'], dir)
       assert.ok(!/hook installed|plugin installed/.test(output), `${script} reported installed after uninstall`)
@@ -930,6 +981,7 @@ test('agent registry provides display metadata and process scoring', () => {
   assert.deepStrictEqual(agentDisplay('codex'), { label: 'codex', color: '38;5;36' })
   assert.deepStrictEqual(agentDisplay('trae'), { label: 'trae', color: '38;5;84' })
   assert.strictEqual(scoreAgentProcess({ basename: 'opencode', commandLine: '/usr/bin/opencode' }, 'opencode'), 100)
+  assert.strictEqual(scoreAgentProcess({ basename: 'traex', commandLine: '/usr/local/bin/traex' }, 'traex'), 100)
   assert.strictEqual(scoreAgentProcess({ basename: 'gh', commandLine: 'gh copilot suggest' }, 'copilot-cli'), 70)
   assert.strictEqual(scoreAgentProcess({ basename: 'node', commandLine: 'node /bin/gemini-cli' }, 'gemini'), 70)
 })
@@ -1627,6 +1679,35 @@ test('session contract validates factual state invariants', () => {
   assert.strictEqual(invalid.valid, false)
   assert.ok(invalid.errors.includes('session.sessionId is required'))
   assert.ok(invalid.errors.includes('session.phase is required and must be canonical'))
+})
+
+test('session contract computes phase-based picker visibility', () => {
+  const now = 1_000_000_000_000
+  const recent = now - 1000
+  const old = now - 10 * 60 * 1000
+
+  // Live phases with a bound pane defer to runtime pane/PID liveness.
+  assert.strictEqual(isVisibleInPicker({ phase: 'running', tmuxPane: '%1' }, { now }), 'pane')
+  assert.strictEqual(isVisibleInPicker({ phase: 'waitingForApproval', tmuxPane: '%1' }, { now }), 'pane')
+
+  // No pane yet (JSONL-discovered): active phases show, idle/completed hide.
+  assert.strictEqual(isVisibleInPicker({ phase: 'running' }, { now }), 'visible')
+  assert.strictEqual(isVisibleInPicker({ phase: 'idle' }, { now }), 'hidden')
+  assert.strictEqual(isVisibleInPicker({ phase: 'completed' }, { now }), 'hidden')
+  assert.strictEqual(isVisibleInPicker({ phase: 'running', stateSource: 'codex-hooks' }, { now }), 'hidden')
+
+  // Terminal phases linger briefly, then hide.
+  assert.strictEqual(isVisibleInPicker({ phase: 'crashed', endedAt: recent, tmuxPane: '%1' }, { now }), 'visible')
+  assert.strictEqual(isVisibleInPicker({ phase: 'crashed', endedAt: old, tmuxPane: '%1' }, { now }), 'hidden')
+  assert.strictEqual(isVisibleInPicker({ phase: 'stale', endedAt: old }, { now }), 'hidden')
+  assert.strictEqual(isVisibleInPicker({ phase: 'interrupted', lastUpdated: recent, tmuxPane: '%1' }, { now }), 'visible')
+
+  // A finished turn with endedAt is hidden even if a pane is still bound.
+  assert.strictEqual(isVisibleInPicker({ phase: 'completed', endedAt: recent, tmuxPane: '%1' }, { now }), 'hidden')
+
+  // Legacy status-only snapshots resolve through phaseFromLegacyStatus.
+  assert.strictEqual(isVisibleInPicker({ status: 'working' }, { now }), 'visible')
+  assert.strictEqual(isVisibleInPicker(null, { now }), 'hidden')
 })
 
 test('session contract exports runtime schemas for debug and fixtures', () => {
@@ -2361,6 +2442,57 @@ test('generic hook maps Hermes clarify questions and completion', () => {
   }
 })
 
+test('generic hook maps Traex approval modes and idle completion', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'traex-session'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'SessionStart'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'ship traex support'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' },
+      permission_mode: 'auto'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'traex')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.PERMISSION_BYPASSED)
+
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Bash'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'Notification',
+      notification_type: 'idle_prompt',
+      message: 'Agent finished and is waiting for your input'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('session reducer protects recent high-confidence hook state', () => {
   const session = { sessionId: 's1', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
@@ -2704,6 +2836,46 @@ test('session reducer defers completion while a pending interaction is visible',
   })
   assert.strictEqual(lateTool.applied, false)
   assert.strictEqual(currentPhase(session), 'completed')
+})
+
+test('session reducer clears active subagents on applied end phases', () => {
+  const session = {
+    sessionId: 's2-subagents-end',
+    agentType: 'traex',
+    startedAt: 1000,
+    activeSubagents: [
+      { agentId: 'child-1', phase: 'running', lastToolActivity: 'Bash: npm test' }
+    ]
+  }
+
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'hook',
+    timestamp: 1000,
+    attentionReason: 'waiting for approval',
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
+  })
+  applySessionEvent(session, {
+    type: 'stop',
+    source: 'hook',
+    timestamp: 1500,
+    reason: 'turn completed'
+  })
+
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.activeSubagents.length, 1)
+
+  applySessionEvent(session, {
+    type: 'permission_resolved',
+    source: 'hook',
+    timestamp: 2000,
+    details: 'approved'
+  })
+
+  assert.strictEqual(currentPhase(session), 'completed')
+  assert.deepStrictEqual(session.activeSubagents, [])
+  assert.strictEqual(session.pendingInteraction, null)
+  assert.strictEqual(session.activeTool, null)
 })
 
 test('session reducer lets interrupted deferred completion win over completed', () => {

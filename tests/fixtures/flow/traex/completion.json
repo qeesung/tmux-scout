@@ -1,0 +1,62 @@
+{
+  "name": "traex completion flow",
+  "agent": "traex",
+  "sessionId": "fixture-traex-completion",
+  "payloadDefaults": {
+    "session_id": "fixture-traex-completion",
+    "cwd": "/tmp/tmux-scout-fixtures/traex"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "complete the traex task"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "npm test"
+        }
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "Notification",
+        "notification_type": "idle_prompt",
+        "message": "Agent finished and is waiting for your input"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "traex",
+    "status": "completed",
+    "phase": "completed",
+    "needsAttention": null,
+    "pendingInteraction": null,
+    "pendingToolUse": null,
+    "activeTool": null,
+    "sessionTitle": "complete the traex task"
+  },
+  "expectEvidenceTypes": [
+    "session_start",
+    "prompt_submit",
+    "tool_use",
+    "post_tool_use",
+    "stop"
+  ]
+}

@@ -158,6 +158,7 @@ module.exports = {
   safeSessionId,
   sessionFilePath,
   currentPhase,
+  lastTouchedAt,
   shouldPruneSession,
   deleteSession,
   pruneSessions

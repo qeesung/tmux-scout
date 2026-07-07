@@ -9,6 +9,8 @@ const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { agentDisplay } = require('../lib/agents')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { isVisibleInPicker } = require('../lib/session-contract')
+const { lastTouchedAt } = require('../lib/session-registry')
+const { readAccessRanks } = require('../lib/access-history')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
@@ -108,28 +110,23 @@ function isNeedsAttention(session, now) {
   return Boolean(session && (session.needsAttention || session.pendingInteraction || isWaitingPhase(phaseForSession(session))))
 }
 
-function groupOrder(session, now) {
-  const phase = phaseForSession(session)
-  if (isNeedsAttention(session, now)) return 0
-  if (phase === 'running') return 1
-  if (phase === 'interrupted') return 2
-  if (phase === 'completed') return 3
-  if (phase === 'crashed' || phase === 'stale') return 4
-  return 5
+// Access-order (MRU): rank a session by its pane's position in the access
+// history. Sessions never jumped-to via the picker get Infinity and fall back
+// to activity recency.
+function accessRank(session, ranks) {
+  if (!ranks || !session || !session.tmuxPane) return Infinity
+  const rank = ranks.get(session.tmuxPane)
+  return Number.isInteger(rank) ? rank : Infinity
 }
 
-function isCurrentPaneSession(session, pane) {
-  return Boolean(pane && session && session.tmuxPane === pane)
-}
+function compareSessions(left, right, ctx = {}) {
+  const ranks = ctx.accessRanks
+  const leftRank = accessRank(left, ranks)
+  const rightRank = accessRank(right, ranks)
+  // Avoid Infinity - Infinity (NaN) when both sessions are unvisited.
+  if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1
 
-function compareSessions(left, right, now, pane) {
-  const g = groupOrder(left, now) - groupOrder(right, now)
-  if (g !== 0) return g
-
-  const current = Number(isCurrentPaneSession(right, pane)) - Number(isCurrentPaneSession(left, pane))
-  if (current !== 0) return current
-
-  return (right.lastUpdated || 0) - (left.lastUpdated || 0)
+  return lastTouchedAt(right) - lastTouchedAt(left)
 }
 
 function isTerminalSession(session) {
@@ -373,7 +370,8 @@ function run(file, pane, cached) {
   for (const session of active) {
     session._tmuxPaneSnapshot = session.tmuxPane ? panes.get(session.tmuxPane) : null
   }
-  active.sort((left, right) => compareSessions(left, right, now, currentPane))
+  const accessRanks = readAccessRanks()
+  active.sort((left, right) => compareSessions(left, right, { accessRanks }))
 
   const hStatus = 'STATUS'.padEnd(STATUS_WIDTH)
   const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)

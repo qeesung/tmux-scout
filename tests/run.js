@@ -11,6 +11,7 @@ const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, s
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
 const { compareSessions, formatLine, getActiveSessions } = require('../scripts/picker/render')
+const { recordAccess, readAccessRanks } = require('../scripts/lib/access-history')
 const { AGENTS, agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
@@ -1948,19 +1949,20 @@ test('picker rows omit duplicated generic wait details', () => {
   assert.ok(!line.includes('waiting for answer: waiting for answer'), line)
 })
 
-test('picker ordering promotes current pane inside each status group only', () => {
+test('picker ordering sorts by access rank, ignoring status', () => {
   const now = Date.now()
   const sessions = [
     {
-      sessionId: 'newer-busy',
+      sessionId: 'wait-unvisited',
       agentType: 'codex',
       status: 'working',
-      phase: 'running',
-      tmuxPane: '%2',
+      phase: 'waitingForApproval',
+      needsAttention: 'waiting for approval',
+      tmuxPane: '%3',
       lastUpdated: now
     },
     {
-      sessionId: 'current-busy',
+      sessionId: 'busy-visited-first',
       agentType: 'codex',
       status: 'working',
       phase: 'running',
@@ -1968,22 +1970,72 @@ test('picker ordering promotes current pane inside each status group only', () =
       lastUpdated: now - 10000
     },
     {
-      sessionId: 'wait-other-pane',
+      sessionId: 'idle-visited-recent',
       agentType: 'codex',
-      status: 'working',
-      phase: 'waitingForApproval',
-      needsAttention: 'waiting for approval',
-      tmuxPane: '%3',
+      status: 'completed',
+      phase: 'idle',
+      tmuxPane: '%2',
       lastUpdated: now - 20000
     }
   ]
 
-  sessions.sort((left, right) => compareSessions(left, right, now, '%1'))
+  // %2 was jumped-to most recently (rank 0), then %1 (rank 1). %3 was never visited.
+  const accessRanks = new Map([['%2', 0], ['%1', 1]])
+  sessions.sort((left, right) => compareSessions(left, right, { accessRanks }))
   assert.deepStrictEqual(sessions.map(session => session.sessionId), [
-    'wait-other-pane',
-    'current-busy',
-    'newer-busy'
+    'idle-visited-recent',
+    'busy-visited-first',
+    'wait-unvisited'
   ])
+})
+
+test('picker ordering falls back to activity recency when no access history', () => {
+  const now = Date.now()
+  const sessions = [
+    { sessionId: 'older', agentType: 'codex', status: 'working', phase: 'running', tmuxPane: '%1', lastUpdated: now - 20000 },
+    { sessionId: 'newer', agentType: 'codex', status: 'completed', phase: 'idle', tmuxPane: '%2', lastUpdated: now }
+  ]
+
+  sessions.sort((left, right) => compareSessions(left, right, { accessRanks: new Map() }))
+  assert.deepStrictEqual(sessions.map(session => session.sessionId), ['newer', 'older'])
+})
+
+test('access history records most-recent-first, dedupes, and caps length', () => {
+  const dir = tempDir()
+  const file = path.join(dir, 'access-history.json')
+  try {
+    recordAccess('%1', { file, now: 1000 })
+    recordAccess('%2', { file, now: 2000 })
+    recordAccess('%1', { file, now: 3000 }) // revisit %1 -> moves to front, no duplicate
+
+    const ranks = readAccessRanks({ file })
+    assert.strictEqual(ranks.get('%1'), 0)
+    assert.strictEqual(ranks.get('%2'), 1)
+    assert.strictEqual(ranks.size, 2)
+
+    // Cap is honored: only the most recent `max` entries survive.
+    recordAccess('%3', { file, now: 4000, max: 2 })
+    const capped = readAccessRanks({ file })
+    assert.strictEqual(capped.size, 2)
+    assert.strictEqual(capped.get('%3'), 0)
+    assert.strictEqual(capped.get('%1'), 1)
+    assert.ok(!capped.has('%2'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('access history returns empty ranks when file is missing or corrupt', () => {
+  const dir = tempDir()
+  const missing = path.join(dir, 'nope.json')
+  const corrupt = path.join(dir, 'corrupt.json')
+  try {
+    assert.strictEqual(readAccessRanks({ file: missing }).size, 0)
+    fs.writeFileSync(corrupt, 'not json{')
+    assert.strictEqual(readAccessRanks({ file: corrupt }).size, 0)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('status bar summarizes wait subtypes and active totals', () => {

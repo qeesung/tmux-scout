@@ -16,7 +16,7 @@ If you prefer a zero-dependency setup without needing a Node.js runtime, check o
 
 ## Features
 
-- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux window names, project names, prompt titles, and live tool details
+- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux window names, project names, prompt titles, and live tool details, ordered by most recently visited
 - **Pane preview** — right-side preview panel shows the last 40 lines of each session's tmux pane
 - **Status bar widget** — displays session counts by status (e.g. `0|1|2`) in tmux's status-right, refreshed every 2 seconds
 - **Auto-refresh** — `Ctrl-T` toggles automatic picker reload every 2 seconds
@@ -123,6 +123,11 @@ Each line shows:
 - Project directory name
 - Session title (first prompt)
 - Current tool details (for working sessions)
+
+Sessions are ordered by access recency: the session you most recently jumped to
+(via the picker) floats to the top, then the next, and so on. Sessions you
+haven't visited yet fall below, ordered by most recent activity. The status tags
+above still render on every row.
 
 ### Supported Agents and Colors
 

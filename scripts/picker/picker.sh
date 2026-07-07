@@ -156,3 +156,6 @@ fi
 if ! tmux select-pane -t "$pane_id" 2>/dev/null; then
   tmux display-message "tmux-scout: cannot select pane $pane_id" 2>/dev/null || true
 fi
+
+# Record this jump so the picker can sort by access order (most recent first)
+node "$SCRIPT_DIR/../lib/access-history.js" record "$pane_id" >/dev/null 2>&1 || true

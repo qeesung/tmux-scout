@@ -5,6 +5,7 @@
 const path = require('path')
 const { createHookContext, liveSessionState, readStdin, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
+const { classifyNotification } = require('../lib/notification-intent')
 
 const hookContext = createHookContext({
   agentType: 'claude',
@@ -487,18 +488,83 @@ function handleClaudeHook(data) {
       break
     }
 
-    case 'Notification':
+    case 'Notification': {
+      // Claude signals "the agent needs the user" only through Notification text
+      // ("Claude needs your permission" / "...approval for the plan" / "Claude is
+      // waiting for your input"). Standard Claude Code never delivers a real
+      // PermissionRequest hook, so without classifying this the session stays
+      // stuck showing BUSY, so normalize every waiting signal into an explicit
+      // lifecycle event through the one reducer.
+      const { intent, details, tool } = classifyNotification(data)
+      const notificationText = data.message || data.notification || data.title || details || null
+
+      if (intent === 'permission' || intent === 'plan' || intent === 'question') {
+        const questionIntent = intent === 'question'
+        const eventType = questionIntent ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.PERMISSION_REQUEST
+        const attentionReason = questionIntent
+          ? 'waiting for answer'
+          : intent === 'plan' ? 'waiting for plan approval' : 'waiting for approval'
+        const session = hookContext.readSession(session_id)
+        const knownTool = tool ||
+          (session && session.activeTool) ||
+          (session && session.pendingToolUse && session.pendingToolUse.tool) ||
+          undefined
+        const waitDetails = details || attentionReason
+        const pendingToolUse = knownTool ? { tool: knownTool, details: waitDetails, timestamp: now } : undefined
+        updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+          status: 'working',
+          needsAttention: attentionReason,
+          lastNotification: notificationText,
+          pendingToolUse: pendingToolUse || null,
+          activeTool: knownTool || null,
+          lastEvent: { type: eventType, timestamp: now, details: waitDetails },
+          lifecycleEvent: {
+            type: eventType,
+            source: 'hook',
+            stateSource: 'claude-hooks',
+            timestamp: now,
+            details: waitDetails,
+            attentionReason,
+            pendingToolUse,
+            activeTool: knownTool || undefined,
+            force: true
+          }
+        })))
+        break
+      }
+
+      if (intent === 'idle') {
+        // "Claude is waiting for your input" — turn ended / idle at the prompt.
+        // Only demote a still-running session to completed; never resurrect a
+        // completed/idle session or clobber a real pending WAIT.
+        const session = hookContext.readSession(session_id)
+        if (session && session.phase === 'running') {
+          updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
+            status: 'completed',
+            needsAttention: null,
+            pendingToolUse: null,
+            activeTool: null,
+            lastNotification: notificationText,
+            lastEvent: { type: AGENT_EVENTS.TURN_COMPLETE, timestamp: now, details: 'idle prompt' }
+          }))
+          break
+        }
+      }
+
+      // Informational notification (or idle on a non-running session): record it
+      // without touching the state machine.
       updateSession(session_id, {
-        lastNotification: data.message || data.notification || data.title || null,
+        lastNotification: notificationText,
         lastEvent: {
           type: AGENT_EVENTS.NOTIFICATION,
           timestamp: now,
-          details: data.message || data.notification || data.title || null
+          details: notificationText
         },
         tmuxPane,
         pid
       })
       break
+    }
 
     case 'PreCompact':
       updateSession(session_id, {

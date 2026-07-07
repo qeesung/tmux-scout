@@ -1,0 +1,37 @@
+{
+  "name": "claude notification idle completes the turn",
+  "agent": "claude",
+  "sessionId": "fixture-claude-notif-idle",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-notif-idle",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "summarize the repo"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "Notification",
+        "message": "Claude is waiting for your input"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "completed",
+    "phase": "completed",
+    "needsAttention": null,
+    "pendingInteraction": null,
+    "activeTool": null
+  }
+}

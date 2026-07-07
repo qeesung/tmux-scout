@@ -123,8 +123,7 @@ Readers should treat files as eventually consistent and re-read on each render.
 Writers must not assume they are the only producer unless they are inside the
 bridge server.
 
-The watchdog reconciliation loop follows the same shape as the reference app's
-coordinator loop, scoped to tmux:
+The watchdog reconciliation loop is a single coordinator pass, scoped to tmux:
 
 1. reconcile tmux panes and tracked PIDs
 2. scan known Codex/Claude transcripts for missed interruption signals

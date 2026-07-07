@@ -1,0 +1,41 @@
+{
+  "name": "claude notification question wait",
+  "agent": "claude",
+  "sessionId": "fixture-claude-notif-question",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-notif-question",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "help me choose"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "Notification",
+        "message": "Claude has a question for you"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "working",
+    "phase": "waitingForAnswer",
+    "needsAttention": "waiting for answer",
+    "pendingInteraction.type": "question",
+    "activeTool": null
+  },
+  "expectEvidenceTypes": [
+    "prompt_submit",
+    "question_asked"
+  ]
+}

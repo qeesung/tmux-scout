@@ -2460,6 +2460,38 @@ test('generic hook still maps Trae elicitation notifications as answer waits', (
   }
 })
 
+test('generic hook classifies text-only notifications and preserves tool and plan intent', () => {
+  const dir = tempDir()
+  try {
+    // Permission text that names the tool — the recovered tool must survive.
+    const permId = 'gemini-text-perm'
+    runGenericHook('gemini', {
+      session_id: permId,
+      cwd: '/tmp/demo',
+      hook_event_name: 'Notification',
+      message: 'Gemini needs your permission to use Bash'
+    }, dir)
+    let session = readScoutStatus(dir).sessions[permId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+    assert.strictEqual(session.pendingInteraction.tool, 'Bash')
+
+    // Plan-approval text must land as a plan wait (W:PLAN), not a bare approval.
+    const planId = 'gemini-text-plan'
+    runGenericHook('gemini', {
+      session_id: planId,
+      cwd: '/tmp/demo',
+      hook_event_name: 'Notification',
+      message: 'Gemini needs your approval for the plan'
+    }, dir)
+    session = readScoutStatus(dir).sessions[planId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.pendingInteraction.type, 'plan')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('generic hook maps Hermes clarify questions and completion', () => {
   const dir = tempDir()
   try {
@@ -2576,6 +2608,89 @@ test('session reducer protects recent high-confidence hook state', () => {
 
   assert.strictEqual(applied.applied, true)
   assert.strictEqual(currentPhase(session), 'completed')
+})
+
+test('session reducer recovers a stuck interrupted session on genuine new activity', () => {
+  const session = { sessionId: 'int-recover', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
+  applySessionEvent(session, { type: 'interrupted', source: 'transcript', timestamp: 2000 })
+  assert.strictEqual(currentPhase(session), 'interrupted')
+
+  // A real tool hook newer than the interrupt proves the agent resumed — recover.
+  const recovered = applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 3000,
+    activeTool: 'Bash'
+  })
+  assert.strictEqual(recovered.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.endedAt, null)
+})
+
+test('session reducer keeps interrupted sticky against a stale in-flight activity event', () => {
+  const session = { sessionId: 'int-stale', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
+  applySessionEvent(session, { type: 'interrupted', source: 'transcript', timestamp: 2000 })
+
+  // A tool-start event generated BEFORE the interrupt (delayed delivery) is older
+  // than the interrupt transition and must not resurrect a genuinely interrupted turn.
+  const stale = applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 1500
+  })
+  assert.strictEqual(stale.applied, false)
+  assert.strictEqual(currentPhase(session), 'interrupted')
+})
+
+test('session reducer does not resume an interrupted turn from a late post-tool hook', () => {
+  const session = { sessionId: 'int-posttool', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
+  applySessionEvent(session, { type: 'interrupted', source: 'transcript', timestamp: 2000 })
+
+  // "Interrupt while a tool is running": the aborted tool's post_tool_use_failure can
+  // arrive with a newer processing timestamp, but the tool never completed and the
+  // agent is not working again — it must NOT flip the interrupt back to running.
+  const late = applySessionEvent(session, { type: 'post_tool_use_failure', source: 'hook', timestamp: 3000 })
+  assert.strictEqual(late.applied, false)
+  assert.strictEqual(currentPhase(session), 'interrupted')
+})
+
+test('session reducer recovers an idle-sweep completed session on a genuinely new tool', () => {
+  const session = { sessionId: 'idle-done-recover', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
+  // The idle-complete sweep INFERS the turn ended (source 'stale'), not a real Stop.
+  applySessionEvent(session, { type: 'turn_complete', source: 'stale', timestamp: 2000, force: true })
+  assert.strictEqual(currentPhase(session), 'completed')
+
+  // A genuinely new tool start proves the inference wrong -> reopen (self-heal),
+  // so a wrongly idle-completed turn can never stay stuck at DONE.
+  const recovered = applySessionEvent(session, { type: 'tool_use', source: 'hook', timestamp: 3000, activeTool: 'Bash' })
+  assert.strictEqual(recovered.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+})
+
+test('session reducer keeps completed sticky against later activity (only a new turn reopens)', () => {
+  const session = { sessionId: 'done-sticky', agentType: 'claude', startedAt: 1000 }
+  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
+  applySessionEvent(session, { type: 'stop', source: 'hook', timestamp: 2000 })
+  assert.strictEqual(currentPhase(session), 'completed')
+
+  // A stray late tool event must NOT un-finish a normally-completed turn.
+  const stray = applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 3000,
+    activeTool: 'Bash'
+  })
+  assert.strictEqual(stray.applied, false)
+  assert.strictEqual(currentPhase(session), 'completed')
+
+  // A fresh prompt still reopens it.
+  const reopened = applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 4000 })
+  assert.strictEqual(reopened.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
 })
 
 test('session reducer records applied and blocked state evidence', () => {
@@ -3307,7 +3422,7 @@ test('sync marks running Claude session interrupted from transcript marker', () 
     }, dir)
     fs.appendFileSync(transcriptPath, JSON.stringify({
       timestamp: new Date(Date.now() + 1000).toISOString(),
-      type: 'assistant',
+      type: 'user',
       message: {
         content: [{ type: 'text', text: '[Request interrupted by user]' }]
       }
@@ -3332,7 +3447,217 @@ test('sync marks running Claude session interrupted from transcript marker', () 
   }
 })
 
-test('sync does not infer Claude interruption from hook silence alone', () => {
+test('sync does not interrupt when the marker text is merely quoted (strict structural match)', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-quoted-marker'
+    const transcriptPath = path.join(dir, 'quoted.jsonl')
+    const now = Date.now()
+    // The phrase appears only inside an assistant message and a normal user
+    // prompt — never as Claude's own `type:'user'` interrupt record. The old
+    // recursive text match false-positived here; the strict match must not.
+    fs.writeFileSync(transcriptPath,
+      JSON.stringify({
+        timestamp: new Date(now).toISOString(),
+        type: 'user',
+        message: { content: [{ type: 'text', text: 'what does "[Request interrupted by user]" mean?' }] }
+      }) + '\n' +
+      JSON.stringify({
+        timestamp: new Date(now + 1000).toISOString(),
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'It is the marker [Request interrupted by user] Claude writes on ESC.' }] }
+      }) + '\n')
+
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        [sessionId]: {
+          sessionId,
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now,
+          lastUpdated: now,
+          lastHookAt: now,
+          transcriptPath,
+          activeTool: null
+        }
+      }
+    }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      paneGroundTruth: false,
+      stuckSweep: false,
+      idleComplete: false
+    })
+    const session = result.status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(result.stats.claudeTranscript.interrupted, 0)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync skips re-reading an unchanged Claude transcript when a scan cache is supplied', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-cache'
+    const transcriptPath = path.join(dir, 'transcript.jsonl')
+    const now = Date.now()
+    // A running transcript with no interrupt marker yet.
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      timestamp: new Date(now).toISOString(),
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'working on it' }] }
+    }) + '\n')
+
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        [sessionId]: {
+          sessionId,
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now,
+          lastUpdated: now,
+          lastHookAt: now,
+          transcriptPath,
+          activeTool: null
+        }
+      }
+    }, null, 2))
+
+    const cache = {}
+    const runOptions = {
+      reconcile: false,
+      codexMode: 'none',
+      paneGroundTruth: false,
+      stuckSweep: false,
+      idleComplete: false,
+      claudeTranscriptState: cache
+    }
+
+    // First run reads the file (no marker -> no hit) and populates the cache.
+    const first = sync.run(statusFile, runOptions)
+    assert.strictEqual(first.stats.claudeTranscript.filesRead, 1)
+    assert.strictEqual(first.stats.claudeTranscript.skippedUnchanged, 0)
+    assert.strictEqual(currentPhase(first.status.sessions[sessionId]), 'running')
+    assert.ok(cache[sessionId], 'scan-state cache entry was written')
+
+    // Second run: transcript byte-identical -> skip the tail read entirely.
+    const second = sync.run(statusFile, runOptions)
+    assert.strictEqual(second.stats.claudeTranscript.filesRead, 0)
+    assert.strictEqual(second.stats.claudeTranscript.skippedUnchanged, 1)
+    assert.strictEqual(currentPhase(second.status.sessions[sessionId]), 'running')
+
+    // Append an interrupt marker: the file grows -> cache miss -> rescanned and
+    // detected on the very next run (the marker is never skipped).
+    fs.appendFileSync(transcriptPath, JSON.stringify({
+      timestamp: new Date(now + 2000).toISOString(),
+      type: 'user',
+      message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] }
+    }) + '\n')
+
+    const third = sync.run(statusFile, runOptions)
+    assert.strictEqual(third.stats.claudeTranscript.filesRead, 1)
+    assert.strictEqual(third.stats.claudeTranscript.skippedUnchanged, 0)
+    assert.strictEqual(third.stats.claudeTranscript.interrupted, 1)
+    assert.strictEqual(currentPhase(third.status.sessions[sessionId]), 'interrupted')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync batches every sweep into a single status.json write per run', () => {
+  const dir = tempDir()
+  const realRenameSync = fs.renameSync
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    const now = Date.now()
+
+    // Two independent sweeps must each mutate a session in the same run:
+    //   idleComplete completes `idleClaude`, the interrupt sweep interrupts
+    //   `interruptedClaude`. Pre-batching this produced two full status writes.
+    const staleTranscript = path.join(dir, 'stale.jsonl')
+    fs.writeFileSync(staleTranscript, JSON.stringify({ type: 'assistant' }) + '\n')
+    const staleTime = new Date(now - 300000)
+    fs.utimesSync(staleTranscript, staleTime, staleTime)
+
+    const interruptTranscript = path.join(dir, 'interrupt.jsonl')
+    fs.writeFileSync(interruptTranscript, JSON.stringify({
+      timestamp: new Date(now).toISOString(),
+      type: 'user',
+      message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] }
+    }) + '\n')
+
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        idleClaude: {
+          sessionId: 'idleClaude',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          transcriptPath: staleTranscript,
+          activeTool: null
+        },
+        interruptedClaude: {
+          sessionId: 'interruptedClaude',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now,
+          lastUpdated: now,
+          lastHookAt: now,
+          transcriptPath: interruptTranscript,
+          activeTool: null
+        }
+      }
+    }, null, 2))
+
+    let statusWrites = 0
+    fs.renameSync = (from, to) => {
+      if (to === statusFile) statusWrites++
+      return realRenameSync(from, to)
+    }
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      idleCompleteMs: 60000
+    })
+
+    assert.strictEqual(statusWrites, 1, 'the whole run flushes status.json exactly once')
+    // Both mutations landed and are readable back from the single write.
+    const persisted = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(currentPhase(persisted.sessions.idleClaude), 'completed')
+    assert.strictEqual(currentPhase(persisted.sessions.interruptedClaude), 'interrupted')
+    assert.strictEqual(currentPhase(result.status.sessions.idleClaude), 'completed')
+    assert.strictEqual(currentPhase(result.status.sessions.interruptedClaude), 'interrupted')
+  } finally {
+    fs.renameSync = realRenameSync
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync leaves recently-active running sessions alone (idle-complete threshold)', () => {
   const dir = tempDir()
   try {
     const statusFile = path.join(dir, '.tmux-scout', 'status.json')
@@ -3360,13 +3685,170 @@ test('sync does not infer Claude interruption from hook silence alone', () => {
       reconcile: false,
       codexMode: 'none',
       claudeTranscript: false,
-      claudeIdleInterruptMs: 1
+      idleCompleteMs: 60000
     })
 
+    // Idle 10s is well under the 60s threshold — a short lull must not complete.
     const session = result.status.sessions.idleClaude
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(result.stats.claudeTranscript.idleInterrupted, 0)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync completes idle running sessions past the threshold (missed-stop safety net)', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    const now = Date.now()
+
+    // Positive evidence the turn ended: a transcript that has been stale as long
+    // as the session has been silent.
+    const staleTranscript = path.join(dir, 'stale.jsonl')
+    fs.writeFileSync(staleTranscript, JSON.stringify({ type: 'assistant' }) + '\n')
+    const staleTime = new Date(now - 300000)
+    fs.utimesSync(staleTranscript, staleTime, staleTime)
+
+    // No transcript => no evidence => must NOT be completed (could be thinking).
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        stuckRunning: {
+          sessionId: 'stuckRunning',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          transcriptPath: staleTranscript,
+          activeTool: null
+        },
+        noTranscript: {
+          sessionId: 'noTranscript',
+          agentType: 'gemini',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          activeTool: null
+        },
+        busyWithTool: {
+          sessionId: 'busyWithTool',
+          agentType: 'codex',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          activeTool: 'Bash'
+        }
+      }
+    }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      idleCompleteMs: 60000
+    })
+
+    // Silent past the threshold WITH a stale transcript => the turn ended
+    // without a Stop hook; complete it (DONE, not interrupted).
+    const stuck = result.status.sessions.stuckRunning
+    assert.strictEqual(currentPhase(stuck), 'completed')
+    assert.strictEqual(stuck.status, 'completed')
+    assert.strictEqual(stuck.endedAt, null, 'completed reopens on a new turn, so endedAt stays null')
+    assert.strictEqual(result.stats.claudeTranscript.idleInterrupted, 1)
+
+    // No transcript => we have no evidence the turn ended => leave it running.
+    assert.strictEqual(currentPhase(result.status.sessions.noTranscript), 'running')
+
+    // A session still holding an active tool is genuinely busy — never sweep it.
+    const busy = result.status.sessions.busyWithTool
+    assert.strictEqual(currentPhase(busy), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('notification intent classifier maps agent notifications to wait/idle intents', () => {
+  const { classifyNotification } = require('../scripts/lib/notification-intent')
+  assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).intent, 'permission')
+  assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).tool, 'Bash')
+  assert.strictEqual(classifyNotification({ message: 'Claude Code needs your approval for the plan' }).intent, 'plan')
+  assert.strictEqual(classifyNotification({ message: 'Claude has a question for you' }).intent, 'question')
+  assert.strictEqual(classifyNotification({ message: 'Claude is waiting for your input' }).intent, 'idle')
+  assert.strictEqual(classifyNotification({ message: 'Permission prompt shown' }).intent, 'info')
+  assert.strictEqual(classifyNotification({ message: '请授权执行该命令' }).intent, 'permission')
+  assert.strictEqual(classifyNotification({ notification_type: 'idle_prompt', message: 'x' }).intent, 'idle')
+  assert.strictEqual(classifyNotification({ notification_type: 'elicitation_dialog', message: '请选择' }).intent, 'question')
+  assert.strictEqual(classifyNotification({ notification_type: 'ToolPermission', details: { type: 'ask_user' } }).intent, 'question')
+  assert.strictEqual(classifyNotification({ notification_type: 'permission_prompt' }).intent, 'permission')
+})
+
+test('sync resolves a stale wait once the transcript advances (missed-resolve backstop)', () => {
+  const dir = tempDir()
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const statusFile = path.join(scoutDir, 'status.json')
+    const transcript = path.join(dir, 'wait.jsonl')
+    const now = Date.now()
+    const waitStart = now - 60000
+    fs.writeFileSync(transcript, JSON.stringify({ type: 'user' }) + '\n')
+    const advanced = new Date(now - 1000)
+    fs.utimesSync(transcript, advanced, advanced) // transcript advanced past the wait
+
+    const session = {
+      sessionId: 'stuckWait', agentType: 'gemini', status: 'working',
+      phase: 'waitingForApproval', needsAttention: 'waiting for approval',
+      tmuxPane: '%1', transcriptPath: transcript, startedAt: waitStart, lastUpdated: waitStart,
+      pendingInteraction: { type: 'approval', phase: 'waitingForApproval', startedAt: waitStart, updatedAt: waitStart, reason: 'waiting for approval' }
+    }
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, lastUpdated: now, sessions: { stuckWait: session } }))
+
+    const result = sync.run(statusFile, { reconcile: false, codexMode: 'none', claudeTranscript: false })
+    const resolved = result.status.sessions.stuckWait
+    assert.strictEqual(currentPhase(resolved), 'running')
+    assert.strictEqual(resolved.needsAttention, null)
+    assert.strictEqual(resolved.pendingInteraction, null)
+    assert.strictEqual(result.stats.claudeTranscript.waitResolved, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync keeps a genuine wait while the transcript stays quiet', () => {
+  const dir = tempDir()
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const statusFile = path.join(scoutDir, 'status.json')
+    const transcript = path.join(dir, 'quiet.jsonl')
+    const now = Date.now()
+    const waitStart = now - 60000
+    fs.writeFileSync(transcript, JSON.stringify({ type: 'user' }) + '\n')
+    const atStart = new Date(waitStart + 1000) // no writes after the wait began
+    fs.utimesSync(transcript, atStart, atStart)
+
+    const session = {
+      sessionId: 'quietWait', agentType: 'claude', status: 'working',
+      phase: 'waitingForApproval', needsAttention: 'waiting for approval',
+      tmuxPane: '%1', transcriptPath: transcript, startedAt: waitStart, lastUpdated: waitStart,
+      pendingInteraction: { type: 'approval', phase: 'waitingForApproval', startedAt: waitStart, updatedAt: waitStart, reason: 'waiting for approval' }
+    }
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, lastUpdated: now, sessions: { quietWait: session } }))
+
+    const result = sync.run(statusFile, { reconcile: false, codexMode: 'none', claudeTranscript: false })
+    assert.strictEqual(currentPhase(result.status.sessions.quietWait), 'waitingForApproval')
+    assert.strictEqual(result.stats.claudeTranscript.waitResolved, 0)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -4328,7 +4810,7 @@ test('claude transcript watcher helper marks running sessions interrupted', () =
     const now = Date.now()
     fs.writeFileSync(transcriptPath, JSON.stringify({
       timestamp: new Date(now + 1000).toISOString(),
-      type: 'assistant',
+      type: 'user',
       message: {
         content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }]
       }
@@ -4396,7 +4878,7 @@ test('claude transcript watcher retries missing files and preserves partial line
 
     fs.writeFileSync(transcriptPath, '')
     manager.openOne(sessionId, transcriptPath)
-    fs.appendFileSync(transcriptPath, '{"timestamp":"' + new Date(now + 1000).toISOString() + '","message":{"content":[{"type":"text","text":"[Request interrupted')
+    fs.appendFileSync(transcriptPath, '{"type":"user","timestamp":"' + new Date(now + 1000).toISOString() + '","message":{"content":[{"type":"text","text":"[Request interrupted')
     assert.strictEqual(manager.scanWatch(sessionId), false)
     fs.appendFileSync(transcriptPath, ' by user]"}]}}\n')
     assert.strictEqual(manager.scanWatch(sessionId), true)
@@ -4661,6 +5143,38 @@ test('claude hook records metadata-only official events without changing active 
     assert.strictEqual(session.lastNotification, 'Permission prompt shown')
     assert.strictEqual(session.lastCompactReason, 'manual')
     assert.strictEqual(session.lastEvent.type, 'pre_compact')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude hook resolves a notification approval wait when a subagent starts', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-notif-subagent'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'plan and build'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'Notification',
+      message: 'Claude needs your permission'
+    }), dir)
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+
+    // Approving in the terminal produces no resolve hook — the next hook is the
+    // subagent launch. That must un-stick the wait back to running.
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'SubagentStart',
+      sub_agent: { id: 'sa1', type: 'Plan' }
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.ok(Array.isArray(session.activeSubagents) && session.activeSubagents.length === 1)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

@@ -1,0 +1,52 @@
+{
+  "name": "claude notification permission wait",
+  "agent": "claude",
+  "sessionId": "fixture-claude-notif-permission",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-notif-permission",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "run the deploy"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+          "command": "npm run deploy"
+        }
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "Notification",
+        "message": "Claude needs your permission to use Bash"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "working",
+    "phase": "waitingForApproval",
+    "needsAttention": "waiting for approval",
+    "pendingInteraction.type": "approval",
+    "pendingInteraction.tool": "Bash",
+    "activeTool": null
+  },
+  "expectEvidenceTypes": [
+    "prompt_submit",
+    "tool_use",
+    "permission_request"
+  ]
+}

@@ -343,7 +343,7 @@ const PICKER_TERMINAL_DISPLAY_PHASES = new Set([
 ])
 
 // Phase/lifecycle-based picker visibility, factored out of picker/render.js so
-// it is pure and unit-testable (mirrors the reference app's isVisibleInIsland). It
+// it is pure and unit-testable. It
 // deliberately does NOT resolve runtime pane / PID liveness — that stays in
 // render.js — and leaves the agent-specific isHiddenCodexSession filter to the
 // caller to keep this contract module dependency-light.

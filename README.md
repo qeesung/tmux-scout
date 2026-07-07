@@ -274,9 +274,9 @@ for up to 24 hours before cleanup.
 
 ## Agent Compatibility Notes
 
-tmux-scout now prefers Codex's event hook mechanism, which gives near-real-time updates for session start, prompt submission, tool activity, approval waits, and turn completion. This is the same style of lifecycle tracking used by the reference app.
+tmux-scout now prefers Codex's event hook mechanism, which gives near-real-time updates for session start, prompt submission, tool activity, approval waits, and turn completion. This is a hook-driven style of lifecycle tracking rather than polling.
 
-With the default watchdog path, tmux-scout keeps hooks as the primary state source and adds reference-style reconciliation: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, registry pruning, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
+With the default watchdog path, tmux-scout keeps hooks as the primary state source and adds a reconciliation pass: process/pane lifecycle checks, tail-only Codex transcript reads with cached offsets, registry pruning, and periodic full reconcile. It does not repeatedly reread every transcript on the fast path.
 
 Internally, hook, pane, transcript, PID, and stale-timeout observations are reduced through a shared session-state model. Higher-confidence hook/PID events win over lower-confidence pane/transcript observations for short races, while terminal crash/stale events still close dead sessions.
 

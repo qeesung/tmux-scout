@@ -97,7 +97,7 @@ function liveSessionState(updates) {
 // only be overwritten with a *meaningful* value. Generic placeholders like
 // "Thinking…", "Prompt: …", or the bare tool fallbacks ("unknown"/"Tool")
 // would clobber the last real tool line, so callers keep the prior value when
-// this returns false. Mirrors the reference app's shouldUseActivityAsSubagentToolLine.
+// this returns false.
 function isMeaningfulSubagentActivity(activity) {
   if (activity === undefined || activity === null) return false
   const text = String(activity).trim()

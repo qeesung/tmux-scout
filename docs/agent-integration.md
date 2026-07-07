@@ -69,6 +69,43 @@ Waiting state is represented as `pendingInteraction` plus the legacy
 - `requestId` / `turnId`: stable ids when exposed by the agent
 - `source` / `stateSource` / `rawEventName`: evidence for debugging
 
+## Notifications
+
+Some agents only signal "the agent now needs the user" through a `Notification`
+hook rather than a dedicated permission/question event — Claude Code, for
+example, sends `Notification` with text like `Claude needs your permission to
+use Bash`, `...needs your approval for the plan`, or `Claude is waiting for your
+input`. Dropping those leaves a session stuck showing BUSY.
+
+`scripts/lib/notification-intent.js` (`classifyNotification`) turns a payload
+into one canonical intent, first by structured `notification_type` and then by
+message text (English + 中文):
+
+| Intent | Driven event | Phase |
+|---|---|---|
+| `permission` | `permission_request` | `waitingForApproval` (W:APP) |
+| `plan` | `permission_request` with plan reason | `waitingForApproval` (W:PLAN) |
+| `question` | `question_asked` | `waitingForAnswer` (W:ANS) |
+| `idle` | `turn_complete` (only if currently running) | `completed` |
+| `info` | none | unchanged |
+
+Reuse the classifier for any new agent whose waiting/idle state arrives as a
+Notification. A running session that goes fully silent (no active tool, no
+pending interaction) past the idle threshold is also completed by the watcher's
+`sweepIdleRunningSessions` safety net, in case the `stop` hook is missed.
+
+## Resolving a WAIT
+
+A WAIT returns to `running` when the agent resumes. The reducer treats subagent
+lifecycle events (`subagent_start` / `subagent_stop` / `subagent_tool_activity`)
+as resolvers so an approval that is followed by a subagent launch does not get
+stuck — the user acted in the terminal, which produces no explicit resolve hook.
+For the case where the resolving hook is missed entirely, `sync.js`
+`sweepResolvedPendingInteractions` is a transcript-based backstop: an agent
+blocked at a prompt writes nothing to its transcript, so once the transcript
+advances past the moment the wait began the wait is resolved. It applies to any
+agent that exposes a `transcriptPath`.
+
 ## Installer Rules
 
 - Preserve user-owned config and comments whenever the target format allows it.

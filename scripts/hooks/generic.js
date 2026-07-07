@@ -5,6 +5,7 @@ const fs = require('fs')
 const path = require('path')
 const { createHookContext, readStdin, liveSessionState, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
+const { classifyNotification, notificationText } = require('../lib/notification-intent')
 
 function argValue(names) {
   const args = process.argv.slice(2)
@@ -229,7 +230,7 @@ function toolUse(data, sessionId, now) {
   })))
 }
 
-function permissionRequest(data, sessionId, now, question) {
+function permissionRequest(data, sessionId, now, question, attentionReasonOverride) {
   const toolName = getToolName(data)
   const toolInput = getToolInput(data)
   const details = question ||
@@ -238,9 +239,10 @@ function permissionRequest(data, sessionId, now, question) {
     data.description ||
     getToolDetails(toolName, toolInput)
   const eventType = question ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.PERMISSION_REQUEST
+  const attentionReason = attentionReasonOverride || (question ? 'waiting for answer' : 'waiting for approval')
   updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
     status: 'working',
-    needsAttention: question ? 'waiting for answer' : 'waiting for approval',
+    needsAttention: attentionReason,
     pendingToolUse: { tool: toolName, details, timestamp: now },
     activeTool: toolName,
     lastEvent: { type: eventType, timestamp: now, details },
@@ -250,7 +252,7 @@ function permissionRequest(data, sessionId, now, question) {
       stateSource: `${agentType}-hooks`,
       timestamp: now,
       details,
-      attentionReason: question ? 'waiting for answer' : 'waiting for approval',
+      attentionReason,
       pendingToolUse: { tool: toolName, details, timestamp: now },
       activeTool: toolName,
       force: true
@@ -424,6 +426,7 @@ function handleGemini(data, sessionId, eventName, now) {
     if (details.type === 'ask_user') return permissionRequest(data, sessionId, now, 'Gemini is asking for input in the terminal')
     return permissionRequest(Object.assign({}, data, { tool_name: details.title || 'ToolPermission' }), sessionId, now)
   }
+  if (eventName === 'Notification') return notificationFallback(data, sessionId, now)
   if (eventName === 'PreCompress') {
     updateSession(sessionId, { currentActivity: 'Compacting conversation...', lastEvent: { type: AGENT_EVENTS.PRE_COMPACT, timestamp: now }, lastUpdated: now })
   }
@@ -556,17 +559,34 @@ function handleCursor(data, sessionId, eventName, now) {
 }
 
 function notificationDetails(data) {
-  return data.question ||
-    data.message ||
-    data.text ||
-    data.reason ||
-    data.title ||
-    (data.details && typeof data.details === 'object' ? data.details.message || data.details.text || data.details.title : data.details)
+  return notificationText(data) || undefined
 }
 
 function isCocoCompletionIdleNotification(data) {
   const details = notificationDetails(data)
   return /agent finished and is waiting for your input/i.test(String(details || ''))
+}
+
+// Fallback for a Notification that a per-agent handler did not resolve via a
+// structured notification_type. Classifies the message text so text-only
+// "needs your permission" / "waiting for your input" notifications still drive
+// the state machine instead of being dropped as BUSY — every waiting signal
+// becomes an explicit lifecycle event.
+function notificationFallback(data, sessionId, now) {
+  const { intent, details, tool } = classifyNotification(data)
+  // Carry the tool/detail the classifier recovered from the message text into
+  // the WAIT so non-Claude adapters render the real tool and reason instead of
+  // "unknown" / a bare approval.
+  const enriched = Object.assign({}, data)
+  if (tool && !(enriched.tool_name || enriched.toolName || enriched.tool)) enriched.tool_name = tool
+  if (details && !enriched.description && !enriched.permission_description && !enriched.permissionDescription) {
+    enriched.description = details
+  }
+  if (intent === 'permission') return permissionRequest(enriched, sessionId, now)
+  if (intent === 'plan') return permissionRequest(enriched, sessionId, now, undefined, 'waiting for plan approval')
+  if (intent === 'question') return permissionRequest(enriched, sessionId, now, details || questionPrompt(enriched))
+  if (intent === 'idle') return stop(data, sessionId, now, false)
+  return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
 }
 
 function handleCoco(data, sessionId, eventName, now) {
@@ -599,7 +619,7 @@ function handleCoco(data, sessionId, eventName, now) {
       return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
     }
     if (type === 'permission_prompt') return permissionRequest(data, sessionId, now)
-    return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
+    return notificationFallback(data, sessionId, now)
   }
   if (event === 'stop') return stop(data, sessionId, now, false)
   if (event === 'subagent_start') {
@@ -661,7 +681,7 @@ function handleTraex(data, sessionId, eventName, now) {
   if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
   if (event === 'notification') {
     if (isIdlePromptNotification(data)) return stop(data, sessionId, now, false)
-    return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
+    return notificationFallback(data, sessionId, now)
   }
   if (event === 'stop') return stop(data, sessionId, now, false)
   if (event === 'stop_failure') return stop(data, sessionId, now, true)
@@ -747,6 +767,7 @@ function handlePayload(data) {
   if (/prompt/i.test(eventName)) return promptSubmit(data, sessionId, now, data.prompt || data.message)
   if (/pre.*tool|before.*tool/i.test(eventName)) return toolUse(data, sessionId, now)
   if (/post.*tool|after.*tool/i.test(eventName)) return postToolUse(data, sessionId, now, false)
+  if (/notif/i.test(eventName)) return notificationFallback(data, sessionId, now)
   if (/stop|complete|end/i.test(eventName)) return stop(data, sessionId, now, false)
 }
 

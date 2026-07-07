@@ -7,6 +7,9 @@ const { readFileTail, splitJsonlLines } = require('./jsonl-tail-reader')
 const { AGENT_EVENTS } = require('./agent-events')
 
 const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
+// Also covers the '[Request interrupted by user for tool use]' variant via the
+// shared prefix + closing ']'.
+const CLAUDE_INTERRUPT_MARKER_PREFIX = '[Request interrupted by user'
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = 128 * 1024
 const ATTACH_RETRY_INTERVAL_MS = 250
 const ATTACH_RETRY_MAX_ATTEMPTS = 24
@@ -60,11 +63,27 @@ function eventTimestampMs(obj) {
   return null
 }
 
-function containsInterruptText(value, depth = 0) {
-  if (depth > 8 || value === null || value === undefined) return false
-  if (typeof value === 'string') return /request interrupted by user/i.test(value)
-  if (Array.isArray(value)) return value.some(item => containsInterruptText(item, depth + 1))
-  if (typeof value === 'object') return Object.values(value).some(item => containsInterruptText(item, depth + 1))
+// Strict structural match (same rule as sync.js): the marker is a `type:'user'`
+// message whose content carries a text block starting with the marker prefix and
+// ending ']'. Matching the phrase anywhere false-positives when a prompt/assistant
+// message merely quotes it.
+function isInterruptMarkerText(value) {
+  const text = String(value == null ? '' : value).trim()
+  return text.startsWith(CLAUDE_INTERRUPT_MARKER_PREFIX) && text.endsWith(']')
+}
+
+function isInterruptMarkerObject(obj) {
+  if (!obj || typeof obj !== 'object' || obj.type !== 'user') return false
+  const message = obj.message
+  if (!message || typeof message !== 'object') return false
+  const content = message.content
+  if (Array.isArray(content)) {
+    return content.some(block =>
+      block && typeof block === 'object' &&
+      block.type === 'text' && typeof block.text === 'string' &&
+      isInterruptMarkerText(block.text))
+  }
+  if (typeof content === 'string') return isInterruptMarkerText(content)
   return false
 }
 
@@ -78,7 +97,7 @@ function findLatestClaudeInterrupt(transcriptPath, sinceMs) {
     try {
       obj = JSON.parse(line)
     } catch (_) {}
-    const hit = obj ? containsInterruptText(obj) : /request interrupted by user/i.test(line)
+    const hit = obj ? isInterruptMarkerObject(obj) : false
     if (!hit) continue
     hits.push({ timestamp: eventTimestampMs(obj), rawLine: line })
   }
@@ -232,7 +251,7 @@ class ClaudeTranscriptWatchManager {
       try {
         obj = JSON.parse(line)
       } catch (_) {}
-      if (obj ? containsInterruptText(obj) : /request interrupted by user/i.test(line)) {
+      if (obj ? isInterruptMarkerObject(obj) : false) {
         return true
       }
     }

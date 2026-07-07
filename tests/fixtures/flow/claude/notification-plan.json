@@ -1,0 +1,41 @@
+{
+  "name": "claude notification plan wait",
+  "agent": "claude",
+  "sessionId": "fixture-claude-notif-plan",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-notif-plan",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "SessionStart",
+        "source": "startup"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "plan the refactor"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "Notification",
+        "message": "Claude Code needs your approval for the plan"
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "working",
+    "phase": "waitingForApproval",
+    "needsAttention": "waiting for plan approval",
+    "pendingInteraction.type": "plan",
+    "activeTool": null
+  },
+  "expectEvidenceTypes": [
+    "prompt_submit",
+    "permission_request"
+  ]
+}

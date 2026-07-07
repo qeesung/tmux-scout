@@ -33,6 +33,37 @@ const PENDING_RESOLUTION_EVENTS = new Set([
   AGENT_EVENTS.PERMISSION_RESOLVED,
   AGENT_EVENTS.QUESTION_ANSWERED
 ])
+// While a WAIT is pending the agent is blocked on the user. A parent that now
+// spawns a subagent must have just approved that launch out-of-band (the user
+// acted in the terminal, which produces no explicit resolve hook), so treat
+// subagent_start as a resolution and return the phase to running. This event
+// carries no phase of its own, so without this it is dropped as "no phase
+// change". The pending interaction is cleared on the next lifecycle hook.
+// Only subagent_START qualifies: subagent_stop /
+// subagent_tool_activity come from an ALREADY-running subagent and do not prove
+// the parent's current wait was resolved, so including them could clear an
+// unrelated fresh approval. assistant_message_update is likewise excluded (it
+// may be the streamed question text) to keep genuine waits sticky.
+const WAIT_RESUME_EVENTS = new Set([
+  AGENT_EVENTS.SUBAGENT_START
+])
+// A sweep-INFERRED end state (an `interrupted` from the transcript/idle sweeps, or
+// a `completed` synthesised by the idle-complete sweep) reopens when a genuinely
+// NEW tool STARTS — proof the agent is working again after a false inference or a
+// missed reopening UserPromptSubmit. Only PreToolUse-class START signals qualify:
+// `tool_use` (PreToolUse) and `permission_bypassed` (emitted at permission-check
+// time, before the tool runs) both mean "a new tool is starting". POST_* events are
+// EXCLUDED on purpose — a delayed `post_tool_use` / `post_tool_use_failure` from the
+// just-aborted turn carries a hook-processing timestamp that can be newer than the
+// interrupt and would wrongly resurrect a genuinely interrupted turn (whose tool
+// never completed). A real Stop-hook `completed` (source 'hook') is NOT inferred and
+// stays sticky, so a normally-finished turn is never un-finished; only a sweep's own
+// inference is allowed to be overturned by the next genuine activity. See
+// phaseDecision for the newer-than-inference gate.
+const INFERRED_END_RESUME_EVENTS = new Set([
+  AGENT_EVENTS.TOOL_USE,
+  AGENT_EVENTS.PERMISSION_BYPASSED
+])
 const TURN_START_EVENTS = new Set([
   AGENT_EVENTS.PROMPT_SUBMIT
 ])
@@ -258,6 +289,19 @@ function phaseDecision(session, event, nextPhase, now) {
     nextPhase === 'running' &&
     event.type !== AGENT_EVENTS.PROMPT_SUBMIT &&
     event.type !== AGENT_EVENTS.SESSION_START) {
+    // Recover a sweep-INFERRED end when a genuinely new tool starts and the event is
+    // newer than the inference: an `interrupted` (always inferred) or an idle-sweep
+    // `completed` whose lifecycle source is 'stale'. A real Stop-hook completion
+    // (source 'hook') is observed ground truth and stays sticky, so a normal turn is
+    // never un-finished. The newer-than gate stops a delayed in-flight event from the
+    // aborted turn from resurrecting a genuinely ended turn (which emits nothing new
+    // until the user's next prompt — already allowed above).
+    const inferredEnd = current === 'interrupted' ||
+      (current === 'completed' && currentSource === 'stale')
+    if (inferredEnd && INFERRED_END_RESUME_EVENTS.has(event.type)) {
+      const eventTimestamp = Number.isFinite(event.timestamp) ? event.timestamp : now
+      if (eventTimestamp >= currentUpdatedAt) return { apply: true }
+    }
     return { apply: false, blockedReason: `current phase ${current} only reopens on a new turn` }
   }
   if (event.force) return { apply: true }
@@ -282,8 +326,8 @@ function shouldApplyPhase(session, event, nextPhase, now) {
 }
 
 // A new turn is a clean slate: an error surfaced in turn N (via stop_failure /
-// post_tool_use_failure) must not bleed into turn N+1. Mirrors the reference app's
-// SessionState reducer clearing error/errorDetail on sessionStarted/turnStarted.
+// post_tool_use_failure) must not bleed into turn N+1, so clear error/errorDetail
+// on sessionStarted/turnStarted (parity with the tool-residue reset elsewhere).
 function clearTurnErrorResidue(session) {
   session.error = null
   session.errorDetail = null
@@ -594,7 +638,13 @@ function applySessionEvent(session, event) {
   const phaseEvent = resolvingDeferred
     ? eventFromDeferredCompletion(deferredCompletion, event, now)
     : event
-  const nextPhase = resolvingDeferred ? deferredCompletion.phase : phaseForEvent(event)
+  let nextPhase = resolvingDeferred ? deferredCompletion.phase : phaseForEvent(event)
+  if (!nextPhase &&
+    !resolvingDeferred &&
+    PENDING_INTERACTION_PHASES.has(currentPhase(session)) &&
+    WAIT_RESUME_EVENTS.has(event.type)) {
+    nextPhase = 'running'
+  }
   const decision = phaseDecision(session, phaseEvent, nextPhase, now)
   let applied = decision.apply
   let deferredPhase = false

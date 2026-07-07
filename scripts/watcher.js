@@ -124,6 +124,9 @@ function loadState() {
   if (!state.codexTranscripts || typeof state.codexTranscripts !== 'object' || Array.isArray(state.codexTranscripts)) {
     state.codexTranscripts = {}
   }
+  if (!state.claudeTranscripts || typeof state.claudeTranscripts !== 'object' || Array.isArray(state.claudeTranscripts)) {
+    state.claudeTranscripts = {}
+  }
   return state
 }
 
@@ -225,8 +228,12 @@ function runTick(state, forceFull = false, transcriptWatchManager = null) {
   if (!state.codexTranscripts || typeof state.codexTranscripts !== 'object' || Array.isArray(state.codexTranscripts)) {
     state.codexTranscripts = {}
   }
+  if (!state.claudeTranscripts || typeof state.claudeTranscripts !== 'object' || Array.isArray(state.claudeTranscripts)) {
+    state.claudeTranscripts = {}
+  }
   const result = sync.run(STATUS_FILE, {
-    codexTranscriptState: state.codexTranscripts
+    codexTranscriptState: state.codexTranscripts,
+    claudeTranscriptState: state.claudeTranscripts
   })
   state.lastMode = forceFull ? 'reconcile:forced' : 'reconcile'
 

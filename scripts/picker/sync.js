@@ -20,9 +20,24 @@ let sessionsDir = statusFile ? path.join(path.dirname(statusFile), 'sessions') :
 const pidStateCache = new Map()
 const CLAUDE_TRANSCRIPT_TAIL_BYTES = DEFAULT_TAIL_BYTES
 const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
+// Claude also writes a '[Request interrupted by user for tool use]' variant;
+// matching on the shared prefix + closing ']' covers it and any future '...for X'.
+const CLAUDE_INTERRUPT_MARKER_PREFIX = '[Request interrupted by user'
 const CODEX_TRANSCRIPT_SETTLE_GATE_MS = 3000
-const CLAUDE_IDLE_INTERRUPT_THRESHOLD_MS = 120000
 const CODEX_STUCK_INTERRUPT_THRESHOLD_MS = 180000
+// An agent blocked on a permission/question prompt writes NOTHING to its
+// transcript while waiting. Once the transcript advances past the moment the wait
+// began (plus a small settle margin), the user must have acted in the terminal —
+// so we resolve the wait even if the resolving hook (PostToolUse / SubagentStart /
+// etc.) was missed or arrived in an order we don't treat as a resolver. Applies
+// to any agent that exposes a transcript (Claude, Codex, Copilot, …). This is the
+// hook-side transcript backstop for a resolver hook we never observed.
+const WAIT_RESOLVE_SETTLE_MS = 5000
+// Time-based safety net: a running session that goes fully silent (no hook, no
+// transcript write, no active tool) for this long almost certainly finished its
+// turn but missed its Stop hook, so we complete it. A time-based reconcile safety
+// net — but maps to `completed` (DONE), not `interrupted`.
+const IDLE_COMPLETE_THRESHOLD_MS = 180000
 
 function createStats(options = {}) {
   return {
@@ -54,7 +69,9 @@ function createStats(options = {}) {
     claudeTranscript: {
       interrupted: 0,
       idleInterrupted: 0,
+      waitResolved: 0,
       filesRead: 0,
+      skippedUnchanged: 0,
       parseErrors: 0
     },
     evidence: {
@@ -101,6 +118,27 @@ function writeJsonAtomic(filePath, data) {
     try { fs.unlinkSync(tempPath) } catch (_) {}
     throw error
   }
+}
+
+// --- Status write batching ---
+// One sync.run() mutates the in-memory `status` across many sweeps. Each sweep
+// historically re-serialized and atomically renamed the WHOLE status.json at its
+// own end, so a single churny tick could rewrite the entire registry up to ~9
+// times, all producing the same final content. We persist exactly once per run
+// instead. Inside run() the sweep-level writes only mark the registry dirty and
+// run() flushes one write at the end. A sweep invoked standalone (e.g. a unit test calling
+// sync.sweepDeadProcesses directly) still persists immediately, preserving its
+// write-through contract.
+let statusWriteBatching = false
+let statusWriteDirty = false
+
+function persistStatus(status) {
+  if (!statusFile) return
+  if (statusWriteBatching) {
+    statusWriteDirty = true
+    return
+  }
+  writeJsonAtomic(statusFile, status)
 }
 
 function sessionFilePath(sessionId) {
@@ -219,7 +257,7 @@ function writeSessionIfNeeded(sessionId, session, options = {}) {
 
 function writeStatusIfNeeded(status, options = {}) {
   if (options.writeStatus === false || !statusFile) return
-  writeJsonAtomic(statusFile, status)
+  persistStatus(status)
 }
 
 function removeDiscoverySession(status, sessionId, stats, options = {}) {
@@ -419,7 +457,7 @@ function sweepPidBindings(status, panes, processTable, stats) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
 }
 
@@ -495,7 +533,7 @@ function sweepDeadProcesses(status, panes, processTable, stats) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
 }
 
@@ -518,7 +556,7 @@ function sweepVanishedPanes(status, panes, stats) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
 }
 
@@ -703,7 +741,7 @@ function sweepInterruptedCodexTranscripts(status, stats, options = {}) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
 }
 
@@ -745,7 +783,7 @@ function sweepStuckCodexSessions(status, stats, options = {}) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
 }
 
@@ -768,7 +806,7 @@ function pruneRegistrySessions(status, stats, options = {}) {
 
   const now = Date.now()
   status.lastUpdated = now
-  writeJsonAtomic(statusFile, status)
+  persistStatus(status)
 
   if (stats && stats.registry) {
     stats.registry.deleted += result.deleted.length
@@ -780,14 +818,15 @@ function pruneRegistrySessions(status, stats, options = {}) {
     }
   }
   pruneCodexTranscriptScanState(status, options)
+  pruneClaudeTranscriptScanState(status, options)
   return result
 }
 
 // --- Claude transcript helpers ---
 
-function readFileTail(filePath, maxBytes) {
+function readFileTail(filePath, maxBytes, preStat) {
   try {
-    const stat = fs.statSync(filePath)
+    const stat = preStat || fs.statSync(filePath)
     const start = Math.max(0, stat.size - maxBytes)
     const length = stat.size - start
     if (length <= 0) return { text: '', mtimeMs: stat.mtimeMs }
@@ -810,18 +849,28 @@ function readFileTail(filePath, maxBytes) {
   }
 }
 
+// Strict structural match: the interrupt marker is a `type:'user'` message whose
+// content carries a text block whose text starts with the marker prefix and ends
+// ']'. Matching the phrase anywhere in the object (the old recursive behaviour)
+// false-positives whenever a prompt or an assistant message merely quotes
+// '[Request interrupted by user]'.
 function isClaudeInterruptText(value) {
-  const text = String(value || '')
-  return text.includes(CLAUDE_INTERRUPT_MARKER) || /request interrupted by user/i.test(text)
+  const text = String(value == null ? '' : value).trim()
+  return text.startsWith(CLAUDE_INTERRUPT_MARKER_PREFIX) && text.endsWith(']')
 }
 
-function objectContainsInterrupt(value, depth = 0) {
-  if (depth > 8 || value === null || value === undefined) return false
-  if (typeof value === 'string') return isClaudeInterruptText(value)
-  if (Array.isArray(value)) return value.some(item => objectContainsInterrupt(item, depth + 1))
-  if (typeof value === 'object') {
-    return Object.values(value).some(item => objectContainsInterrupt(item, depth + 1))
+function isClaudeInterruptObject(obj) {
+  if (!obj || typeof obj !== 'object' || obj.type !== 'user') return false
+  const message = obj.message
+  if (!message || typeof message !== 'object') return false
+  const content = message.content
+  if (Array.isArray(content)) {
+    return content.some(block =>
+      block && typeof block === 'object' &&
+      block.type === 'text' && typeof block.text === 'string' &&
+      isClaudeInterruptText(block.text))
   }
+  if (typeof content === 'string') return isClaudeInterruptText(content)
   return false
 }
 
@@ -838,8 +887,8 @@ function eventTimestampMs(obj) {
   return null
 }
 
-function findLatestClaudeInterrupt(transcriptPath, sinceMs, stats) {
-  const tail = readFileTail(transcriptPath, CLAUDE_TRANSCRIPT_TAIL_BYTES)
+function findLatestClaudeInterrupt(transcriptPath, sinceMs, stats, preStat) {
+  const tail = readFileTail(transcriptPath, CLAUDE_TRANSCRIPT_TAIL_BYTES, preStat)
   if (!tail) return null
   if (stats) stats.claudeTranscript.filesRead++
 
@@ -853,7 +902,7 @@ function findLatestClaudeInterrupt(transcriptPath, sinceMs, stats) {
       if (stats) stats.claudeTranscript.parseErrors++
     }
 
-    const hit = obj ? objectContainsInterrupt(obj) : isClaudeInterruptText(line)
+    const hit = obj ? isClaudeInterruptObject(obj) : false
     if (!hit) continue
     hits.push({
       timestamp: eventTimestampMs(obj),
@@ -873,7 +922,68 @@ function findLatestClaudeInterrupt(transcriptPath, sinceMs, stats) {
   return null
 }
 
-function sweepInterruptedClaudeTranscripts(status, stats) {
+function claudeTranscriptState(options) {
+  const state = options && options.claudeTranscriptState
+  return state && typeof state === 'object' && !Array.isArray(state) ? state : null
+}
+
+// Skip the 128KB tail read + per-line JSON.parse when a running Claude
+// transcript has not changed since the last scan. Mirrors the Codex scan cache
+// (keyed on transcriptPath/size/mtimeMs/inode). No settle gate: unlike Codex, the
+// Claude sweep must react to an
+// interrupt marker the moment it lands, and an appended marker always grows
+// size+mtimeMs -> cache miss -> rescan, so a genuine interrupt is never skipped.
+// Returns { skip, stat } so a cache miss reuses the stat for readFileTail
+// (one statSync per changed transcript, not two). No cache configured -> never
+// skip (preserves standalone / picker behaviour).
+function shouldSkipClaudeTranscriptScan(sessionId, session, options, stats) {
+  const state = claudeTranscriptState(options)
+  if (!state) return { skip: false }
+
+  const stat = statTranscriptFile(session.transcriptPath)
+  if (!stat) return { skip: false }
+
+  const cache = state[sessionId]
+  if (cache &&
+    cache.transcriptPath === session.transcriptPath &&
+    cache.lastScannedSize === stat.size &&
+    cache.lastScannedMtimeMs === stat.mtimeMs &&
+    cache.lastScannedInode === stat.ino) {
+    if (stats && stats.claudeTranscript) stats.claudeTranscript.skippedUnchanged++
+    return { skip: true, stat }
+  }
+  return { skip: false, stat }
+}
+
+function updateClaudeTranscriptScanState(sessionId, session, options, stat, now) {
+  const state = claudeTranscriptState(options)
+  if (!state) return
+  const nextStat = stat || statTranscriptFile(session.transcriptPath)
+  if (!nextStat) return
+  state[sessionId] = {
+    transcriptPath: session.transcriptPath,
+    lastScannedSize: nextStat.size,
+    lastScannedMtimeMs: nextStat.mtimeMs,
+    lastScannedInode: nextStat.ino,
+    lastScannedAt: now
+  }
+}
+
+function pruneClaudeTranscriptScanState(status, options) {
+  const state = claudeTranscriptState(options)
+  if (!state) return
+  const keep = new Set()
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (!session || session.agentType !== 'claude' || session.endedAt || !session.transcriptPath) continue
+    if (currentPhase(session) !== 'running') continue
+    keep.add(sessionId)
+  }
+  for (const sessionId of Object.keys(state)) {
+    if (!keep.has(sessionId)) delete state[sessionId]
+  }
+}
+
+function sweepInterruptedClaudeTranscripts(status, stats, options = {}) {
   const now = Date.now()
   let changed = false
 
@@ -882,7 +992,11 @@ function sweepInterruptedClaudeTranscripts(status, stats) {
     if (currentPhase(session) !== 'running') continue
     if (!session.transcriptPath) continue
 
-    const hit = findLatestClaudeInterrupt(session.transcriptPath, session.lastUpdated || session.startedAt, stats)
+    const scan = shouldSkipClaudeTranscriptScan(sessionId, session, options, stats)
+    if (scan.skip) continue
+
+    const hit = findLatestClaudeInterrupt(session.transcriptPath, session.lastUpdated || session.startedAt, stats, scan.stat)
+    updateClaudeTranscriptScanState(sessionId, session, options, scan.stat, now)
     if (!hit) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
@@ -899,37 +1013,111 @@ function sweepInterruptedClaudeTranscripts(status, stats) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
+  pruneClaudeTranscriptScanState(status, options)
 }
 
-function sweepIdleClaudeSessions(status, stats, options = {}) {
-  if (options.claudeIdleInterrupt !== true) return
-  if (optionDisabled(options, 'stuckSweep') || optionDisabled(options, 'idleInterrupt')) return
+// Backstop for a WAIT whose resolving hook was missed or arrived in an order we
+// don't treat as a resolver (the reducer's WAIT_RESUME_EVENTS covers the common
+// subagent case in-band; this catches the rest). Any agent with a transcript that
+// has advanced past the moment the wait began has clearly resumed after the user
+// acted, so we resolve the pending interaction. Safe because a genuinely pending
+// wait writes nothing — its transcript never advances — so this never force-clears
+// a wait the user has not answered. Disable via `waitResolve: false`.
+function sweepResolvedPendingInteractions(status, stats, options = {}) {
+  if (optionDisabled(options, 'waitResolve')) return
   const now = Date.now()
-  const maxIdleMs = thresholdMs(options, 'claudeIdleInterruptMs', CLAUDE_IDLE_INTERRUPT_THRESHOLD_MS)
+  const settleMs = thresholdMs(options, 'waitResolveSettleMs', WAIT_RESOLVE_SETTLE_MS)
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (!session || session.agentType !== 'claude' || session.endedAt) continue
-    if (currentPhase(session) !== 'running') continue
-    if (session.activeTool || session.pendingInteraction || activeSubagentCount(session) > 0) continue
+    if (!session || session.endedAt) continue
+    if (isHiddenCodexSession(session)) continue
+    const phase = currentPhase(session)
+    if (phase !== 'waitingForApproval' && phase !== 'waitingForAnswer') continue
+    if (!session.transcriptPath) continue
 
-    const lastActivityAt = lastSessionActivityAt(session)
-    if (!lastActivityAt || now - lastActivityAt < maxIdleMs) continue
+    const pending = session.pendingInteraction
+    const waitStartedAt = pending && Number.isFinite(pending.startedAt)
+      ? pending.startedAt
+      : (Number.isFinite(session.lastUpdated) ? session.lastUpdated : null)
+    if (!Number.isFinite(waitStartedAt)) continue
 
+    const stat = statTranscriptFile(session.transcriptPath)
+    if (!stat || !Number.isFinite(stat.mtimeMs)) continue
+    if (stat.mtimeMs <= waitStartedAt + settleMs) continue
+
+    const resolveType = pending && pending.type === 'question'
+      ? AGENT_EVENTS.QUESTION_ANSWERED
+      : AGENT_EVENTS.PERMISSION_RESOLVED
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.INTERRUPTED,
-      source: 'stale',
+      type: resolveType,
+      source: 'transcript',
       timestamp: now,
-      reason: `Claude session idle for ${Math.floor((now - lastActivityAt) / 1000)}s without an active tool`,
-      details: 'claude idle without active tool',
-      rawEventName: 'claude_idle_sweep',
+      reason: 'transcript advanced past the pending interaction (user acted)',
+      details: 'wait resolved from transcript progress',
+      rawEventName: 'wait_resolved_sweep',
       transcriptPath: session.transcriptPath,
       force: true
     }, stats)
     if (updated && stats && stats.claudeTranscript) {
-      stats.claudeTranscript.interrupted++
+      stats.claudeTranscript.waitResolved = (stats.claudeTranscript.waitResolved || 0) + 1
+    }
+    changed = updated || changed
+  }
+
+  if (changed) {
+    status.lastUpdated = now
+    persistStatus(status)
+  }
+}
+
+// Default-on safety net across all agents: a running session that has gone
+// fully silent (no active tool, no pending interaction, no subagents) past the
+// idle threshold most likely finished its turn but missed its Stop hook, so we
+// complete it. Codex's stuck sweep (activeTool PRESENT -> interrupted) is a
+// different signature and stays separate. Disable via `idleComplete: false`.
+function sweepIdleRunningSessions(status, stats, options = {}) {
+  if (optionDisabled(options, 'idleComplete')) return
+  if (optionDisabled(options, 'stuckSweep') || optionDisabled(options, 'idleInterrupt')) return
+  const now = Date.now()
+  const maxIdleMs = thresholdMs(options, 'idleCompleteMs', IDLE_COMPLETE_THRESHOLD_MS)
+  let changed = false
+
+  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
+    if (!session || session.endedAt) continue
+    if (isHiddenCodexSession(session)) continue
+    if (currentPhase(session) !== 'running') continue
+    if (session.activeTool || session.pendingToolUse || session.pendingInteraction || activeSubagentCount(session) > 0) continue
+
+    // Only complete a session we have positive evidence ended: without a
+    // transcript an agent could be legitimately thinking/streaming to the
+    // terminal, and a wrong completion is sticky (completed only reopens on a
+    // new turn, so later same-turn tool events are dropped and it stays DONE).
+    if (!session.transcriptPath) continue
+
+    const lastActivityAt = lastSessionActivityAt(session)
+    if (!lastActivityAt || now - lastActivityAt < maxIdleMs) continue
+
+    // A live turn keeps writing its transcript (Claude streams thinking to it),
+    // so require the transcript itself to be stale before assuming the turn
+    // ended. If we can't stat it, we have no evidence — leave it running.
+    const stat = statTranscriptFile(session.transcriptPath)
+    if (!stat || !Number.isFinite(stat.mtimeMs)) continue
+    if (now - stat.mtimeMs < maxIdleMs) continue
+
+    const updated = applySessionUpdate(status, sessionId, session, {
+      type: AGENT_EVENTS.TURN_COMPLETE,
+      source: 'stale',
+      timestamp: now,
+      reason: `${session.agentType || 'agent'} idle for ${Math.floor((now - lastActivityAt) / 1000)}s without an active tool`,
+      details: 'idle without active tool; assuming turn complete',
+      rawEventName: 'idle_complete_sweep',
+      transcriptPath: session.transcriptPath,
+      force: true
+    }, stats)
+    if (updated && stats && stats.claudeTranscript) {
       stats.claudeTranscript.idleInterrupted++
     }
     changed = updated || changed
@@ -937,7 +1125,7 @@ function sweepIdleClaudeSessions(status, stats, options = {}) {
 
   if (changed) {
     status.lastUpdated = now
-    writeJsonAtomic(statusFile, status)
+    persistStatus(status)
   }
 }
 
@@ -972,11 +1160,26 @@ function run(file, options = {}) {
   if (!statusFile) return { status: null, panes: new Map(), stats }
   const status = readJson(statusFile, { version: 1, lastUpdated: Date.now(), sessions: {} })
   const panes = getPaneSnapshot()
-  if (options.reconcile !== false) reconcileSessions(status, panes, stats, options)
-  syncCodexSessions(status, panes, options, stats)
-  if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats)
-  sweepIdleClaudeSessions(status, stats, options)
-  pruneRegistrySessions(status, stats, options)
+
+  // Batch every sweep's status.json write into a single flush at the end of the
+  // run — the whole reconcile pass persists the registry exactly once.
+  statusWriteBatching = true
+  statusWriteDirty = false
+  try {
+    if (options.reconcile !== false) reconcileSessions(status, panes, stats, options)
+    syncCodexSessions(status, panes, options, stats)
+    if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats, options)
+    sweepResolvedPendingInteractions(status, stats, options)
+    sweepIdleRunningSessions(status, stats, options)
+    pruneRegistrySessions(status, stats, options)
+  } finally {
+    statusWriteBatching = false
+    if (statusWriteDirty && options.writeStatus !== false) {
+      writeJsonAtomic(statusFile, status)
+    }
+    statusWriteDirty = false
+  }
+
   stats.durationMs = Date.now() - stats.startedAt
   return { status, panes, stats }
 }

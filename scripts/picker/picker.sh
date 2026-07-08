@@ -68,6 +68,7 @@ fzf_output=$(cat "$LINES_FILE" | fzf \
   --listen=$LISTEN_PORT \
   --tmux "center,85%,$height,border-native" \
   --ansi \
+  --exact \
   --expect='ctrl-d' \
   --prompt='> ' \
   --color='border:bright-cyan,label:bright-white' \

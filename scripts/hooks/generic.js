@@ -345,7 +345,9 @@ function stop(data, sessionId, now, failure) {
     data.text ||
     (data.extra && data.extra.last_assistant_message) ||
     latestAssistantFromCopilotTranscript(data.transcriptPath || data.transcript_path)
-  resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
+  // A Stop while the agent is waiting is not proof that the user answered. Let the
+  // reducer defer completion until a real resolver (PostToolUse/UserPrompt/etc.)
+  // arrives, matching Flux pending wait semantics.
   updateSession(sessionId, Object.assign(baseUpdates(data, now), {
     status: 'completed',
     needsAttention: null,
@@ -363,7 +365,8 @@ function stop(data, sessionId, now, failure) {
 }
 
 function sessionEnd(data, sessionId, now) {
-  resolvePendingInteraction(sessionId, data, now, data.reason || getEventName(data))
+  // SessionEnd follows the same pending-wait rule as Stop: it may arrive while
+  // the terminal is still blocked on a visible user interaction.
   updateSession(sessionId, Object.assign(baseUpdates(data, now), {
     status: 'completed',
     needsAttention: null,

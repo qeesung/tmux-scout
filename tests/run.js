@@ -2211,6 +2211,21 @@ test('status bar summarizes wait subtypes and active totals', () => {
   })
 })
 
+test('status bar treats canonical WAIT phase as wait even with stale legacy status', () => {
+  const counts = statusBar.summarizeSessions([
+    {
+      status: 'completed',
+      phase: 'waitingForApproval',
+      pendingInteraction: { type: 'plan' }
+    }
+  ])
+
+  assert.strictEqual(counts.wait, 1)
+  assert.strictEqual(counts.plan, 1)
+  assert.strictEqual(counts.done, 0)
+  assert.strictEqual(counts.busy, 0)
+})
+
 test('status bar keeps compact default output clickable', () => {
   const output = statusBar.renderStatusBar({
     wait: 1,
@@ -2718,6 +2733,48 @@ test('generic hook maps Traex approval modes and idle completion', () => {
   }
 })
 
+test('generic hook defers Stop while waiting for permission until resolver arrives', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'traex-stop-while-waiting'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run guarded command'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'Stop'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+    assert.strictEqual(session.deferredCompletion.phase, 'completed')
+    assert.strictEqual(session.lastEvent.deferred, true)
+
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Bash'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
+    assert.strictEqual(session.lastEvent.resolvedBy, AGENT_EVENTS.PERMISSION_RESOLVED)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('generic hook keeps Traex background shell notification busy', () => {
   const dir = tempDir()
   try {
@@ -3161,6 +3218,41 @@ test('session reducer does not infer active tool from pending display fields', (
   assert.strictEqual(currentPhase(session), 'running')
   assert.strictEqual(session.pendingToolUse.tool, 'Read')
   assert.strictEqual(session.activeTool, null)
+})
+
+test('session reducer keeps activity text out of activeTool', () => {
+  const idleSession = { sessionId: 's2-activity-idle', agentType: 'gemini', startedAt: 1000 }
+  applySessionEvent(idleSession, {
+    type: 'activityUpdated',
+    source: 'hook',
+    timestamp: 1000,
+    details: 'Thinking...',
+    updates: { currentActivity: 'Thinking...' }
+  })
+
+  assert.strictEqual(currentPhase(idleSession), 'running')
+  assert.strictEqual(idleSession.currentActivity, 'Thinking...')
+  assert.strictEqual(idleSession.activeTool, null)
+
+  const toolSession = { sessionId: 's2-activity-tool', agentType: 'gemini', startedAt: 1000 }
+  applySessionEvent(toolSession, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 1000,
+    activeTool: 'Bash',
+    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
+  })
+  applySessionEvent(toolSession, {
+    type: 'activityUpdated',
+    source: 'hook',
+    timestamp: 1100,
+    details: 'Thinking...',
+    updates: { currentActivity: 'Thinking...' }
+  })
+
+  assert.strictEqual(currentPhase(toolSession), 'running')
+  assert.strictEqual(toolSession.currentActivity, 'Thinking...')
+  assert.strictEqual(toolSession.activeTool, 'Bash')
 })
 
 test('session reducer clears waits with explicit pending lifecycle events', () => {
@@ -4779,6 +4871,25 @@ test('codex sync maps completed plan task to WAIT plan instead of DONE', () => {
     assert.strictEqual(counts.plan, 1)
     assert.strictEqual(counts.done, 0)
     assert.strictEqual(counts.busy, 0)
+
+    runHook('scripts/hooks/codex.js', {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: threadId,
+      thread_id: threadId,
+      cwd: '/tmp/demo',
+      transcript_path: jsonl,
+      turn_id: 'turn-implement',
+      prompt: 'Implement this plan.'
+    }, dir)
+
+    const resumed = readScoutStatus(dir).sessions[threadId]
+    assert.strictEqual(currentPhase(resumed), 'running')
+    assert.strictEqual(resumed.status, 'working')
+    assert.strictEqual(resumed.needsAttention, null)
+    assert.strictEqual(resumed.pendingInteraction, null)
+    assert.strictEqual(resumed.pendingToolUse, null)
+    assert.strictEqual(resumed.lastTurnId, 'turn-implement')
+    assert.ok(resumed.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })

@@ -19,6 +19,7 @@ const DEFAULT_CLICK_STYLE = 'underscore'
 
 // Reuse render logic so counts stay aligned with picker without mutating state.
 const { getActiveSessions, waitCode } = require(path.join(__dirname, 'picker', 'render'))
+const { phaseFromLegacyStatus } = require(path.join(__dirname, 'lib', 'session-contract'))
 
 function readJson(filePath, fallback) {
   try {
@@ -56,17 +57,21 @@ function summarizeSessions(active) {
   }
 
   for (const s of active) {
-    if (s.needsAttention) {
+    const phase = s && (s.phase || phaseFromLegacyStatus(s.status, s.needsAttention) || 'idle')
+    const isWait = phase === 'waitingForApproval' ||
+      phase === 'waitingForAnswer' ||
+      Boolean(s && (s.pendingInteraction || s.needsAttention))
+    if (isWait) {
       counts.wait++
       const code = waitCode(s)
       if (code === 'APP') counts.approval++
       else if (code === 'ANS') counts.question++
       else if (code === 'PLAN') counts.plan++
-    } else if (s.status === 'working') {
+    } else if (phase === 'running' || s.status === 'working') {
       counts.busy++
-    } else if (s.status === 'completed') {
+    } else if (phase === 'completed' || s.status === 'completed') {
       counts.done++
-    } else if (s.status === 'idle') {
+    } else if (phase === 'idle' || s.status === 'idle') {
       counts.idle++
     }
   }

@@ -58,8 +58,11 @@ const WAIT_RESUME_EVENTS = new Set([
 // interrupt and would wrongly resurrect a genuinely interrupted turn (whose tool
 // never completed). A real Stop-hook `completed` (source 'hook') is NOT inferred and
 // stays sticky, so a normally-finished turn is never un-finished; only a sweep's own
-// inference is allowed to be overturned by the next genuine activity. See
-// phaseDecision for the newer-than-inference gate.
+// inference is allowed to be overturned by the next genuine activity. A real
+// Stop-hook `completed` can also be reopened by a tool start carrying a DIFFERENT
+// turn id: Flux models this as `turnStarted`, and Codex goal continuations can
+// start a fresh turn without a UserPromptSubmit hook. Same-turn delayed tool
+// events remain blocked. See phaseDecision for both newer-than gates.
 const INFERRED_END_RESUME_EVENTS = new Set([
   AGENT_EVENTS.TOOL_USE,
   AGENT_EVENTS.PERMISSION_BYPASSED
@@ -296,10 +299,20 @@ function phaseDecision(session, event, nextPhase, now) {
     // never un-finished. The newer-than gate stops a delayed in-flight event from the
     // aborted turn from resurrecting a genuinely ended turn (which emits nothing new
     // until the user's next prompt — already allowed above).
+    const eventTimestamp = Number.isFinite(event.timestamp) ? event.timestamp : now
+    const previousTurnId = session.lastTurnId || session.currentTurnId
+    const startsDifferentTurn = current === 'completed' &&
+      INFERRED_END_RESUME_EVENTS.has(event.type) &&
+      event.turnId &&
+      previousTurnId &&
+      event.turnId !== previousTurnId
+    if (startsDifferentTurn && eventTimestamp >= currentUpdatedAt) {
+      return { apply: true }
+    }
+
     const inferredEnd = current === 'interrupted' ||
       (current === 'completed' && currentSource === 'stale')
     if (inferredEnd && INFERRED_END_RESUME_EVENTS.has(event.type)) {
-      const eventTimestamp = Number.isFinite(event.timestamp) ? event.timestamp : now
       if (eventTimestamp >= currentUpdatedAt) return { apply: true }
     }
     return { apply: false, blockedReason: `current phase ${current} only reopens on a new turn` }

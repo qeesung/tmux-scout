@@ -6,6 +6,12 @@ const path = require('path')
 const { createHookContext, readStdin, liveSessionState, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { classifyNotification, notificationText } = require('../lib/notification-intent')
+const { currentPhase } = require('../lib/session-state')
+const {
+  backgroundActivityText,
+  backgroundShellDetails,
+  isBackgroundShellRunningText
+} = require('../lib/background-activity')
 
 function argValue(names) {
   const args = process.argv.slice(2)
@@ -227,6 +233,44 @@ function toolUse(data, sessionId, now) {
     pendingToolUse: { tool: toolName, details, timestamp: now },
     activeTool: toolName,
     lastEvent: { type: AGENT_EVENTS.TOOL_USE, timestamp: now, details }
+  })))
+}
+
+function backgroundShellRunning(data, sessionId, now) {
+  const details = backgroundShellDetails(data)
+  const message = backgroundActivityText(data) || details
+  const existing = hookContext.readSession(sessionId)
+
+  if (existing && currentPhase(existing) === 'completed') {
+    updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now), {
+      status: 'working',
+      needsAttention: null,
+      pendingToolUse: null,
+      activeTool: null,
+      lastAssistantMessage: message,
+      lastEvent: {
+        type: AGENT_EVENTS.PROMPT_SUBMIT,
+        timestamp: now,
+        details: 'background shell still running',
+        rawEventName: `${getEventName(data) || 'hook'}:background_shell_turn_active`
+      }
+    })))
+  }
+
+  resolvePendingInteraction(sessionId, data, now, details)
+  updateSession(sessionId, liveSessionState(Object.assign(baseUpdates(data, now + 1), {
+    status: 'working',
+    needsAttention: null,
+    currentActivity: details,
+    pendingToolUse: { tool: 'Bash', details, timestamp: now + 1 },
+    activeTool: 'Bash',
+    lastAssistantMessage: message,
+    lastEvent: {
+      type: AGENT_EVENTS.TOOL_USE,
+      timestamp: now + 1,
+      details,
+      rawEventName: `${getEventName(data) || 'hook'}:background_shell_running`
+    }
   })))
 }
 
@@ -605,12 +649,14 @@ function handleCoco(data, sessionId, eventName, now) {
   if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
   if (event === 'permission_request' || event === 'permission_prompt') return permissionRequest(data, sessionId, now)
   if (event === 'elicitation_dialog' || event === 'idle_prompt') {
+    if (isBackgroundShellRunningText(data)) return backgroundShellRunning(data, sessionId, now)
     if (isCocoCompletionIdleNotification(data)) {
       return updateActivity(data, sessionId, now, notificationDetails(data), AGENT_EVENTS.NOTIFICATION)
     }
     return permissionRequest(data, sessionId, now, notificationDetails(data) || 'Trae is asking for input in the terminal')
   }
   if (event === 'notification') {
+    if (isBackgroundShellRunningText(data)) return backgroundShellRunning(data, sessionId, now)
     const type = normalizeHookEventName(data.notification_type || data.notificationType || data.kind || data.type || '')
     if (type === 'elicitation_dialog' || type === 'idle_prompt') {
       if (isCocoCompletionIdleNotification(data)) {
@@ -621,7 +667,10 @@ function handleCoco(data, sessionId, eventName, now) {
     if (type === 'permission_prompt') return permissionRequest(data, sessionId, now)
     return notificationFallback(data, sessionId, now)
   }
-  if (event === 'stop') return stop(data, sessionId, now, false)
+  if (event === 'stop') {
+    if (isBackgroundShellRunningText(data)) return backgroundShellRunning(data, sessionId, now)
+    return stop(data, sessionId, now, false)
+  }
   if (event === 'subagent_start') {
     const childId = subagentId(data, now, agentType)
     return upsertSubagent(sessionId, childId, {
@@ -680,10 +729,14 @@ function handleTraex(data, sessionId, eventName, now) {
   if (event === 'post_tool_use') return postToolUse(data, sessionId, now, false)
   if (event === 'post_tool_use_failure') return postToolUse(data, sessionId, now, true)
   if (event === 'notification') {
+    if (isBackgroundShellRunningText(data)) return backgroundShellRunning(data, sessionId, now)
     if (isIdlePromptNotification(data)) return stop(data, sessionId, now, false)
     return notificationFallback(data, sessionId, now)
   }
-  if (event === 'stop') return stop(data, sessionId, now, false)
+  if (event === 'stop') {
+    if (isBackgroundShellRunningText(data)) return backgroundShellRunning(data, sessionId, now)
+    return stop(data, sessionId, now, false)
+  }
   if (event === 'stop_failure') return stop(data, sessionId, now, true)
   if (event === 'subagent_start') return upsertSubagent(sessionId, subagentId(data, now, 'traex'), subagentPatch(data, now, 'subagent'))
   if (event === 'subagent_stop') return removeSubagent(sessionId, subagentId(data, now, 'traex'), now, data.response || data.reason)

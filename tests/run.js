@@ -35,7 +35,11 @@ const {
   validateSessionSnapshot
 } = require('../scripts/lib/session-contract')
 const { collectFixtureFiles, runFlowFixture, validateFixtureExpectations } = require('../scripts/lib/flow-fixtures')
-const { findLatestCodexInterrupt } = require('../scripts/lib/codex-transcript-detector')
+const {
+  findLatestCodexInterrupt,
+  findLatestCodexPlanWait,
+  findLatestCodexOpenTurnActivity
+} = require('../scripts/lib/codex-transcript-detector')
 const { DEFAULT_TERMINAL_DISPLAY_MS } = require('../scripts/lib/session-registry')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
@@ -242,6 +246,82 @@ test('codex transcript detector matches interrupted turns by id or timestamp', (
     const byTime = findLatestCodexInterrupt(file, { minTimestampMs: 2000 })
     assert.strictEqual(byTime.turnId, 'current-turn')
     assert.strictEqual(findLatestCodexInterrupt(file, { expectTurnId: 'missing' }), null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex transcript detector matches plan waits from Plan item task completion', () => {
+  const dir = tempDir()
+  try {
+    const file = path.join(dir, 'codex-plan.jsonl')
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(1000).toISOString(),
+        payload: {
+          type: 'item_completed',
+          thread_id: 'thread-1',
+          turn_id: 'turn-plan',
+          item: { type: 'Plan', id: 'plan-item', text: '# Implement fix\n\n- Step 1' }
+        }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(2000).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'turn-plan', completed_at: 2 }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(3000).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'ordinary-turn', completed_at: 3 }
+      })
+    ].join('\n') + '\n')
+
+    const hit = findLatestCodexPlanWait(file, { expectTurnId: 'turn-plan' })
+    assert.strictEqual(hit.turnId, 'turn-plan')
+    assert.strictEqual(hit.planId, 'plan-item')
+    assert.strictEqual(hit.completedAtMs, 2000)
+    assert.match(hit.rawEventName, /item_completed:Plan\/task_complete/)
+    assert.strictEqual(findLatestCodexPlanWait(file, { expectTurnId: 'ordinary-turn' }), null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex transcript detector finds open turn activity but ignores completed turns', () => {
+  const dir = tempDir()
+  try {
+    const file = path.join(dir, 'codex-open-turn.jsonl')
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: new Date(1000).toISOString(),
+        payload: {
+          type: 'message',
+          internal_chat_message_metadata_passthrough: { turn_id: 'old-turn' }
+        }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(2000).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'old-turn' }
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: new Date(3000).toISOString(),
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          internal_chat_message_metadata_passthrough: { turn_id: 'new-turn' }
+        }
+      })
+    ].join('\n') + '\n')
+
+    const hit = findLatestCodexOpenTurnActivity(file, { minTimestampMs: 0 })
+    assert.strictEqual(hit.turnId, 'new-turn')
+    assert.strictEqual(hit.timestampMs, 3000)
+    assert.strictEqual(findLatestCodexOpenTurnActivity(file, { expectTurnId: 'old-turn' }), null)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2638,6 +2718,113 @@ test('generic hook maps Traex approval modes and idle completion', () => {
   }
 })
 
+test('generic hook keeps Traex background shell notification busy', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'traex-background-shell'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    const backgroundMessage = 'Artifact poll is running in background (ID: 20899). cx is working on the extraction. This typically takes 5-15 minutes.'
+
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'extract artifacts'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'Stop'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'Notification',
+      notification_type: 'idle_prompt',
+      message: backgroundMessage
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.agentType, 'traex')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.ok(session.pendingToolUse.details.includes('Artifact poll is running in background'))
+    assert.ok(session.lastAssistantMessage.includes('Artifact poll is running in background'))
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
+
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'Notification',
+      notification_type: 'idle_prompt',
+      message: 'Agent finished and is waiting for your input'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.pendingToolUse, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync recovers completed Traex background shell sessions as busy', () => {
+  const dir = tempDir()
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(scoutDir, { recursive: true })
+    const statusPath = path.join(scoutDir, 'status.json')
+    const now = Date.now()
+    const sessionId = 'traex-background-recovery'
+    const backgroundMessage = 'Artifact poll is running in background (ID: 20899). cx is working on the extraction. This typically takes 5-15 minutes.'
+    fs.writeFileSync(statusPath, JSON.stringify({
+      version: 1,
+      lastUpdated: now - 5000,
+      sessions: {
+        [sessionId]: {
+          sessionId,
+          agentType: 'traex',
+          phase: 'completed',
+          status: 'completed',
+          startedAt: now - 60000,
+          lastUpdated: now - 5000,
+          lastHookAt: now - 5000,
+          stateSource: 'traex-hooks',
+          lastAssistantMessage: backgroundMessage,
+          lastEvent: { type: AGENT_EVENTS.STOP, timestamp: now - 5000, rawEventName: 'Notification' },
+          lifecycle: {
+            phase: 'completed',
+            source: 'hook',
+            priority: 90,
+            reason: 'stop',
+            updatedAt: now - 5000
+          }
+        }
+      }
+    }, null, 2))
+
+    const result = sync.run(statusPath, {
+      reconcile: false,
+      codexTranscript: false,
+      claudeTranscript: false,
+      waitResolve: false,
+      idleComplete: false,
+      registryPrune: false,
+      backgroundActivityRecoveryMs: 10 * 60 * 1000
+    })
+
+    const session = result.status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.ok(session.pendingToolUse.details.includes('Artifact poll is running in background'))
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
+    assert.strictEqual(result.stats.reconcile.backgroundActivity, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('session reducer protects recent high-confidence hook state', () => {
   const session = { sessionId: 's1', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
@@ -2734,8 +2921,8 @@ test('session reducer recovers an idle-sweep completed session on a genuinely ne
 
 test('session reducer keeps completed sticky against later activity (only a new turn reopens)', () => {
   const session = { sessionId: 'done-sticky', agentType: 'claude', startedAt: 1000 }
-  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
-  applySessionEvent(session, { type: 'stop', source: 'hook', timestamp: 2000 })
+  applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000, turnId: 'turn-old' })
+  applySessionEvent(session, { type: 'stop', source: 'hook', timestamp: 2000, turnId: 'turn-old' })
   assert.strictEqual(currentPhase(session), 'completed')
 
   // A stray late tool event must NOT un-finish a normally-completed turn.
@@ -2743,13 +2930,31 @@ test('session reducer keeps completed sticky against later activity (only a new 
     type: 'tool_use',
     source: 'hook',
     timestamp: 3000,
+    turnId: 'turn-old',
     activeTool: 'Bash'
   })
   assert.strictEqual(stray.applied, false)
   assert.strictEqual(currentPhase(session), 'completed')
 
+  // Codex goal continuations can start a fresh turn without a UserPromptSubmit
+  // hook. A new-turn tool start is Flux's turnStarted equivalent and reopens it.
+  const newTurnTool = applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 3500,
+    turnId: 'turn-new',
+    activeTool: 'Bash'
+  })
+  assert.strictEqual(newTurnTool.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.lastTurnId, 'turn-new')
+  assert.strictEqual(session.activeTool, 'Bash')
+
+  applySessionEvent(session, { type: 'stop', source: 'hook', timestamp: 3600, turnId: 'turn-new' })
+  assert.strictEqual(currentPhase(session), 'completed')
+
   // A fresh prompt still reopens it.
-  const reopened = applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 4000 })
+  const reopened = applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 4000, turnId: 'turn-third' })
   assert.strictEqual(reopened.applied, true)
   assert.strictEqual(currentPhase(session), 'running')
 })
@@ -3171,6 +3376,36 @@ test('session reducer classifies plan approval as pending interaction', () => {
 
   assert.strictEqual(session.pendingInteraction.startedAt, 1000)
   assert.strictEqual(session.pendingInteraction.updatedAt, 1500)
+})
+
+test('session reducer resumes running after plan wait user confirmation', () => {
+  const session = { sessionId: 's2-plan-confirmed', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'permission_request',
+    source: 'transcript',
+    timestamp: 1000,
+    attentionReason: 'waiting for plan approval',
+    pendingToolUse: { tool: 'ExitPlanMode', details: 'ExitPlanMode: proposed plan', timestamp: 1000 },
+    turnId: 'turn-plan',
+    force: true
+  })
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.pendingInteraction.type, 'plan')
+
+  applySessionEvent(session, {
+    type: 'prompt_submit',
+    source: 'hook',
+    rawEventName: 'UserPromptSubmit',
+    timestamp: 2000,
+    details: 'Implement the plan.',
+    turnId: 'turn-implement'
+  })
+
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.needsAttention, null)
+  assert.strictEqual(session.pendingInteraction, null)
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.lastTurnId, 'turn-implement')
 })
 
 test('session reducer keeps pending tool detail on low-fidelity wait refresh', () => {
@@ -4471,6 +4706,141 @@ test('codex sync marks matching current turn interrupted from transcript', () =>
     assert.strictEqual(updated.lastEvent.turnId, 'turn-current')
     assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
     assert.strictEqual(result.stats.codex.interrupted, 1)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync maps completed plan task to WAIT plan instead of DONE', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-plan-wait-sync'
+    const jsonl = path.join(dir, 'codex-plan-wait-sync.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(now - 3000).toISOString(),
+        payload: {
+          type: 'item_completed',
+          thread_id: threadId,
+          turn_id: 'turn-plan',
+          item: { type: 'Plan', id: 'plan-item', text: '# Fix status sync\n\n- Use Flux semantics' }
+        }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(now - 2500).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'turn-plan' }
+      })
+    ].join('\n') + '\n')
+    const fileTime = new Date(now - 2500)
+    fs.utimesSync(jsonl, fileTime, fileTime)
+
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'completed',
+      phase: 'completed',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-plan',
+      lastUpdated: now - 2400,
+      lifecycle: { phase: 'completed', source: 'notify', priority: 40, updatedAt: now - 2400 }
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      waitResolve: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'waitingForApproval')
+    assert.strictEqual(updated.status, 'working')
+    assert.strictEqual(updated.needsAttention, 'waiting for plan approval')
+    assert.strictEqual(updated.pendingInteraction.type, 'plan')
+    assert.strictEqual(updated.pendingInteraction.tool, 'ExitPlanMode')
+    assert.strictEqual(updated.activeTool, null)
+    assert.strictEqual(result.stats.codex.planWaits, 1)
+
+    const counts = statusBar.summarizeSessions([updated])
+    assert.strictEqual(counts.wait, 1)
+    assert.strictEqual(counts.plan, 1)
+    assert.strictEqual(counts.done, 0)
+    assert.strictEqual(counts.busy, 0)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync reopens completed session when transcript starts a new goal turn', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-goal-turn-start'
+    const jsonl = path.join(dir, 'codex-goal-turn-start.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(now - 10000).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'turn-plan' }
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        timestamp: new Date(now - 1000).toISOString(),
+        payload: {
+          type: 'message',
+          internal_chat_message_metadata_passthrough: { turn_id: 'turn-goal' },
+          content: [{ type: 'output_text', text: '<codex_internal_context source="goal">' }]
+        }
+      })
+    ].join('\n') + '\n')
+
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'completed',
+      phase: 'completed',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastTurnId: 'turn-plan',
+      lastUpdated: now - 9000,
+      lifecycle: { phase: 'completed', source: 'hook', priority: 90, updatedAt: now - 9000 }
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      waitResolve: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'running')
+    assert.strictEqual(updated.status, 'working')
+    assert.strictEqual(updated.lastTurnId, 'turn-goal')
+    assert.strictEqual(updated.activeTool, null)
+    assert.strictEqual(result.stats.codex.turnStarts, 1)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })

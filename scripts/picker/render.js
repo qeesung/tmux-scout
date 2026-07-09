@@ -163,6 +163,7 @@ function getActiveSessions(status, panes) {
 
   function paneActivityRank(session) {
     const phase = phaseForSession(session)
+    if (session && session.isRalphLoopIteration) return 0
     if (isNeedsAttention(session, now) || phase === 'running') return 0
     if (phase === 'completed' || phase === 'idle') return 1
     if (phase === 'interrupted') return 2
@@ -241,6 +242,7 @@ function waitCode(session) {
 function statusTag(session, now) {
   const phase = phaseForSession(session)
   if (isNeedsAttention(session, now)) return formatField(`W:${waitCode(session)}`, STATUS_WIDTH, '31')
+  if (session && session.isRalphLoopIteration) return formatField('LOOP', STATUS_WIDTH, '35')
   if (phase === 'running') return formatField('BUSY', STATUS_WIDTH, '33')
   if (phase === 'interrupted') return formatField('INT', STATUS_WIDTH, '35')
   if (phase === 'crashed') return formatField('CRASH', STATUS_WIDTH, '31')
@@ -284,6 +286,18 @@ function subagentDetail(session) {
   const label = cleanText(latest.nickname || latest.agentType || latest.title, 'subagent')
   const activity = cleanText(latest.lastToolActivity || latest.title || latest.phase, '')
   return activity ? `${count} · ${label}: ${activity}` : `${count} · ${label}`
+}
+
+function ralphLoopDetail(session) {
+  if (!session || !session.isRalphLoopIteration) return ''
+  const loop = session.ralphLoop && typeof session.ralphLoop === 'object' ? session.ralphLoop : {}
+  const iteration = Number.isFinite(loop.iteration) ? loop.iteration : undefined
+  const maxIterations = Number.isFinite(loop.maxIterations) ? loop.maxIterations : undefined
+  if (iteration !== undefined && maxIterations !== undefined && maxIterations > 0) {
+    return `Ralph loop ${iteration}/${maxIterations}`
+  }
+  if (iteration !== undefined) return `Ralph loop iteration ${iteration}`
+  return 'Ralph loop iteration'
 }
 
 function latestEvidence(session) {
@@ -336,9 +350,12 @@ function formatLine(session, now, currentPane) {
   const title = session.sessionTitle ? `\x1b[2m"${String(session.sessionTitle).replace(/[\r\n\t]+/g, ' ').slice(0, 50)}"\x1b[0m` : ''
   const terminalReason = session.terminalReason || session.crashReason || session.staleReason || session.stateReason
   const subagents = subagentDetail(session)
+  const ralph = ralphLoopDetail(session)
   const evidence = evidenceDetail(session, now)
   const detail = isTerminalSession(session) && terminalReason
     ? `  \x1b[2m${String(terminalReason).replace(/[\r\n\t]+/g, ' ').slice(0, 55)}\x1b[0m`
+    : ralph
+    ? `  \x1b[35m${ralph.slice(0, 55)}\x1b[0m`
     : isNeedsAttention(session, now)
     ? `  \x1b[31m${attentionDetail(session).slice(0, 55)}\x1b[0m`
     : unbound

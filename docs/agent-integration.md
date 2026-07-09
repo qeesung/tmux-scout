@@ -69,6 +69,11 @@ Waiting state is represented as `pendingInteraction` plus the legacy
 - `requestId` / `turnId`: stable ids when exposed by the agent
 - `source` / `stateSource` / `rawEventName`: evidence for debugging
 
+Codex `request_user_input` should be mapped as `question_asked` on `PreToolUse`
+and `question_answered` on `PostToolUse`. Do not rely on final assistant text as
+the primary question signal; use text heuristics only as a fallback when the
+payload has no structured wait event.
+
 ## Notifications
 
 Some agents only signal "the agent now needs the user" through a `Notification`

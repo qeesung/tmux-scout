@@ -5127,6 +5127,113 @@ test('claude hook records StopFailure as completed with error detail', () => {
   }
 })
 
+test('claude hook marks Ralph loop Stop as loop iteration in picker', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-ralph-loop'
+    const cwd = path.join(dir, 'project')
+    fs.mkdirSync(path.join(cwd, '.claude'), { recursive: true })
+    fs.writeFileSync(path.join(cwd, '.claude', 'ralph-loop.local.md'), [
+      '---',
+      'active: true',
+      `session_id: ${sessionId}`,
+      'iteration: 2',
+      'max_iterations: 5',
+      'completion_promise: "ship when green"',
+      '---',
+      ''
+    ].join('\n'))
+
+    const base = { session_id: sessionId, cwd }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run Ralph loop'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'iteration done'
+    }), dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.isRalphLoopIteration, true)
+    assert.strictEqual(session.ralphLoop.iteration, 2)
+    assert.strictEqual(session.ralphLoop.maxIterations, 5)
+    assert.strictEqual(session.ralphLoop.completionPromise, 'ship when green')
+
+    const pane = { paneId: '%1', currentCommand: 'node', paneDead: false, windowName: 'main' }
+    session._tmuxPaneSnapshot = pane
+    const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+    assert.ok(line.includes('LOOP'), line)
+    assert.ok(line.includes('Ralph loop 2/5'), line)
+    assert.deepStrictEqual(
+      getActiveSessions(status, new Map([['%1', pane]])).map(item => item.sessionId),
+      [sessionId]
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude hook clears Ralph loop marker on normal Stop', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-ralph-clear'
+    const cwd = path.join(dir, 'project')
+    fs.mkdirSync(path.join(cwd, '.claude'), { recursive: true })
+    const loopPath = path.join(cwd, '.claude', 'ralph-loop.local.md')
+    fs.writeFileSync(loopPath, [
+      '---',
+      'active: true',
+      `session_id: ${sessionId}`,
+      'iteration: 1',
+      'max_iterations: 3',
+      'completion_promise: null',
+      '---',
+      ''
+    ].join('\n'))
+
+    const base = { session_id: sessionId, cwd }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run Ralph loop'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'iteration done'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.isRalphLoopIteration, true)
+
+    fs.writeFileSync(loopPath, [
+      '---',
+      'active: false',
+      `session_id: ${sessionId}`,
+      'iteration: 3',
+      'max_iterations: 3',
+      'completion_promise: null',
+      '---',
+      ''
+    ].join('\n'))
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'all done'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.isRalphLoopIteration, null)
+    assert.strictEqual(session.ralphLoop, null)
+    session._tmuxPaneSnapshot = { paneId: '%1', currentCommand: 'node', paneDead: false, windowName: 'main' }
+    const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+    assert.ok(line.includes('DONE'), line)
+    assert.ok(!line.includes('LOOP'), line)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('claude hook resets lifecycle on clear but preserves compact starts', () => {
   const dir = tempDir()
   try {
@@ -5394,6 +5501,193 @@ test('codex hook records question answered before next prompt clears wait', () =
   }
 })
 
+test('codex hook maps request_user_input to answer wait and resolution', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-request-user-input'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo', turn_id: 'turn-question' }
+    const toolInput = {
+      questions: [{
+        id: 'choice',
+        header: 'Implementation',
+        question: 'Which implementation should I use?',
+        options: [
+          { label: 'Keep current API' },
+          { label: 'Add adapter' }
+        ]
+      }]
+    }
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'ask before implementing'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'request_user_input',
+      tool_input: toolInput,
+      tool_use_id: 'call-question'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+    assert.strictEqual(session.needsAttention, 'waiting for answer')
+    assert.strictEqual(session.pendingInteraction.type, 'question')
+    assert.strictEqual(session.pendingInteraction.tool, 'request_user_input')
+    assert.match(session.pendingInteraction.details, /Which implementation/)
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.lastEvent.type, 'question_asked')
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'request_user_input',
+      tool_input: toolInput,
+      tool_response: '{"answers":{"choice":{"answers":["Keep current API"]}}}',
+      tool_use_id: 'call-question'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.lastEvent.type, 'post_tool_use')
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === 'question_answered'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook resolves deferred Stop after request_user_input answer', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-request-user-input-deferred'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo', turn_id: 'turn-question-deferred' }
+    const toolInput = { message: '请选择一个方案？\n1. A\n2. B' }
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'ask before implementing'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'request_user_input',
+      tool_input: toolInput
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'done'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+    assert.strictEqual(session.deferredCompletion.phase, 'completed')
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'request_user_input',
+      tool_input: toolInput,
+      tool_response: '{"answers":{"q0":{"answers":["A"]}}}'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, 'stop')
+    assert.strictEqual(session.lastEvent.resolvedBy, 'question_answered')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook bypasses PermissionRequest when approval_policy is never', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-approval-never'
+    const transcriptPath = path.join(dir, 'codex-approval-never.jsonl')
+    fs.writeFileSync(transcriptPath, [
+      JSON.stringify({ type: 'session_meta', payload: { id: sessionId, source: 'cli' } }),
+      JSON.stringify({ type: 'turn_context', payload: { approval_policy: 'never' } })
+    ].join('\n') + '\n')
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo', transcript_path: transcriptPath, turn_id: 'turn-never' }
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run tests'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      permission_mode: 'default',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, 'permission_bypassed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook bypasses duplicate native-approved PermissionRequest only for the same request', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-duplicate-native-approval'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo', turn_id: 'turn-approval' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run tests'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.ok(session._codexPendingNativeRequestId)
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session._codexPendingNativeRequestId, null)
+    assert.strictEqual(session._codexNativeApprovedRequestIds.length, 1)
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, 'permission_bypassed')
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm run build' }
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.lastEvent.type, 'permission_request')
+    assert.match(session.pendingInteraction.details, /npm run build/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('codex hook defers Stop while approval wait is still pending', () => {
   const dir = tempDir()
   try {
@@ -5519,6 +5813,29 @@ test('codex hook does not treat normal completed answers with question marks as 
   }
 })
 
+test('codex hook does not treat unstructured Stop question text as input wait', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-unstructured-question-text'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'finish and ask if needed'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'Which implementation should I use?'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.lastEvent.type, 'stop')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('codex classifier hides internal background prompts', () => {
   const classification = classifyCodexSession({
     prompt: [
@@ -5530,6 +5847,40 @@ test('codex classifier hides internal background prompts', () => {
   assert.strictEqual(classification.hidden, true)
   assert.strictEqual(classification.isInternal, true)
   assert.strictEqual(classification.reason, 'codex-pr-metadata')
+})
+
+test('codex classifier hides newer internal background prompts and agent jobs', () => {
+  const cases = [
+    {
+      prompt: 'Using the current thread context and the diff below, generate a single-line git commit message.',
+      reason: 'codex-commit-message'
+    },
+    {
+      prompt: 'Using the current thread context and the commit and pull request contexts below, generate one git commit message plus one pull request title and body.',
+      reason: 'codex-commit-pr-message'
+    },
+    {
+      prompt: '## GDPA Agent Box Runtime\n\nRun this automated task.',
+      reason: 'codex-agent-box-runtime'
+    }
+  ]
+
+  for (const testCase of cases) {
+    const classification = classifyCodexSession({ prompt: testCase.prompt })
+    assert.strictEqual(classification.hidden, true)
+    assert.strictEqual(classification.isInternal, true)
+    assert.strictEqual(classification.reason, testCase.reason)
+  }
+
+  const agentJob = classifyCodexSession({
+    sessionMeta: {
+      id: 'codex-agent-job',
+      source: { subagent: { other: 'agent_job:123' } }
+    }
+  })
+  assert.strictEqual(agentJob.hidden, true)
+  assert.strictEqual(agentJob.isInternal, true)
+  assert.strictEqual(agentJob.reason, 'codex-agent-job')
 })
 
 test('codex classifier keeps standalone review sessions visible', () => {
@@ -5648,10 +5999,10 @@ test('codex legacy notify classifies full prompt before title truncation', () =>
   }
 })
 
-test('codex hook reads transcript session_meta from first line of large transcript', () => {
+test('codex hook keeps fork-only transcript session visible', () => {
   const dir = tempDir()
   try {
-    const sessionId = 'codex-large-transcript-subagent'
+    const sessionId = 'codex-large-transcript-fork'
     const transcriptPath = path.join(dir, 'large-rollout.jsonl')
     const firstLine = JSON.stringify({
       type: 'session_meta',
@@ -5672,11 +6023,10 @@ test('codex hook reads transcript session_meta from first line of large transcri
 
     const status = readScoutStatus(dir)
     const session = status.sessions[sessionId]
-    assert.strictEqual(session.isHiddenFromScout, true)
-    assert.strictEqual(session.isCodexSubagent, true)
-    assert.strictEqual(session.hiddenReason, 'codex-subagent')
-    assert.strictEqual(session.parentSessionId, 'parent-session')
-    assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+    assert.notStrictEqual(session.isHiddenFromScout, true)
+    assert.notStrictEqual(session.isCodexSubagent, true)
+    assert.strictEqual(session.codexForkedFromId, 'parent-session')
+    assert.strictEqual(currentPhase(session), 'idle')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -5754,6 +6104,15 @@ test('codex hidden subagents are summarized on parent picker rows', () => {
     parent._tmuxPaneSnapshot = pane
     const line = stripAnsi(formatLine(parent, Date.now(), '%1'))
     assert.ok(/1 subagent · reviewer: Bash: npm test/.test(line), line)
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, childBase, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'request_user_input',
+      tool_input: { questions: [{ question: 'Continue child task?', options: [{ label: 'Yes' }] }] }
+    }), dir)
+    status = readScoutStatus(dir)
+    assert.strictEqual(status.sessions[parentId].activeSubagents[0].phase, 'waitingForAnswer')
+    assert.strictEqual(status.sessions[parentId].activeSubagents[0].lastToolActivity, 'Continue child task?')
 
     runHook('scripts/hooks/codex.js', Object.assign({}, childBase, {
       hook_event_name: 'Stop',

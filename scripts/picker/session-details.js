@@ -66,6 +66,7 @@ function shortAge(now, timestamp) {
 }
 
 function statusLabel(session) {
+  if (session.isRalphLoopIteration) return 'LOOP'
   if (session.needsAttention) return 'WAITING'
   if (session.status === 'working') return 'BUSY'
   if (session.status === 'interrupted') return 'INTERRUPTED'
@@ -76,6 +77,7 @@ function statusLabel(session) {
 }
 
 function statusColor(session) {
+  if (session.isRalphLoopIteration) return COLOR.magenta
   if (session.needsAttention) return `${COLOR.red};${COLOR.bold}`
   if (session.status === 'working') return COLOR.yellow
   if (session.status === 'interrupted') return COLOR.magenta
@@ -112,6 +114,18 @@ function currentActivity(session) {
   if (session.lastEvent && session.lastEvent.details) return session.lastEvent.details
   if (session.stateReason) return session.stateReason
   return ''
+}
+
+function ralphLoopDetail(session) {
+  if (!session || !session.isRalphLoopIteration) return ''
+  const loop = session.ralphLoop && typeof session.ralphLoop === 'object' ? session.ralphLoop : {}
+  const iteration = Number.isFinite(loop.iteration) ? loop.iteration : undefined
+  const maxIterations = Number.isFinite(loop.maxIterations) ? loop.maxIterations : undefined
+  const promise = cleanText(loop.completionPromise)
+  const progress = iteration !== undefined && maxIterations !== undefined && maxIterations > 0
+    ? `${iteration}/${maxIterations}`
+    : iteration !== undefined ? `iteration ${iteration}` : 'active'
+  return [progress, promise].filter(Boolean).join('  ')
 }
 
 function updatedLine(session, now) {
@@ -171,6 +185,7 @@ function formatCurrent(session, now) {
   pushField(lines, 'phase', colorText(phase, phaseColor(phase)))
   pushField(lines, 'activity', colorText(truncateText(currentActivity(session), 120), COLOR.yellow))
   pushField(lines, 'request', colorText(session.needsAttention, COLOR.red))
+  pushField(lines, 'ralph', colorText(ralphLoopDetail(session), COLOR.magenta))
   pushField(lines, 'pending', colorText(pendingInteractionDetail(session.pendingInteraction), COLOR.red))
   pushField(lines, 'evidence', pendingInteractionEvidence(session.pendingInteraction, now))
   pushField(lines, 'updated', updatedLine(session, now))

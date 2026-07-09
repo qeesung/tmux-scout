@@ -4,6 +4,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const { spawnSync } = require('child_process')
 const { createHookContext, readStdin } = require('../lib/hook-adapter')
 const { classifyCodexSession, cleanCodexPrompt, isHiddenCodexSession } = require('../lib/codex-session-classifier')
@@ -47,7 +48,7 @@ function resolvePendingInteraction(sessionId, data, now, details) {
   const pending = session && session.pendingInteraction
   if (!pending) return
   const eventType = pendingResolutionType(pending)
-  updateSession(sessionId, Object.assign({}, baseUpdates(data, now), {
+  updateSession(sessionId, Object.assign({}, baseUpdates(data, now), codexNativeApprovalUpdates(session, data.hook_event_name), {
     status: 'working',
     needsAttention: null,
     pendingToolUse: null,
@@ -114,6 +115,63 @@ function getToolDetails(toolName, toolInput) {
     }
   }
   return toolDetails
+}
+
+function compactText(value, max = 160) {
+  const text = String(value || '').replace(/[\r\n\t]+/g, ' ').trim()
+  if (!text) return ''
+  return text.length > max ? text.slice(0, max - 1) + '~' : text
+}
+
+function stableStringify(value) {
+  if (value === null || value === undefined) return String(value)
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']'
+  if (typeof value === 'object') {
+    return '{' + Object.keys(value).sort().map(key => {
+      return JSON.stringify(key) + ':' + stableStringify(value[key])
+    }).join(',') + '}'
+  }
+  return JSON.stringify(value)
+}
+
+function codexNativeRequestId(toolName, toolInput) {
+  const input = stableStringify(toolInput || {})
+  const hash = crypto.createHash('sha1').update(input).digest('hex').slice(0, 16)
+  return `${toolName || 'unknown'}:${hash}`
+}
+
+function codexApprovedRequestIds(session) {
+  return Array.isArray(session && session._codexNativeApprovedRequestIds)
+    ? session._codexNativeApprovedRequestIds.filter(value => typeof value === 'string' && value)
+    : []
+}
+
+function hasCodexApprovedRequest(session, requestId) {
+  return Boolean(requestId && codexApprovedRequestIds(session).includes(requestId))
+}
+
+function codexNativeApprovalUpdates(session, eventName) {
+  const pendingRequestId = session && session._codexPendingNativeRequestId
+  if (!pendingRequestId) return {}
+  if (eventName !== 'PreToolUse' && eventName !== 'PostToolUse') return {}
+  const approved = codexApprovedRequestIds(session).filter(value => value !== pendingRequestId)
+  approved.unshift(pendingRequestId)
+  return {
+    _codexPendingNativeRequestId: null,
+    _codexNativeApprovedRequestIds: approved.slice(0, 50)
+  }
+}
+
+function questionDetailsFromToolInput(toolInput) {
+  const input = toolInput && typeof toolInput === 'object' && !Array.isArray(toolInput) ? toolInput : null
+  if (!input) return 'request_user_input'
+  if (Array.isArray(input.questions) && input.questions.length > 0) {
+    const first = input.questions.find(item => item && typeof item === 'object')
+    if (first) {
+      return compactText(first.question || first.header || first.id, 160) || 'request_user_input'
+    }
+  }
+  return compactText(input.message || input.prompt || input.description, 160) || 'request_user_input'
 }
 
 function forwardToOriginalNotify(jsonArg) {
@@ -196,9 +254,6 @@ function looksLikeAssistantQuestion(message) {
     return /[?？]/.test(line) && promptQuestionRe.test(line)
   }
 
-  const lastLine = tailLines[tailLines.length - 1]
-  if (isPromptQuestion(lastLine)) return true
-
   for (let i = 0; i < tailLines.length - 1; i++) {
     if (!isPromptQuestion(tailLines[i])) continue
     if (tailLines.slice(i + 1).some(line => optionRe.test(line))) return true
@@ -265,6 +320,53 @@ function readTranscriptSessionMeta(transcriptPath) {
   } catch (_) {
     return null
   }
+}
+
+function readApprovalPolicy(transcriptPath, maxBytes = 1024 * 1024) {
+  if (!transcriptPath) return undefined
+  let fd = null
+  try {
+    fd = fs.openSync(transcriptPath, 'r')
+    const buffer = Buffer.alloc(Math.min(64 * 1024, maxBytes))
+    let offset = 0
+    let carry = ''
+    while (offset < maxBytes) {
+      const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, maxBytes - offset), offset)
+      if (bytesRead <= 0) break
+      offset += bytesRead
+      carry += buffer.toString('utf-8', 0, bytesRead)
+      const lines = carry.split('\n')
+      carry = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const obj = JSON.parse(line)
+          const policy = obj &&
+            obj.type === 'turn_context' &&
+            obj.payload &&
+            typeof obj.payload.approval_policy === 'string'
+            ? obj.payload.approval_policy
+            : undefined
+          if (policy) return policy
+        } catch (_) {}
+      }
+    }
+    if (carry.trim()) {
+      try {
+        const obj = JSON.parse(carry)
+        if (obj && obj.type === 'turn_context' && typeof obj.payload?.approval_policy === 'string') {
+          return obj.payload.approval_policy
+        }
+      } catch (_) {}
+    }
+  } catch (_) {
+    return undefined
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch (_) {}
+    }
+  }
+  return undefined
 }
 
 function codexSourceLabel(source) {
@@ -417,9 +519,14 @@ function updateParentSubagentFromHiddenEvent(session, data, now) {
 
   if (eventName === 'PreToolUse' || eventName === 'PermissionRequest') {
     const toolName = data.tool_name || 'unknown'
-    const details = getToolDetails(toolName, data.tool_input)
+    const isQuestionTool = toolName === 'request_user_input'
+    const details = isQuestionTool
+      ? questionDetailsFromToolInput(data.tool_input)
+      : getToolDetails(toolName, data.tool_input)
     upsertParentSubagent(session.parentSessionId, childSessionId, Object.assign({}, base, {
-      phase: eventName === 'PermissionRequest' ? 'waitingForApproval' : 'running',
+      phase: isQuestionTool
+        ? 'waitingForAnswer'
+        : eventName === 'PermissionRequest' ? 'waitingForApproval' : 'running',
       lastToolActivity: details
     }))
     return
@@ -492,6 +599,8 @@ function handleModernHook(data) {
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
         needsAttention: null,
+        _codexPendingNativeRequestId: null,
+        _codexNativeApprovedRequestIds: null,
         pendingToolUse: null,
         activeTool: null,
         sessionTitle: title,
@@ -504,7 +613,21 @@ function handleModernHook(data) {
 
     case 'PreToolUse': {
       const toolName = data.tool_name || 'unknown'
-      const details = getToolDetails(toolName, data.tool_input)
+      const isQuestionTool = toolName === 'request_user_input'
+      const details = isQuestionTool
+        ? questionDetailsFromToolInput(data.tool_input)
+        : getToolDetails(toolName, data.tool_input)
+      if (isQuestionTool) {
+        updateSession(sessionId, Object.assign({}, base, {
+          status: 'working',
+          needsAttention: 'waiting for answer',
+          pendingToolUse: { tool: toolName, details, timestamp: now },
+          activeTool: toolName,
+          lastTurnId: data.turn_id,
+          lastEvent: { type: AGENT_EVENTS.QUESTION_ASKED, timestamp: now, details, turnId: data.turn_id }
+        }))
+        break
+      }
       resolvePendingInteraction(sessionId, data, now, details)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
@@ -518,21 +641,26 @@ function handleModernHook(data) {
     }
 
     case 'PermissionRequest': {
-      if (isBypassPermission(data)) {
+      const toolName = data.tool_name || 'unknown'
+      const nativeRequestId = codexNativeRequestId(toolName, data.tool_input)
+      const approvalPolicy = readApprovalPolicy(data.transcript_path)
+      if (isBypassPermission(data) || approvalPolicy === 'never' || hasCodexApprovedRequest(existing, nativeRequestId)) {
         resolvePendingInteraction(sessionId, data, now, 'permission bypassed')
         updateSession(sessionId, Object.assign({}, base, {
           lastTurnId: data.turn_id,
+          requestId: data.request_id || data.requestId || data.tool_call_id || data.toolCallId || data.tool_use_id || data.toolUseId || nativeRequestId,
           lastEvent: { type: AGENT_EVENTS.PERMISSION_BYPASSED, timestamp: now, turnId: data.turn_id }
         }))
         break
       }
-      const toolName = data.tool_name || 'unknown'
       const details = getToolDetails(toolName, data.tool_input)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
         needsAttention: 'waiting for approval',
+        _codexPendingNativeRequestId: nativeRequestId,
         pendingToolUse: { tool: toolName, details, timestamp: now },
         activeTool: toolName,
+        requestId: data.request_id || data.requestId || data.tool_call_id || data.toolCallId || data.tool_use_id || data.toolUseId || nativeRequestId,
         lastTurnId: data.turn_id,
         lastEvent: { type: AGENT_EVENTS.PERMISSION_REQUEST, timestamp: now, details, turnId: data.turn_id }
       }))
@@ -541,12 +669,14 @@ function handleModernHook(data) {
 
     case 'PostToolUse': {
       const toolName = data.tool_name || 'unknown'
-      resolvePendingInteraction(sessionId, data, now, toolName)
+      const isQuestionTool = toolName === 'request_user_input'
+      const details = isQuestionTool ? questionDetailsFromToolInput(data.tool_input) : toolName
+      resolvePendingInteraction(sessionId, data, now, details)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
-        preserveActiveTool: true,
+        preserveActiveTool: isQuestionTool ? undefined : true,
         lastTurnId: data.turn_id,
         lastEvent: { type: AGENT_EVENTS.POST_TOOL_USE, timestamp: now, details: toolName, turnId: data.turn_id }
       }))
@@ -565,6 +695,8 @@ function handleModernHook(data) {
       updateSession(sessionId, Object.assign({}, base, {
         status: wantsAnswer ? 'working' : 'completed',
         needsAttention: wantsAnswer ? 'waiting for answer' : null,
+        _codexPendingNativeRequestId: wantsAnswer ? undefined : null,
+        _codexNativeApprovedRequestIds: wantsAnswer ? undefined : null,
         pendingToolUse: null,
         activeTool: null,
         sessionTitle: data.session_title || undefined,

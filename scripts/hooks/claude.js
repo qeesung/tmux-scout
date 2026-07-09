@@ -3,6 +3,7 @@
 // Tracks Claude session status with tmux pane mapping
 
 const path = require('path')
+const fs = require('fs')
 const { createHookContext, liveSessionState, readStdin, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { classifyNotification } = require('../lib/notification-intent')
@@ -59,6 +60,40 @@ function isQuestionTool(toolName) {
 
 function isPlanApprovalTool(toolName) {
   return toolName === 'ExitPlanMode'
+}
+
+function readRalphLoopState(cwd, sessionId) {
+  if (!cwd || !sessionId) return null
+  try {
+    const filePath = path.join(cwd, '.claude', 'ralph-loop.local.md')
+    const raw = fs.readFileSync(filePath, 'utf-8')
+    const frontmatter = raw.match(/^---\n([\s\S]*?)\n---/)
+    if (!frontmatter) return null
+    const body = frontmatter[1]
+    const get = key => {
+      const match = body.match(new RegExp(`^${key}:\\s*(.*)$`, 'm'))
+      if (!match) return undefined
+      let value = match[1].trim()
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1)
+      }
+      return value
+    }
+    if (get('active') !== 'true') return null
+    const stateSessionId = get('session_id') || ''
+    if (!stateSessionId || stateSessionId !== sessionId) return null
+    const iteration = Number(get('iteration') || '0')
+    const maxIterations = Number(get('max_iterations') || '0')
+    const completionPromise = get('completion_promise')
+    return {
+      active: true,
+      iteration: Number.isFinite(iteration) ? iteration : 0,
+      maxIterations: Number.isFinite(maxIterations) ? maxIterations : 0,
+      completionPromise: completionPromise && completionPromise !== 'null' ? completionPromise : null
+    }
+  } catch (_) {
+    return null
+  }
 }
 
 function eventBase(data, now) {
@@ -451,16 +486,20 @@ function handleClaudeHook(data) {
       break
     }
 
-    case 'Stop':
+    case 'Stop': {
+      const ralphLoopState = readRalphLoopState(data.cwd, session_id)
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
+        isRalphLoopIteration: ralphLoopState ? true : null,
+        ralphLoop: ralphLoopState ? Object.assign({}, ralphLoopState, { updatedAt: now }) : null,
         pendingToolUse: null,
         activeTool: null,
         lastAssistantMessage: data.last_assistant_message,
         lastEvent: { type: AGENT_EVENTS.STOP, timestamp: now },
       }))
       break
+    }
 
     case 'StopFailure':
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {

@@ -72,6 +72,8 @@ const SESSION_CONTRACT_VERSION = 1
  * @property {{tool?: string, details?: string, timestamp?: number}|null=} pendingToolUse
  * @property {PendingInteraction|null=} pendingInteraction
  * @property {string|null=} activeTool
+ * @property {boolean=} isRalphLoopIteration
+ * @property {{active?: boolean, iteration?: number, maxIterations?: number, completionPromise?: string|null, updatedAt?: number}=} ralphLoop
  * @property {StateEvidence[]=} stateEvidence
  */
 
@@ -228,6 +230,8 @@ const SESSION_SNAPSHOT_SCHEMA = Object.freeze({
     terminalKind: FIELD_TYPES.STRING,
     terminalReason: FIELD_TYPES.STRING,
     deferredCompletion: FIELD_TYPES.OBJECT,
+    isRalphLoopIteration: FIELD_TYPES.BOOLEAN,
+    ralphLoop: FIELD_TYPES.OBJECT,
     lifecycle: FIELD_TYPES.OBJECT,
     lastEvent: FIELD_TYPES.OBJECT,
     stateEvidence: FIELD_TYPES.ARRAY,

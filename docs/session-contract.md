@@ -42,6 +42,7 @@ Every session snapshot should include:
 | `pid` | Tracked foreground or agent process id |
 | `pendingToolUse` | Current tool activity |
 | `pendingInteraction` | Approval/question/plan wait detail |
+| `isRalphLoopIteration` / `ralphLoop` | Claude Ralph-loop turn marker and iteration metadata |
 | `stateEvidence` | Recent reducer evidence stream |
 
 Views should tolerate missing optional fields. Hooks should not write view-only

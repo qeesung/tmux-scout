@@ -17,9 +17,15 @@ const PR_METADATA_HEADER =
   /^\s*You\s+are\s+a\s+helpful\s+assistant\.\s*Generate\s+a\s+pull\s+request\s+title\s+and\s+body\b/i
 const SUMMARY_GENERATOR_HEADER =
   /^\s*You\s+are\s+writing\s+a\s+short\s+summary\s+of\s+a\s+final\s+assistant\s+message\b/i
+const COMMIT_MESSAGE_GENERATOR_HEADER =
+  /^\s*Using\s+the\s+current\s+thread\s+context\s+and\s+the\s+diff\s+below,\s*generate\s+a\s+single-line\s+git\s+commit\s+message\b/i
+const COMMIT_PULL_REQUEST_MESSAGE_GENERATOR_HEADER =
+  /^\s*Using\s+the\s+current\s+thread\s+context\s+and\s+the\s+commit\s+and\s+pull\s+request\s+contexts\s+below,\s*generate\s+one\s+git\s+commit\s+message\s+plus\s+one\s+pull\s+request\s+title\s+and\s+body\b/i
 const MEMORY_WRITING_AGENT_HEADER = /^\s*##\s+Memory\s+Writing\s+Agent\s*:/i
 const GUARDIAN_REVIEWER_HEADER =
   /^\s*You\s+are\s+judging\s+one\s+planned\s+coding-agent\s+action\b/i
+const AGENT_BOX_RUNTIME_HEADER = /##\s*GDPA\s+Agent\s+Box\s+Runtime\b/i
+const AGENT_JOB_PREFIX = 'agent_job:'
 
 function stripCodexIdeContextWrapper(raw) {
   if (!raw) return ''
@@ -53,8 +59,11 @@ function internalPromptReason(prompt) {
   if (AMBIENT_SUGGESTIONS_REVIEWER_HEADER.test(clean)) return 'codex-ambient-suggestions-reviewer'
   if (PR_METADATA_HEADER.test(clean)) return 'codex-pr-metadata'
   if (SUMMARY_GENERATOR_HEADER.test(clean)) return 'codex-summary-generator'
+  if (COMMIT_MESSAGE_GENERATOR_HEADER.test(clean)) return 'codex-commit-message'
+  if (COMMIT_PULL_REQUEST_MESSAGE_GENERATOR_HEADER.test(clean)) return 'codex-commit-pr-message'
   if (MEMORY_WRITING_AGENT_HEADER.test(clean)) return 'codex-memory-writing'
   if (GUARDIAN_REVIEWER_HEADER.test(clean)) return 'codex-guardian-reviewer'
+  if (AGENT_BOX_RUNTIME_HEADER.test(clean)) return 'codex-agent-box-runtime'
 
   return null
 }
@@ -77,6 +86,9 @@ function internalSourceReason(meta) {
   if (src.subagent === 'memory_consolidation') return 'codex-memory-consolidation'
   const sub = subagentObject(meta)
   if (sub && sub.other === 'guardian') return 'codex-guardian-reviewer'
+  if (sub && typeof sub.other === 'string' && sub.other.startsWith(AGENT_JOB_PREFIX)) {
+    return 'codex-agent-job'
+  }
   return null
 }
 
@@ -87,7 +99,7 @@ function subagentInfo(meta) {
     ? sub.thread_spawn
     : null
   const src = sourceObject(meta)
-  const parentSessionId = meta.forked_from_id || (threadSpawn && threadSpawn.parent_thread_id)
+  const parentSessionId = threadSpawn && threadSpawn.parent_thread_id
   // Standalone Codex review sessions use source.subagent = "review"
   // without a parent thread; those should remain visible.
   if (!parentSessionId) return null

@@ -1276,7 +1276,8 @@ test('sync discovers tmux agent panes without an existing hook snapshot', () => 
     paneDead: false,
     sessionName: 'work',
     windowIndex: 3,
-    windowName: 'agent'
+    windowName: 'agent',
+    currentPath: '/Users/me/repos/demo-project'
   }]])
   panes.tmuxAvailable = true
 
@@ -1302,6 +1303,7 @@ test('sync discovers tmux agent panes without an existing hook snapshot', () => 
   assert.ok(session, 'discovered session should be registered')
   assert.strictEqual(session.agentType, 'claude')
   assert.strictEqual(session.tmuxPane, '%77')
+  assert.strictEqual(session.workingDirectory, '/Users/me/repos/demo-project')
   assert.strictEqual(session.pid, agentPid)
   assert.strictEqual(session.phase, SESSION_PHASES.IDLE)
   assert.strictEqual(session.status, 'idle')

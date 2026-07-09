@@ -18,6 +18,7 @@ const hookContext = createHookContext({
     endedAt: null,
     threadId: data.thread_id || data.session_id || data['thread-id'],
     stateSource: data.hook_event_name ? 'codex-hooks' : 'notify',
+    _codexHookManaged: data.hook_event_name ? true : undefined,
     ...codexSessionMetaFields(data)
   })
 })
@@ -369,6 +370,47 @@ function readApprovalPolicy(transcriptPath, maxBytes = 1024 * 1024) {
   return undefined
 }
 
+function readLastUserPrompt(transcriptPath, maxBytes = 2 * 1024 * 1024) {
+  if (!transcriptPath) return undefined
+  let fd = null
+  try {
+    const stat = fs.statSync(transcriptPath)
+    const start = Math.max(0, stat.size - maxBytes)
+    const length = stat.size - start
+    if (length <= 0) return undefined
+    fd = fs.openSync(transcriptPath, 'r')
+    const buffer = Buffer.allocUnsafe(length)
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start)
+    let text = buffer.toString('utf-8', 0, bytesRead)
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n')
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : ''
+    }
+    const lines = text.split('\n')
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const line = lines[index]
+      if (!line || !line.trim()) continue
+      try {
+        const obj = JSON.parse(line)
+        if (obj &&
+          obj.type === 'event_msg' &&
+          obj.payload &&
+          obj.payload.type === 'user_message' &&
+          typeof obj.payload.message === 'string') {
+          return cleanPrompt(obj.payload.message)
+        }
+      } catch (_) {}
+    }
+  } catch (_) {
+    return undefined
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd) } catch (_) {}
+    }
+  }
+  return undefined
+}
+
 function codexSourceLabel(source) {
   if (!source) return undefined
   if (typeof source === 'string') return source
@@ -451,6 +493,48 @@ function markHiddenSession(sessionId, base, classification, now, details) {
       updatedAt: now
     })
   }
+}
+
+function isCodexUserConfirmed(session) {
+  return Boolean(session && (session._codexUserConfirmed === true || cleanPrompt(session.lastUserPrompt || '')))
+}
+
+function markSilentCodexSession(sessionId, base, now, details) {
+  markHiddenSession(sessionId, base, {
+    hidden: true,
+    isInternal: true,
+    isSubagent: false,
+    reason: 'codex-unconfirmed-session'
+  }, now, details || 'codex-unconfirmed-session')
+}
+
+function backfillPromptFromTranscriptIfNeeded(sessionId, data, base, now) {
+  const existing = readSession(sessionId)
+  if (isCodexUserConfirmed(existing)) return true
+
+  const transcriptPath = data.transcript_path
+  if (!transcriptPath) return true
+
+  const prompt = readLastUserPrompt(transcriptPath)
+  if (!prompt) return true
+
+  const classification = classifyCodexSession({ prompt, sessionMeta: data._session_meta || readTranscriptSessionMeta(transcriptPath) })
+  if (classification.hidden) {
+    markHiddenSession(sessionId, base, classification, now, data.hook_event_name)
+    return false
+  }
+
+  const title = titleFromPrompt(prompt)
+  updateSession(sessionId, Object.assign({}, base, {
+    status: existing && existing.status ? existing.status : 'idle',
+    sessionTitle: existing && existing.sessionTitle ? existing.sessionTitle : title,
+    lastUserPrompt: prompt,
+    _codexUserConfirmed: true,
+    lastEvent: existing && existing.lastEvent
+      ? existing.lastEvent
+      : { type: AGENT_EVENTS.SESSION_START, timestamp: now - 1, details: 'backfilled from transcript' }
+  }))
+  return true
 }
 
 function normalizeSubagents(value) {
@@ -579,6 +663,10 @@ function handleModernHook(data) {
     return
   }
 
+  if (eventName !== 'SessionStart' && eventName !== 'UserPromptSubmit') {
+    if (!backfillPromptFromTranscriptIfNeeded(sessionId, data, base, now)) return
+  }
+
   switch (eventName) {
     case 'SessionStart': {
       updateSession(sessionId, Object.assign({}, base, {
@@ -603,6 +691,7 @@ function handleModernHook(data) {
         _codexNativeApprovedRequestIds: null,
         pendingToolUse: null,
         activeTool: null,
+        _codexUserConfirmed: true,
         sessionTitle: title,
         lastUserPrompt: cleanPrompt(data.prompt || data.prompt_preview || ''),
         lastTurnId: data.turn_id,
@@ -689,6 +778,10 @@ function handleModernHook(data) {
         : ''
       const wantsAnswer = codexStopWantsAnswer(data, lastAssistantMessage)
       const existing = readSession(sessionId)
+      if (!isCodexUserConfirmed(existing)) {
+        markSilentCodexSession(sessionId, base, now, 'Stop without confirmed user prompt')
+        break
+      }
       if (!wantsAnswer && !(existing && existing.pendingInteraction)) {
         resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
       }
@@ -728,7 +821,12 @@ function handleLegacyNotify(data) {
 
   const sessionId = threadId || 'unknown'
   const now = Date.now()
+  const existing = readSession(sessionId)
+  if (existing && (existing._codexHookManaged === true || existing.stateSource === 'codex-hooks')) {
+    return
+  }
   const prompt = extractSessionPrompt(inputMessages)
+  if (!prompt && !existing) return
   let title = titleFromPrompt(prompt)
   const classification = classifyCodexSession({ prompt: prompt || '' })
   if (classification.hidden) {

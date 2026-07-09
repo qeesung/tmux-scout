@@ -1091,6 +1091,10 @@ function sweepIdleRunningSessions(status, stats, options = {}) {
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (!session || session.endedAt) continue
     if (isHiddenCodexSession(session)) continue
+    // Flux treats Codex completion as hook truth. A silent Codex transcript can
+    // mean the model is still thinking or a hook was missed; do not synthesize
+    // DONE from idle time for Codex, because completed is sticky in the picker.
+    if (session.agentType === 'codex') continue
     if (currentPhase(session) !== 'running') continue
     if (session.activeTool || session.pendingToolUse || session.pendingInteraction || activeSubagentCount(session) > 0) continue
 

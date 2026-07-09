@@ -3839,6 +3839,57 @@ test('sync completes idle running sessions past the threshold (missed-stop safet
   }
 })
 
+test('sync does not idle-complete Codex running sessions as done', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    const now = Date.now()
+    const staleTranscript = path.join(dir, 'codex-stale.jsonl')
+    fs.writeFileSync(staleTranscript, JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'keep working' }
+    }) + '\n')
+    const staleTime = new Date(now - 300000)
+    fs.utimesSync(staleTranscript, staleTime, staleTime)
+
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        idleCodex: {
+          sessionId: 'idleCodex',
+          agentType: 'codex',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          transcriptPath: staleTranscript,
+          activeTool: null,
+          pendingToolUse: null,
+          pendingInteraction: null
+        }
+      }
+    }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      idleCompleteMs: 60000,
+      registryPrune: false
+    })
+
+    assert.strictEqual(currentPhase(result.status.sessions.idleCodex), 'running')
+    const persisted = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(currentPhase(persisted.sessions.idleCodex), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('notification intent classifier maps agent notifications to wait/idle intents', () => {
   const { classifyNotification } = require('../scripts/lib/notification-intent')
   assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).intent, 'permission')
@@ -4143,7 +4194,7 @@ test('render prefers active sessions over newer completed sessions in the same p
   assert.deepStrictEqual(active.map(session => session.sessionId), ['review'])
 })
 
-test('render prefers newer foreground busy session over stale wait in the same pane', () => {
+test('render prefers wait over newer foreground busy session in the same pane', () => {
   const now = Date.now()
   const pane = {
     paneId: '%1',
@@ -4178,7 +4229,7 @@ test('render prefers newer foreground busy session over stale wait in the same p
     }
   }, new Map([['%1', pane]]))
 
-  assert.deepStrictEqual(active.map(session => session.sessionId), ['busy'])
+  assert.deepStrictEqual(active.map(session => session.sessionId), ['staleWait'])
 })
 
 test('codex full sync does not refresh unchanged same-phase transcript state', () => {
@@ -5595,6 +5646,132 @@ test('codex hook resolves deferred Stop after request_user_input answer', () => 
     assert.strictEqual(session.pendingInteraction, null)
     assert.strictEqual(session.lastEvent.type, 'stop')
     assert.strictEqual(session.lastEvent.resolvedBy, 'question_answered')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook backfills user prompt from transcript before tool activity', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-backfill-prompt'
+    const transcriptPath = path.join(dir, 'codex-backfill.jsonl')
+    fs.writeFileSync(transcriptPath, [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: sessionId, source: { cli: 'codex' } }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'late prompt from transcript' }
+      })
+    ].join('\n') + '\n')
+
+    const base = {
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath,
+      turn_id: 'turn-backfill'
+    }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session._codexUserConfirmed, true)
+    assert.strictEqual(session.lastUserPrompt, 'late prompt from transcript')
+    assert.strictEqual(session.sessionTitle, 'late prompt from transcript')
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'done'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.lastEvent.type, 'stop')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex hook hides Stop without confirmed user prompt instead of showing done', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-unconfirmed-stop'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'generated title'
+    }), dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(session.isHiddenFromScout, true)
+    assert.strictEqual(session.hiddenReason, 'codex-unconfirmed-session')
+    assert.deepStrictEqual(getActiveSessions(status, new Map()), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex legacy notify does not overwrite hook-managed busy session as done', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-notify-busy-guard'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo', turn_id: 'turn-busy' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run tests'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runHook('scripts/hooks/codex.js', {
+      type: 'agent-turn-complete',
+      'thread-id': sessionId,
+      'turn-id': 'turn-busy',
+      cwd: '/tmp/demo',
+      'input-messages': [{ role: 'user', content: 'run tests' }],
+      'last-assistant-message': 'done'
+    }, dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.lastEvent.type, 'tool_use')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex legacy notify without user prompt does not create visible done session', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-notify-no-prompt'
+    runHook('scripts/hooks/codex.js', {
+      type: 'agent-turn-complete',
+      'thread-id': sessionId,
+      'turn-id': 'turn-no-prompt',
+      cwd: '/tmp/demo',
+      'last-assistant-message': '{"suggestions":[{"title":"internal"}]}'
+    }, dir)
+
+    const statusPath = path.join(dir, '.tmux-scout', 'status.json')
+    if (!fs.existsSync(statusPath)) return
+    const status = readScoutStatus(dir)
+    assert.ok(!status.sessions[sessionId])
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

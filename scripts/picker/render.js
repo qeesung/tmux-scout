@@ -164,11 +164,12 @@ function getActiveSessions(status, panes) {
   function paneActivityRank(session) {
     const phase = phaseForSession(session)
     if (session && session.isRalphLoopIteration) return 0
-    if (isNeedsAttention(session, now) || phase === 'running') return 0
-    if (phase === 'completed' || phase === 'idle') return 1
-    if (phase === 'interrupted') return 2
-    if (phase === 'crashed' || phase === 'stale') return 3
-    return 4
+    if (isNeedsAttention(session, now)) return 0
+    if (phase === 'running') return 1
+    if (phase === 'completed' || phase === 'idle') return 2
+    if (phase === 'interrupted') return 3
+    if (phase === 'crashed' || phase === 'stale') return 4
+    return 5
   }
 
   function foregroundTimestamp(session) {

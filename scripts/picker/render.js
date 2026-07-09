@@ -10,7 +10,7 @@ const { agentDisplay } = require('../lib/agents')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { isVisibleInPicker } = require('../lib/session-contract')
 const { lastTouchedAt } = require('../lib/session-registry')
-const { readAccessRanks } = require('../lib/access-history')
+const { readAccessTimes } = require('../lib/access-history')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
@@ -110,23 +110,22 @@ function isNeedsAttention(session, now) {
   return Boolean(session && (session.needsAttention || session.pendingInteraction || isWaitingPhase(phaseForSession(session))))
 }
 
-// Access-order (MRU): rank a session by its pane's position in the access
-// history. Sessions never jumped-to via the picker get Infinity and fall back
-// to activity recency.
-function accessRank(session, ranks) {
-  if (!ranks || !session || !session.tmuxPane) return Infinity
-  const rank = ranks.get(session.tmuxPane)
-  return Number.isInteger(rank) ? rank : Infinity
+// Access-order (MRU) on a unified recency timeline: a session's sort key is the
+// timestamp of its most recent picker jump. Sessions never jumped-to fall back to
+// their activity time (lastTouchedAt), so a freshly-created or newly-active
+// session floats to the top instead of sinking below stale prior visits.
+function orderTime(session, times) {
+  const visited = times && session && session.tmuxPane ? times.get(session.tmuxPane) : undefined
+  return Number.isFinite(visited) ? visited : lastTouchedAt(session)
 }
 
 function compareSessions(left, right, ctx = {}) {
-  const ranks = ctx.accessRanks
-  const leftRank = accessRank(left, ranks)
-  const rightRank = accessRank(right, ranks)
-  // Avoid Infinity - Infinity (NaN) when both sessions are unvisited.
-  if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1
-
-  return lastTouchedAt(right) - lastTouchedAt(left)
+  const times = ctx.accessTimes
+  const leftTime = orderTime(left, times)
+  const rightTime = orderTime(right, times)
+  if (leftTime !== rightTime) return rightTime - leftTime // newest interaction first
+  // Stable, deterministic tiebreak when interaction times coincide.
+  return String(left.sessionId || '').localeCompare(String(right.sessionId || ''))
 }
 
 function isTerminalSession(session) {
@@ -370,8 +369,8 @@ function run(file, pane, cached) {
   for (const session of active) {
     session._tmuxPaneSnapshot = session.tmuxPane ? panes.get(session.tmuxPane) : null
   }
-  const accessRanks = readAccessRanks()
-  active.sort((left, right) => compareSessions(left, right, { accessRanks }))
+  const accessTimes = readAccessTimes()
+  active.sort((left, right) => compareSessions(left, right, { accessTimes }))
 
   const hStatus = 'STATUS'.padEnd(STATUS_WIDTH)
   const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)

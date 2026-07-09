@@ -2,8 +2,9 @@
 // Access-order (MRU) history for the picker.
 //
 // Records the tmux pane the user jumped to via the picker, most-recent-first.
-// The picker sorts sessions by their pane's position in this list, so the
-// session you visited most recently floats to the top.
+// The picker orders sessions by their most-recent-visit timestamp (falling back
+// to activity time for panes never visited), so the ones you touched most
+// recently — and freshly active sessions you've never visited — float to the top.
 
 const fs = require('fs')
 const os = require('os')
@@ -49,24 +50,27 @@ function recordAccess(paneId, options = {}) {
   writeAtomic(file, { version: 1, entries: entries.slice(0, max) })
 }
 
-// Build a paneId -> rank map (0 = most recently accessed). Dedup keeps first occurrence.
-function readAccessRanks(options = {}) {
+// Build a paneId -> last-visit-timestamp map. Dedup keeps the first occurrence,
+// which is the most recent visit since entries are stored newest-first.
+function readAccessTimes(options = {}) {
   const file = options.file || historyFile()
   const data = readHistory(file)
-  const ranks = new Map()
+  const times = new Map()
   for (const entry of data.entries || []) {
-    if (entry && entry.pane && !ranks.has(entry.pane)) {
-      ranks.set(entry.pane, ranks.size)
+    if (entry && entry.pane && !times.has(entry.pane)) {
+      times.set(entry.pane, Number.isFinite(entry.ts) ? entry.ts : 0)
     }
   }
-  return ranks
+  return times
 }
 
-module.exports = { recordAccess, readAccessRanks, readHistory, historyFile, DEFAULT_MAX_ENTRIES }
+module.exports = { recordAccess, readAccessTimes, readHistory, historyFile, DEFAULT_MAX_ENTRIES }
 
 if (require.main === module) {
   const [command, arg] = process.argv.slice(2)
-  if (command === 'record' && arg) {
+  // Only accept tmux pane ids (%N); guards against a literal, unexpanded
+  // "#{pane_id}" or other junk reaching the history from the focus hook.
+  if (command === 'record' && arg && /^%\d+$/.test(arg)) {
     try { recordAccess(arg) } catch (_) {}
   }
 }

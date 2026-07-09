@@ -11,7 +11,7 @@ const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, s
 const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
 const { compareSessions, formatLine, getActiveSessions } = require('../scripts/picker/render')
-const { recordAccess, readAccessRanks } = require('../scripts/lib/access-history')
+const { recordAccess, readAccessTimes } = require('../scripts/lib/access-history')
 const { AGENTS, agentDisplay, scoreAgentProcess } = require('../scripts/lib/agents')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../scripts/lib/hook-command')
 const { createHookContext, defaultPaths } = require('../scripts/lib/hook-adapter')
@@ -1949,20 +1949,21 @@ test('picker rows omit duplicated generic wait details', () => {
   assert.ok(!line.includes('waiting for answer: waiting for answer'), line)
 })
 
-test('picker ordering sorts by access rank, ignoring status', () => {
+test('picker ordering: unvisited-but-recent session floats above stale prior visits', () => {
   const now = Date.now()
   const sessions = [
     {
-      sessionId: 'wait-unvisited',
+      // Never jumped-to via the picker, but just became active (freshly created / BUSY).
+      sessionId: 'fresh-unvisited',
       agentType: 'codex',
       status: 'working',
-      phase: 'waitingForApproval',
-      needsAttention: 'waiting for approval',
+      phase: 'running',
       tmuxPane: '%3',
       lastUpdated: now
     },
     {
-      sessionId: 'busy-visited-first',
+      // Visited long ago; its more-recent activity must NOT bump its order.
+      sessionId: 'visited-older',
       agentType: 'codex',
       status: 'working',
       phase: 'running',
@@ -1970,7 +1971,7 @@ test('picker ordering sorts by access rank, ignoring status', () => {
       lastUpdated: now - 10000
     },
     {
-      sessionId: 'idle-visited-recent',
+      sessionId: 'visited-recent',
       agentType: 'codex',
       status: 'completed',
       phase: 'idle',
@@ -1979,13 +1980,13 @@ test('picker ordering sorts by access rank, ignoring status', () => {
     }
   ]
 
-  // %2 was jumped-to most recently (rank 0), then %1 (rank 1). %3 was never visited.
-  const accessRanks = new Map([['%2', 0], ['%1', 1]])
-  sessions.sort((left, right) => compareSessions(left, right, { accessRanks }))
+  // %2 was jumped-to 5s ago, %1 30s ago; %3 was never visited.
+  const accessTimes = new Map([['%2', now - 5000], ['%1', now - 30000]])
+  sessions.sort((left, right) => compareSessions(left, right, { accessTimes }))
   assert.deepStrictEqual(sessions.map(session => session.sessionId), [
-    'idle-visited-recent',
-    'busy-visited-first',
-    'wait-unvisited'
+    'fresh-unvisited', // unvisited, lastTouchedAt=now -> newest interaction -> top
+    'visited-recent',  // visited 5s ago (activity time ignored for visited sessions)
+    'visited-older'    // visited 30s ago
   ])
 })
 
@@ -1996,7 +1997,7 @@ test('picker ordering falls back to activity recency when no access history', ()
     { sessionId: 'newer', agentType: 'codex', status: 'completed', phase: 'idle', tmuxPane: '%2', lastUpdated: now }
   ]
 
-  sessions.sort((left, right) => compareSessions(left, right, { accessRanks: new Map() }))
+  sessions.sort((left, right) => compareSessions(left, right, { accessTimes: new Map() }))
   assert.deepStrictEqual(sessions.map(session => session.sessionId), ['newer', 'older'])
 })
 
@@ -2006,33 +2007,91 @@ test('access history records most-recent-first, dedupes, and caps length', () =>
   try {
     recordAccess('%1', { file, now: 1000 })
     recordAccess('%2', { file, now: 2000 })
-    recordAccess('%1', { file, now: 3000 }) // revisit %1 -> moves to front, no duplicate
+    recordAccess('%1', { file, now: 3000 }) // revisit %1 -> moves to front, ts updated
 
-    const ranks = readAccessRanks({ file })
-    assert.strictEqual(ranks.get('%1'), 0)
-    assert.strictEqual(ranks.get('%2'), 1)
-    assert.strictEqual(ranks.size, 2)
+    const times = readAccessTimes({ file })
+    assert.strictEqual(times.get('%1'), 3000)
+    assert.strictEqual(times.get('%2'), 2000)
+    assert.strictEqual(times.size, 2)
 
     // Cap is honored: only the most recent `max` entries survive.
     recordAccess('%3', { file, now: 4000, max: 2 })
-    const capped = readAccessRanks({ file })
+    const capped = readAccessTimes({ file })
     assert.strictEqual(capped.size, 2)
-    assert.strictEqual(capped.get('%3'), 0)
-    assert.strictEqual(capped.get('%1'), 1)
+    assert.strictEqual(capped.get('%3'), 4000)
+    assert.strictEqual(capped.get('%1'), 3000)
     assert.ok(!capped.has('%2'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('access history returns empty ranks when file is missing or corrupt', () => {
+test('access history returns empty times when file is missing or corrupt', () => {
   const dir = tempDir()
   const missing = path.join(dir, 'nope.json')
   const corrupt = path.join(dir, 'corrupt.json')
   try {
-    assert.strictEqual(readAccessRanks({ file: missing }).size, 0)
+    assert.strictEqual(readAccessTimes({ file: missing }).size, 0)
     fs.writeFileSync(corrupt, 'not json{')
-    assert.strictEqual(readAccessRanks({ file: corrupt }).size, 0)
+    assert.strictEqual(readAccessTimes({ file: corrupt }).size, 0)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// This is the exact path the pane-focus-in hook invokes: `access-history.js
+// record %N`. record-focus.sh only restores PATH and forwards to it.
+test('access history record CLI writes the focused pane to history (hook path)', () => {
+  const home = tempDir()
+  const file = path.join(home, '.tmux-scout', 'access-history.json')
+  try {
+    runScript('scripts/lib/access-history.js', ['record', '%5'], home)
+    let data = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    assert.strictEqual(data.entries[0].pane, '%5')
+
+    runScript('scripts/lib/access-history.js', ['record', '%6'], home)
+    data = JSON.parse(fs.readFileSync(file, 'utf-8'))
+    assert.strictEqual(data.entries[0].pane, '%6')
+    assert.strictEqual(data.entries[1].pane, '%5')
+    assert.strictEqual(data.entries.length, 2)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('access history record CLI rejects empty or non-pane arguments', () => {
+  const home = tempDir()
+  const file = path.join(home, '.tmux-scout', 'access-history.json')
+  try {
+    runScript('scripts/lib/access-history.js', ['record', ''], home)
+    runScript('scripts/lib/access-history.js', ['record', 'garbage'], home)
+    runScript('scripts/lib/access-history.js', ['record', '#{pane_id}'], home)
+    assert.strictEqual(fs.existsSync(file), false)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('picker ordering reflects focus recency, with unfocused-active still bubbling up', () => {
+  const dir = tempDir()
+  const file = path.join(dir, 'access-history.json')
+  try {
+    recordAccess('%1', { file, now: 1000 })
+    recordAccess('%2', { file, now: 2000 }) // %2 focused later than %1
+    const times = readAccessTimes({ file })
+    const now = Date.now()
+    const sessions = [
+      { sessionId: 'older-focus', agentType: 'codex', phase: 'idle', tmuxPane: '%1', lastUpdated: now },
+      { sessionId: 'newer-focus', agentType: 'codex', phase: 'idle', tmuxPane: '%2', lastUpdated: now },
+      // Never focused (no history entry) but freshly active → fallback lastTouchedAt.
+      { sessionId: 'unfocused-active', agentType: 'codex', phase: 'running', tmuxPane: '%3', lastUpdated: now + 5000 }
+    ]
+    sessions.sort((left, right) => compareSessions(left, right, { accessTimes: times }))
+    assert.deepStrictEqual(sessions.map(session => session.sessionId), [
+      'unfocused-active', // lastTouchedAt newest -> top
+      'newer-focus',      // focused at 2000
+      'older-focus'       // focused at 1000
+    ])
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

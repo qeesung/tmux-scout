@@ -43,4 +43,20 @@ case "$watchdog" in
     ;;
 esac
 
+# Pane access tracking: record every pane the user focuses (mouse, prefix keys,
+# picker, window/session switches) so the picker's MRU sort reflects real
+# recency, not just picker jumps. The indexed hook [9909] overwrites the same
+# slot on every config reload (idempotent) and coexists with a user's own
+# pane-focus-in hook. Disable with @scout-track-focus off.
+track_focus=$(tmux show-option -gqv "@scout-track-focus")
+case "$track_focus" in
+  off|0|false|no|disabled)
+    tmux set-hook -gu 'pane-focus-in[9909]' 2>/dev/null || true
+    ;;
+  *)
+    tmux set-hook -g 'pane-focus-in[9909]' \
+      "run-shell -b \"'$CURRENT_DIR/scripts/lib/record-focus.sh' '#{pane_id}'\""
+    ;;
+esac
+
 # Status bar widget — users add #($SCOUT_DIR/scripts/status-widget.sh) to their status-right config

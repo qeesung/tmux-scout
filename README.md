@@ -124,10 +124,10 @@ Each line shows:
 - Session title (first prompt)
 - Current tool details (for working sessions)
 
-Sessions are ordered by access recency: the session you most recently jumped to
-(via the picker) floats to the top, then the next, and so on. Sessions you
-haven't visited yet fall below, ordered by most recent activity. The status tags
-above still render on every row.
+Sessions are ordered by access recency: the session you most recently switched
+to — via the picker, prefix keys, mouse, or window/session switches — floats to
+the top, then the next, and so on. Sessions you haven't visited yet fall below,
+ordered by most recent activity. The status tags above still render on every row.
 
 ### Supported Agents and Colors
 
@@ -249,6 +249,16 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 
 `watcher status` includes the bridge state, latest tick mode, duration, reconcile change count, Codex JSONL files read, parsed event count, and JSONL parse errors when present.
 
+### Pane access tracking
+
+The picker orders sessions by how recently you looked at them. By default tmux-scout records every pane you focus — via the picker, prefix keys, mouse, or window/session switches — using a `pane-focus-in` hook, so the ordering reflects real recency rather than only picker jumps. To disable:
+
+```bash
+set -g @scout-track-focus off
+```
+
+The hook is installed at a fixed slot (`pane-focus-in[9909]`), so it stays idempotent across config reloads and coexists with your own `pane-focus-in` hook. History is stored (capped) in `~/.tmux-scout/access-history.json`.
+
 ## Data Storage
 
 Session data is stored in `~/.tmux-scout/`:
@@ -264,7 +274,8 @@ Session data is stored in `~/.tmux-scout/`:
 ├── watcher.log                      # Watchdog diagnostics
 ├── run/bridge.sock                  # Watchdog single-writer Unix socket
 ├── codex-hooks-manifest.json        # Codex event hook trust keys owned by tmux-scout
-└── codex-original-notify.json       # Backup of original Codex notify command
+├── codex-original-notify.json       # Backup of original Codex notify command
+└── access-history.json              # Pane access history for the picker MRU sort
 ```
 
 tmux-scout keeps live and recently visible sessions in the registry. Hidden

@@ -124,7 +124,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 - 会话标题（首条提示）
 - 当前工具详情（工作中的会话）
 
-会话按访问顺序排列：最近一次（通过 picker）跳转过去的会话置顶，其次是次近的，依此类推；
+会话按访问顺序排列：最近一次切换过去的会话置顶（无论是通过 picker、prefix 快捷键、鼠标，还是 window/session 切换），其次是次近的，依此类推；
 尚未访问过的会话排在下方，按最近活跃时间排序。每行上方的状态标签仍会照常显示。
 
 ### 支持的 Agent 和颜色
@@ -247,6 +247,16 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 
 `watcher status` 会包含 bridge 状态、最近一次 tick 的模式、耗时、reconcile 变更数、读取的 Codex JSONL 文件数、解析事件数，以及出现时的 JSONL 解析错误数。
 
+### 面板访问追踪
+
+picker 按你最近查看会话的时间排序。默认情况下 tmux-scout 会用 `pane-focus-in` hook 记录你聚焦的每个 pane——无论是通过 picker、prefix 快捷键、鼠标，还是 window/session 切换——因此排序反映真实的访问时间，而不只是 picker 跳转。关闭：
+
+```bash
+set -g @scout-track-focus off
+```
+
+hook 安装在固定槽位（`pane-focus-in[9909]`），因此在 config 重载时保持幂等，并能与你自己的 `pane-focus-in` hook 共存。访问历史（有上限）存储在 `~/.tmux-scout/access-history.json`。
+
 ## 数据存储
 
 会话数据存储在 `~/.tmux-scout/` 目录下：
@@ -262,7 +272,8 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 ├── watcher.log                      # watchdog 诊断日志
 ├── run/bridge.sock                  # watchdog single-writer Unix socket
 ├── codex-hooks-manifest.json        # tmux-scout 管理的 Codex event hook trust key
-└── codex-original-notify.json       # 备份的原始 Codex notify 命令
+├── codex-original-notify.json       # 备份的原始 Codex notify 命令
+└── access-history.json              # picker MRU 排序用的 pane 访问历史
 ```
 
 tmux-scout 会保留当前仍可见或近期可见的会话。隐藏的内部会话以及终端态的 `STALE` / `CRASH` 行会在短暂展示窗口后移除；带有明确 `endedAt` 的快照最多保留 24 小时后清理。

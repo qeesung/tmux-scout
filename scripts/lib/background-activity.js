@@ -62,12 +62,14 @@ const BACKGROUND_RE = /\bbackground\b|后台/i
 const RUNNING_RE = /\b(?:running|working|in\s+progress)\b|(?:仍在|正在|运行中|执行中)/i
 const SHELL_RE = /\bbackground\s+shells?\b|\bshells?\s+(?:still\s+)?running\s+in\s+background\b|后台\s*shell/i
 const ARTIFACT_POLL_RE = /\bartifact\s+poll\b/i
+const EXTRACTION_POLL_RE = /\bextraction\b[\s\S]{0,80}\bbackground\b|\bpoll\s+completes?\b|\bartifacts?\s+to\s+be\s+written\b/i
 
 function isBackgroundShellRunningText(value) {
   const text = typeof value === 'string' ? value : backgroundActivityText(value)
   if (!text) return false
   if (SHELL_RE.test(text) && RUNNING_RE.test(text)) return true
   if (ARTIFACT_POLL_RE.test(text) && BACKGROUND_RE.test(text) && RUNNING_RE.test(text)) return true
+  if (EXTRACTION_POLL_RE.test(text) && BACKGROUND_RE.test(text) && RUNNING_RE.test(text)) return true
   if (/\bstill\s+running\s+in\s+background\b/i.test(text)) return true
   return false
 }

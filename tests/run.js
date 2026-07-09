@@ -51,6 +51,7 @@ const { HOOK_EVENTS: TRAEX_HOOK_EVENTS } = require('../scripts/setup/traex')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
 const claudeHook = require('../scripts/hooks/claude')
 const codexHook = require('../scripts/hooks/codex')
+const { backgroundShellDetails, isBackgroundShellRunningText } = require('../scripts/lib/background-activity')
 
 const tests = []
 
@@ -2775,12 +2776,20 @@ test('generic hook defers Stop while waiting for permission until resolver arriv
   }
 })
 
+test('background activity classifier recognizes extraction poll copy', () => {
+  const message = 'Extraction is running in the background. I\'ll be notified when the poll completes (either DONE or TIMEOUT, up to 30 minutes). Waiting for the artifacts to be written by cx.'
+  assert.strictEqual(isBackgroundShellRunningText(message), true)
+  assert.ok(backgroundShellDetails({ message }).includes('Extraction is running in the background'))
+  assert.strictEqual(isBackgroundShellRunningText('Agent finished and is waiting for your input'), false)
+})
+
 test('generic hook keeps Traex background shell notification busy', () => {
   const dir = tempDir()
   try {
     const sessionId = 'traex-background-shell'
     const base = { session_id: sessionId, cwd: '/tmp/demo' }
     const backgroundMessage = 'Artifact poll is running in background (ID: 20899). cx is working on the extraction. This typically takes 5-15 minutes.'
+    const extractionPollMessage = 'Extraction is running in the background. I\'ll be notified when the poll completes (either DONE or TIMEOUT, up to 30 minutes). Waiting for the artifacts to be written by cx.'
 
     runGenericHook('traex', Object.assign({}, base, {
       hook_event_name: 'UserPromptSubmit',
@@ -2807,6 +2816,30 @@ test('generic hook keeps Traex background shell notification busy', () => {
     assert.strictEqual(session.pendingToolUse.tool, 'Bash')
     assert.ok(session.pendingToolUse.details.includes('Artifact poll is running in background'))
     assert.ok(session.lastAssistantMessage.includes('Artifact poll is running in background'))
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
+
+    const extractionSessionId = 'traex-extraction-poll-background'
+    const extractionBase = { session_id: extractionSessionId, cwd: '/tmp/demo' }
+    runGenericHook('traex', Object.assign({}, extractionBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'extract with cx'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, extractionBase, {
+      hook_event_name: 'Stop'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, extractionBase, {
+      hook_event_name: 'Notification',
+      notification_type: 'idle_prompt',
+      message: extractionPollMessage
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[extractionSessionId]
+    assert.strictEqual(session.agentType, 'traex')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.ok(session.pendingToolUse.details.includes('Extraction is running in the background'))
     assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
 
     runGenericHook('traex', Object.assign({}, base, {
@@ -3761,6 +3794,46 @@ test('codex setup upgrades legacy notify hook to guarded shell command', () => {
     assert.ok(config.includes('"sh"'))
     assert.ok(config.includes('test -e \\"$1\\" || exit 0; exec node \\"$1\\" \\"$2\\"'))
     assert.ok(config.includes(hookPath))
+    assert.ok(config.includes('[features]\nhooks = true'))
+    assert.ok(!config.includes('codex_hooks'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex setup migrates deprecated codex_hooks feature key', () => {
+  const dir = tempDir()
+  try {
+    const codexDir = path.join(dir, '.codex')
+    fs.mkdirSync(codexDir, { recursive: true })
+    const configPath = path.join(codexDir, 'config.toml')
+    fs.writeFileSync(configPath, [
+      'model = "default"',
+      '',
+      '[features]',
+      'codex_hooks = true',
+      'experimental = true',
+      ''
+    ].join('\n'))
+
+    runScript('scripts/setup/codex.js', ['install'], dir)
+
+    const installed = fs.readFileSync(configPath, 'utf-8')
+    assert.ok(installed.includes('model = "default"'))
+    assert.ok(installed.includes('[features]\nhooks = true\nexperimental = true'))
+    assert.ok(!installed.includes('codex_hooks'))
+
+    fs.writeFileSync(configPath, installed.replace(/^hooks = true\n/m, 'codex_hooks = true\n'))
+    const modernStatus = JSON.parse(execFileSync(process.execPath, ['-e', `
+      const codex = require(${JSON.stringify(path.join(__dirname, '..', 'scripts/setup/codex.js'))})
+      process.stdout.write(JSON.stringify(codex.status().modern))
+    `], {
+      env: Object.assign({}, process.env, { HOME: dir }),
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    }))
+    assert.strictEqual(modernStatus.featuresEnabled, false)
+    assert.strictEqual(modernStatus.installed, false)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

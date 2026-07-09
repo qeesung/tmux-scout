@@ -352,7 +352,7 @@ function findTableBody(content, header) {
 function hasHooksFeature(content) {
   const body = findTableBody(content, '[features]')
   if (!body) return false
-  return body.some(line => /^\s*(hooks|codex_hooks)\s*=\s*true\s*(?:#.*)?$/.test(line))
+  return body.some(line => /^\s*hooks\s*=\s*true\s*(?:#.*)?$/.test(line))
 }
 
 function readTrustHash(content, key) {
@@ -382,12 +382,12 @@ function upsertFeatures(content) {
 
   if (start < 0) {
     const prefix = content.trim() ? content.replace(/\s*$/, '\n\n') : ''
-    return prefix + '[features]\nhooks = true\ncodex_hooks = true\n'
+    return prefix + '[features]\nhooks = true\n'
   }
 
   const body = lines.slice(start + 1, end)
     .filter(line => !/^\s*(hooks|codex_hooks)\s*=/.test(line))
-  const replacement = ['[features]', 'hooks = true', 'codex_hooks = true', ...body]
+  const replacement = ['[features]', 'hooks = true', ...body]
   lines.splice(start, end - start, ...replacement)
   return lines.join('\n')
 }

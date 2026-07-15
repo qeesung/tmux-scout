@@ -1,5 +1,5 @@
 {
-  "name": "claude notification permission wait",
+  "name": "claude permission prose notification remains phase-neutral",
   "agent": "claude",
   "sessionId": "fixture-claude-notif-permission",
   "payloadDefaults": {
@@ -38,15 +38,13 @@
   "expect": {
     "agentType": "claude",
     "status": "working",
-    "phase": "waitingForApproval",
-    "needsAttention": "waiting for approval",
-    "pendingInteraction.type": "approval",
-    "pendingInteraction.tool": "Bash",
-    "activeTool": null
+    "phase": "running",
+    "needsAttention": null,
+    "pendingInteraction": null,
+    "activeTool": "Bash"
   },
   "expectEvidenceTypes": [
     "prompt_submit",
-    "tool_use",
-    "permission_request"
+    "tool_use"
   ]
 }

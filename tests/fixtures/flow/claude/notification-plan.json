@@ -1,5 +1,5 @@
 {
-  "name": "claude notification plan wait",
+  "name": "claude plan prose notification remains phase-neutral",
   "agent": "claude",
   "sessionId": "fixture-claude-notif-plan",
   "payloadDefaults": {
@@ -29,13 +29,12 @@
   "expect": {
     "agentType": "claude",
     "status": "working",
-    "phase": "waitingForApproval",
-    "needsAttention": "waiting for plan approval",
-    "pendingInteraction.type": "plan",
+    "phase": "running",
+    "needsAttention": null,
+    "pendingInteraction": null,
     "activeTool": null
   },
   "expectEvidenceTypes": [
-    "prompt_submit",
-    "permission_request"
+    "prompt_submit"
   ]
 }

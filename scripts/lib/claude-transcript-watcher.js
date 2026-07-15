@@ -117,13 +117,13 @@ function findLatestClaudeInterrupt(transcriptPath, sinceMs) {
 function markInterrupted(statusFile, sessionId) {
   const status = readJson(statusFile, { version: 1, lastUpdated: Date.now(), sessions: {} })
   const session = status.sessions && status.sessions[sessionId]
-  if (!session || session.agentType !== 'claude' || session.endedAt) return false
+  if (!session || session.agentType !== 'claude' || session.endedAt || session.isRemote) return false
   if (currentPhase(session) !== 'running') return false
   if (!findLatestClaudeInterrupt(session.transcriptPath, session.lastUpdated || session.startedAt)) return false
 
   const now = Date.now()
   const result = applySessionEvent(session, {
-    type: AGENT_EVENTS.INTERRUPTED,
+    type: AGENT_EVENTS.TURN_COMPLETE,
     source: 'transcript',
     timestamp: now,
     reason: 'Claude transcript recorded request interruption',
@@ -151,7 +151,7 @@ class ClaudeTranscriptWatchManager {
   reconcile(status) {
     const desired = new Map()
     for (const [sessionId, session] of Object.entries((status && status.sessions) || {})) {
-      if (!session || session.agentType !== 'claude' || session.endedAt) continue
+      if (!session || session.agentType !== 'claude' || session.endedAt || session.isRemote) continue
       if (currentPhase(session) !== 'running') continue
       if (!session.transcriptPath) continue
       desired.set(sessionId, session.transcriptPath)

@@ -53,7 +53,6 @@ function resolvePendingInteraction(sessionId, data, now, details) {
     status: 'working',
     needsAttention: null,
     pendingToolUse: null,
-    activeTool: null,
     lastTurnId: data.turn_id,
     lastEvent: {
       type: eventType,
@@ -165,14 +164,15 @@ function codexNativeApprovalUpdates(session, eventName) {
 
 function questionDetailsFromToolInput(toolInput) {
   const input = toolInput && typeof toolInput === 'object' && !Array.isArray(toolInput) ? toolInput : null
-  if (!input) return 'request_user_input'
+  if (!input) return null
   if (Array.isArray(input.questions) && input.questions.length > 0) {
     const first = input.questions.find(item => item && typeof item === 'object')
     if (first) {
       return compactText(first.question || first.header || first.id, 160) || 'request_user_input'
     }
+    return 'request_user_input'
   }
-  return compactText(input.message || input.prompt || input.description, 160) || 'request_user_input'
+  return compactText(input.message || input.prompt || input.description, 160) || null
 }
 
 function forwardToOriginalNotify(jsonArg) {
@@ -188,86 +188,52 @@ function forwardToOriginalNotify(jsonArg) {
   } catch (_) {}
 }
 
-function normalizeSignal(value) {
-  return String(value || '').trim().toLowerCase().replace(/[-\s]+/g, '_')
+// Stop becomes WAIT only for the exact structured Chinese numbered-question
+// shape accepted by the protocol; English punctuation, payload flags, and
+// generic option lists do not gain independent state semantics here.
+function parseCodexQuestions(message) {
+  if (typeof message !== 'string' || !message.includes('？')) return []
+  const items = []
+  let currentQuestion = ''
+  let currentChoices = []
+
+  function flush() {
+    if (!currentQuestion) return
+    items.push({ question: currentQuestion.trim(), choices: currentChoices })
+    currentQuestion = ''
+    currentChoices = []
+  }
+
+  for (const line of message.split('\n')) {
+    const trimmed = line.trim()
+    const numbered = trimmed.match(/^\d+[\.．、]\s*(.+)/)
+    if (numbered && trimmed.includes('？')) {
+      flush()
+      currentQuestion = numbered[1]
+      continue
+    }
+    const dashItem = trimmed.match(/^[-•－]\s*(.+)/)
+    if (!dashItem || !currentQuestion) continue
+    const text = dashItem[1].trim()
+    if (text.startsWith('例如') || text.startsWith('如：')) {
+      currentChoices.push(...text
+        .replace(/^例如[：:]?\s*/, '')
+        .replace(/^如[：:]?\s*/, '')
+        .split(/\s*[\/／、]\s*/)
+        .filter(Boolean))
+    } else if (text.endsWith('？')) {
+      flush()
+      currentQuestion = text
+    } else {
+      currentChoices.push(text)
+    }
+  }
+  flush()
+  return items
 }
 
-const TRUE_SIGNALS = new Set(['1', 'true', 'yes', 'on'])
-const INPUT_WAIT_SIGNALS = new Set([
-  'waiting_for_input',
-  'waiting_for_answer',
-  'requires_input',
-  'requires_user_input',
-  'needs_input',
-  'needs_user_input',
-  'input_required',
-  'user_input_required',
-  'input_requested',
-  'user_input_requested',
-  'awaiting_input',
-  'awaiting_user_input',
-  'awaiting_answer',
-  AGENT_EVENTS.QUESTION_ASKED
-])
-
-function isTrueSignal(value) {
-  if (value === true) return true
-  if (value === false || value === null || value === undefined) return false
-  return TRUE_SIGNALS.has(normalizeSignal(value))
-}
-
-function hasExplicitInputWaitSignal(data) {
-  const flagFields = [
-    'waiting_for_input',
-    'waiting_for_answer',
-    'requires_input',
-    'requires_user_input',
-    'needs_input',
-    'needs_user_input',
-    'input_required',
-    'user_input_required',
-    AGENT_EVENTS.QUESTION_ASKED
-  ]
-  for (const field of flagFields) {
-    if (isTrueSignal(data[field])) return true
-  }
-
-  for (const field of ['reason', 'stop_reason', 'next_action', 'status', 'prompt_type', 'input_mode']) {
-    if (INPUT_WAIT_SIGNALS.has(normalizeSignal(data[field]))) return true
-  }
-
-  return false
-}
-
-function looksLikeAssistantQuestion(message) {
-  if (typeof message !== 'string') return false
-  const text = message.trim()
-  if (!text) return false
-  const lines = text.split('\n').map(line => line.trim()).filter(Boolean)
-  const tailLines = lines.slice(-6)
-  if (tailLines.length === 0) return false
-
-  const promptQuestionRe = /(which|choose|pick|select|confirm|do you want|would you like|should i|shall i|what should i|what would you like|what do you want|请选择|请确认|是否|要我|需要.*(?:选择|输入|回答))/i
-  const optionRe = /^(?:[-*]|\d+[.)、．])\s+\S/
-
-  function isPromptQuestion(line) {
-    if (optionRe.test(line)) return false
-    return /[?？]/.test(line) && promptQuestionRe.test(line)
-  }
-
-  for (let i = 0; i < tailLines.length - 1; i++) {
-    if (!isPromptQuestion(tailLines[i])) continue
-    if (tailLines.slice(i + 1).some(line => optionRe.test(line))) return true
-  }
-
-  return false
-}
-
-function codexStopWantsAnswer(data, lastAssistantMessage) {
-  if (hasExplicitInputWaitSignal(data)) {
-    return true
-  }
-  return looksLikeAssistantQuestion(lastAssistantMessage)
+function codexStopWantsAnswer(_data, lastAssistantMessage) {
+  return parseCodexQuestions(lastAssistantMessage).length > 0
 }
 
 function isBypassPermission(data) {
@@ -370,26 +336,28 @@ function readApprovalPolicy(transcriptPath, maxBytes = 1024 * 1024) {
   return undefined
 }
 
-function readLastUserPrompt(transcriptPath, maxBytes = 2 * 1024 * 1024) {
+// Scan backwards in 64 KiB chunks until a
+// user_message is found or the file head is reached. There is deliberately no
+// total-byte cap; a late watcher must still confirm a long-running real turn.
+function readLastUserPrompt(transcriptPath) {
   if (!transcriptPath) return undefined
-  let fd = null
+  const newlineByte = 0x0a
+  const carriageReturnByte = 0x0d
+  const readChunkBytes = 64 * 1024
+  let fd = -1
   try {
     const stat = fs.statSync(transcriptPath)
-    const start = Math.max(0, stat.size - maxBytes)
-    const length = stat.size - start
-    if (length <= 0) return undefined
+    if (stat.size <= 0) return undefined
     fd = fs.openSync(transcriptPath, 'r')
-    const buffer = Buffer.allocUnsafe(length)
-    const bytesRead = fs.readSync(fd, buffer, 0, length, start)
-    let text = buffer.toString('utf-8', 0, bytesRead)
-    if (start > 0) {
-      const firstNewline = text.indexOf('\n')
-      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : ''
-    }
-    const lines = text.split('\n')
-    for (let index = lines.length - 1; index >= 0; index--) {
-      const line = lines[index]
-      if (!line || !line.trim()) continue
+    const buffer = Buffer.alloc(readChunkBytes)
+    let position = stat.size
+    let trailing = Buffer.alloc(0)
+
+    function matchLine(lineBuffer) {
+      const end = lineBuffer.length > 0 && lineBuffer[lineBuffer.length - 1] === carriageReturnByte
+        ? lineBuffer.length - 1
+        : lineBuffer.length
+      const line = lineBuffer.subarray(0, end).toString('utf8')
       try {
         const obj = JSON.parse(line)
         if (obj &&
@@ -400,15 +368,37 @@ function readLastUserPrompt(transcriptPath, maxBytes = 2 * 1024 * 1024) {
           return cleanPrompt(obj.payload.message)
         }
       } catch (_) {}
+      return undefined
     }
+
+    while (position > 0) {
+      const readLength = Math.min(buffer.length, position)
+      position -= readLength
+      const bytesRead = fs.readSync(fd, buffer, 0, readLength, position)
+      if (bytesRead <= 0) break
+
+      const chunk = buffer.subarray(0, bytesRead)
+      const combined = trailing.length > 0 ? Buffer.concat([chunk, trailing]) : chunk
+      let end = combined.length
+      for (let index = combined.length - 1; index >= 0; index--) {
+        if (combined[index] !== newlineByte) continue
+        const lineBuffer = combined.subarray(index + 1, end)
+        end = index
+        if (lineBuffer.length === 0) continue
+        const matched = matchLine(lineBuffer)
+        if (matched !== undefined) return matched
+      }
+      trailing = Buffer.from(combined.subarray(0, end))
+    }
+
+    return trailing.length > 0 ? matchLine(trailing) : undefined
   } catch (_) {
     return undefined
   } finally {
-    if (fd !== null) {
+    if (fd >= 0) {
       try { fs.closeSync(fd) } catch (_) {}
     }
   }
-  return undefined
 }
 
 function codexSourceLabel(source) {
@@ -457,7 +447,66 @@ function classifyHookPayload(data) {
   return classifyCodexSession({ prompt, sessionMeta })
 }
 
-function markHiddenSession(sessionId, base, classification, now, details) {
+// Codex multi-agent hooks may route a child event with session_id equal to
+// parent_thread_id. In
+// that protocol shape the real child identity lives in session_meta.id.
+function linkSubagentFromSessionMeta(sessionId, meta) {
+  if (!meta || typeof meta !== 'object') return null
+  const source = meta.source && typeof meta.source === 'object' && !Array.isArray(meta.source)
+    ? meta.source
+    : null
+  const subagent = source && source.subagent && typeof source.subagent === 'object' && !Array.isArray(source.subagent)
+    ? source.subagent
+    : null
+  const threadSpawn = subagent && subagent.thread_spawn && typeof subagent.thread_spawn === 'object'
+    ? subagent.thread_spawn
+    : null
+  const parentSessionId = threadSpawn && threadSpawn.parent_thread_id
+  if (!parentSessionId) return null
+
+  const depth = Number.isFinite(threadSpawn.depth) ? threadSpawn.depth : 1
+  if (depth > 1) return null
+
+  const childSessionId = parentSessionId === sessionId ? meta.id : sessionId
+  if (!childSessionId || childSessionId === parentSessionId) return null
+
+  return {
+    parentSessionId,
+    childSessionId,
+    depth,
+    nickname: meta.agent_nickname || threadSpawn.agent_nickname || null
+  }
+}
+
+function codexSubagentRoute(data, sessionId, classification) {
+  // Internal/background sessions are not collaboration children, even if an
+  // unrelated payload field happens to be named agent_id.
+  if (classification && classification.hidden && !classification.isSubagent) return null
+
+  const meta = data._session_meta || readTranscriptSessionMeta(data.transcript_path)
+  const metaRoute = linkSubagentFromSessionMeta(sessionId, meta)
+  const agentId = typeof data.agent_id === 'string' && data.agent_id
+    ? data.agent_id
+    : null
+
+  // Give payload.agent_id priority for child activity/stop events. It is
+  // the only per-child identity when all children share the parent's
+  // session_id. session_meta remains the source of parent/nickname metadata.
+  if (agentId && agentId !== sessionId) {
+    const parentSessionId = metaRoute
+      ? metaRoute.parentSessionId
+      : sessionId
+    if (agentId === parentSessionId) return metaRoute
+    return Object.assign({}, metaRoute || {}, {
+      parentSessionId,
+      childSessionId: agentId
+    })
+  }
+
+  return metaRoute
+}
+
+function markHiddenSession(sessionId, base, classification, now, details, linkParent = true) {
   const updates = Object.assign({}, base, {
     isHiddenFromScout: true,
     hiddenReason: classification.reason || 'codex-hidden-session',
@@ -484,7 +533,7 @@ function markHiddenSession(sessionId, base, classification, now, details) {
   })
   updateSession(sessionId, updates)
 
-  if (classification.isSubagent && classification.parentSessionId) {
+  if (linkParent && classification.isSubagent && classification.parentSessionId) {
     upsertParentSubagent(classification.parentSessionId, sessionId, {
       nickname: classification.subagentNickname || 'subagent',
       depth: classification.subagentDepth,
@@ -510,18 +559,18 @@ function markSilentCodexSession(sessionId, base, now, details) {
 
 function backfillPromptFromTranscriptIfNeeded(sessionId, data, base, now) {
   const existing = readSession(sessionId)
-  if (isCodexUserConfirmed(existing)) return true
+  if (isCodexUserConfirmed(existing)) return { proceed: true, confirmed: true }
 
   const transcriptPath = data.transcript_path
-  if (!transcriptPath) return true
+  if (!transcriptPath) return { proceed: true, confirmed: false }
 
   const prompt = readLastUserPrompt(transcriptPath)
-  if (!prompt) return true
+  if (!prompt) return { proceed: true, confirmed: false }
 
   const classification = classifyCodexSession({ prompt, sessionMeta: data._session_meta || readTranscriptSessionMeta(transcriptPath) })
   if (classification.hidden) {
     markHiddenSession(sessionId, base, classification, now, data.hook_event_name)
-    return false
+    return { proceed: false, confirmed: false }
   }
 
   const title = titleFromPrompt(prompt)
@@ -534,7 +583,10 @@ function backfillPromptFromTranscriptIfNeeded(sessionId, data, base, now) {
       ? existing.lastEvent
       : { type: AGENT_EVENTS.SESSION_START, timestamp: now - 1, details: 'backfilled from transcript' }
   }))
-  return true
+  // updateSession is queued by hook-adapter. Return the synchronous fact as
+  // well so this same hook invocation (notably a first-event Stop) does not
+  // re-read the old file and misclassify a confirmed session as internal.
+  return { proceed: true, confirmed: true }
 }
 
 function normalizeSubagents(value) {
@@ -580,7 +632,10 @@ function removeParentSubagent(parentSessionId, childSessionId, now) {
 function updateParentSubagentFromHiddenEvent(session, data, now) {
   if (!session || !session.isCodexSubagent || !session.parentSessionId) return
   const eventName = data.hook_event_name
-  const childSessionId = session.sessionId || data.session_id || data.thread_id
+  // Codex child hooks can carry the parent in session_id and the actual child
+  // in agent_id. Keep the child identity precise so one child cannot update or
+  // remove a sibling (or the parent itself).
+  const childSessionId = data.agent_id || session.sessionId || data.session_id || data.thread_id
   const base = {
     nickname: session.subagentNickname || data.agent_nickname || 'subagent',
     depth: session.subagentDepth,
@@ -651,26 +706,69 @@ function handleModernHook(data) {
 
   const now = Date.now()
   const base = baseUpdates(data, now)
+  const classification = classifyHookPayload(data)
+  const subagentRoute = codexSubagentRoute(data, sessionId, classification)
+
+  if (subagentRoute) {
+    const childSessionId = subagentRoute.childSessionId
+    const childClassification = {
+      hidden: true,
+      isInternal: false,
+      isSubagent: true,
+      reason: 'codex-subagent',
+      parentSessionId: subagentRoute.parentSessionId,
+      subagentDepth: subagentRoute.depth !== undefined
+        ? subagentRoute.depth
+        : classification.subagentDepth,
+      subagentNickname: subagentRoute.nickname || classification.subagentNickname
+    }
+    const childBase = Object.assign({}, base, {
+      threadId: childSessionId,
+      codexSessionId: childSessionId
+    })
+    const child = readSession(childSessionId)
+    if (!isHiddenCodexSession(child)) {
+      // The route handler below is the single writer for activeSubagents. This
+      // avoids first-event Stop adding a child immediately before removing it.
+      markHiddenSession(childSessionId, childBase, childClassification, now, eventName, false)
+    }
+    updateParentSubagentFromHiddenEvent(Object.assign({}, child || {}, {
+      sessionId: childSessionId,
+      agentType: 'codex',
+      isCodexSubagent: true,
+      parentSessionId: subagentRoute.parentSessionId,
+      subagentDepth: childClassification.subagentDepth,
+      subagentNickname: childClassification.subagentNickname,
+      startedAt: child && child.startedAt ? child.startedAt : now
+    }), data, now)
+    return
+  }
+
   const existing = readSession(sessionId)
   if (isHiddenCodexSession(existing)) {
     updateParentSubagentFromHiddenEvent(existing, data, now)
     return
   }
 
-  const classification = classifyHookPayload(data)
   if (classification.hidden) {
     markHiddenSession(sessionId, base, classification, now, eventName)
     return
   }
 
+  let confirmedByBackfill = false
   if (eventName !== 'SessionStart' && eventName !== 'UserPromptSubmit') {
-    if (!backfillPromptFromTranscriptIfNeeded(sessionId, data, base, now)) return
+    const backfill = backfillPromptFromTranscriptIfNeeded(sessionId, data, base, now)
+    if (!backfill.proceed) return
+    confirmedByBackfill = backfill.confirmed
   }
 
   switch (eventName) {
     case 'SessionStart': {
+      // Treat a missing transcript_path as protocol-level proof of a
+      // short-lived internal Codex session and emits no SessionState event.
+      if (!data.transcript_path) return
       updateSession(sessionId, Object.assign({}, base, {
-        status: 'idle',
+        status: 'working',
         startedAt: now,
         needsAttention: null,
         pendingToolUse: null,
@@ -703,10 +801,9 @@ function handleModernHook(data) {
     case 'PreToolUse': {
       const toolName = data.tool_name || 'unknown'
       const isQuestionTool = toolName === 'request_user_input'
-      const details = isQuestionTool
-        ? questionDetailsFromToolInput(data.tool_input)
-        : getToolDetails(toolName, data.tool_input)
-      if (isQuestionTool) {
+      const questionDetails = isQuestionTool ? questionDetailsFromToolInput(data.tool_input) : null
+      const details = questionDetails || getToolDetails(toolName, data.tool_input)
+      if (isQuestionTool && questionDetails) {
         updateSession(sessionId, Object.assign({}, base, {
           status: 'working',
           needsAttention: 'waiting for answer',
@@ -734,12 +831,9 @@ function handleModernHook(data) {
       const nativeRequestId = codexNativeRequestId(toolName, data.tool_input)
       const approvalPolicy = readApprovalPolicy(data.transcript_path)
       if (isBypassPermission(data) || approvalPolicy === 'never' || hasCodexApprovedRequest(existing, nativeRequestId)) {
-        resolvePendingInteraction(sessionId, data, now, 'permission bypassed')
-        updateSession(sessionId, Object.assign({}, base, {
-          lastTurnId: data.turn_id,
-          requestId: data.request_id || data.requestId || data.tool_call_id || data.toolCallId || data.tool_use_id || data.toolUseId || nativeRequestId,
-          lastEvent: { type: AGENT_EVENTS.PERMISSION_BYPASSED, timestamp: now, turnId: data.turn_id }
-        }))
+        // Only ACK bypass/never/remembered approvals and refresh the jump
+        // target. This emits no state event and must not resolve an existing
+        // WAIT.
         break
       }
       const details = getToolDetails(toolName, data.tool_input)
@@ -760,14 +854,24 @@ function handleModernHook(data) {
       const toolName = data.tool_name || 'unknown'
       const isQuestionTool = toolName === 'request_user_input'
       const details = isQuestionTool ? questionDetailsFromToolInput(data.tool_input) : toolName
+      const rawResponse = data.tool_response || data.tool_output
+      const preview = typeof rawResponse === 'string'
+        ? compactText(rawResponse, 80)
+        : ''
+      const activity = preview ? `${toolName}: ${preview}` : `${toolName} done`
       resolvePendingInteraction(sessionId, data, now, details)
       updateSession(sessionId, Object.assign({}, base, {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
-        preserveActiveTool: isQuestionTool ? undefined : true,
         lastTurnId: data.turn_id,
         lastEvent: { type: AGENT_EVENTS.POST_TOOL_USE, timestamp: now, details: toolName, turnId: data.turn_id }
+      }))
+      updateSession(sessionId, Object.assign({}, base, {
+        status: 'working',
+        currentActivity: activity,
+        lastTurnId: data.turn_id,
+        lastEvent: { type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, timestamp: now, details: activity, turnId: data.turn_id }
       }))
       break
     }
@@ -778,13 +882,14 @@ function handleModernHook(data) {
         : ''
       const wantsAnswer = codexStopWantsAnswer(data, lastAssistantMessage)
       const existing = readSession(sessionId)
-      if (!isCodexUserConfirmed(existing)) {
+      if (!confirmedByBackfill && !isCodexUserConfirmed(existing)) {
         markSilentCodexSession(sessionId, base, now, 'Stop without confirmed user prompt')
         break
       }
-      if (!wantsAnswer && !(existing && existing.pendingInteraction)) {
-        resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
-      }
+      // Clear stale pending interaction before Stop parsing. Resolve an
+      // older wait first; the final assistant message may then establish a new
+      // question wait.
+      resolvePendingInteraction(sessionId, data, now, lastAssistantMessage)
       updateSession(sessionId, Object.assign({}, base, {
         status: wantsAnswer ? 'working' : 'completed',
         needsAttention: wantsAnswer ? 'waiting for answer' : null,
@@ -907,7 +1012,7 @@ module.exports = {
   handleModernHook,
   handleLegacyNotify,
   codexStopWantsAnswer,
-  looksLikeAssistantQuestion,
+  parseCodexQuestions,
   codexSessionMetaFields
 }
 

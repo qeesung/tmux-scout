@@ -6,7 +6,6 @@ const path = require('path')
 const fs = require('fs')
 const { createHookContext, liveSessionState, readStdin, isMeaningfulSubagentActivity } = require('../lib/hook-adapter')
 const { AGENT_EVENTS } = require('../lib/agent-events')
-const { classifyNotification } = require('../lib/notification-intent')
 
 const hookContext = createHookContext({
   agentType: 'claude',
@@ -55,7 +54,7 @@ function getToolDetails(tool_name, tool_input) {
 }
 
 function isQuestionTool(toolName) {
-  return toolName === 'AskUserQuestion' || toolName === 'mcp__conductor__AskUserQuestion'
+  return toolName === 'AskUserQuestion'
 }
 
 function isPlanApprovalTool(toolName) {
@@ -115,7 +114,6 @@ function resolvePendingInteraction(sessionId, data, now, details) {
     status: 'working',
     needsAttention: null,
     pendingToolUse: null,
-    activeTool: null,
     lastEvent: {
       type: eventType,
       timestamp: now,
@@ -136,8 +134,8 @@ function getSubagentPayload(data) {
 
 function getSubagentId(data, fallback) {
   const subAgent = getSubagentPayload(data)
-  return subAgent.id ||
-    data.agent_id ||
+  return data.agent_id ||
+    subAgent.id ||
     data.subagent_id ||
     data.sub_agent_id ||
     data.agentId ||
@@ -310,9 +308,6 @@ function startSubagent(sessionId, data, now) {
   updateSession(sessionId, {
     activeSubagents,
     _pendingSubagentDescriptions: queue,
-    needsAttention: null,
-    pendingToolUse: null,
-    activeTool: null,
     lastSubagentUpdatedAt: now,
     lastEvent: { type: AGENT_EVENTS.SUBAGENT_START, timestamp: now, details: title }
   })
@@ -378,12 +373,18 @@ function handleClaudeHook(data) {
 
   switch (hook_event_name) {
     case 'SessionStart':
-      if (source === 'compact') {
+      // Treat compact/clear as jump-target metadata only. They are not a
+      // new user turn and must not clear a pending approval/question or revive
+      // a completed session.
+      if (source === 'compact' || source === 'clear') {
+        // Only update an existing jump target here; do not create an
+        // AgentSession shell when compact/clear is the first observed hook.
+        if (!hookContext.readSession(session_id)) break
         updateSession(session_id, eventBase(data, now, tmuxPane, pid))
         break
       }
       updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
-        status: 'idle',
+        status: 'working',
         startedAt: now,
         pendingToolUse: null,
         activeTool: null,
@@ -416,28 +417,18 @@ function handleClaudeHook(data) {
     }
 
     case 'PreToolUse': {
+      // Clear stale pending interaction first. In the
+      // bridge that emits the matching permissionResolved/questionAnswered
+      // event only when a prior interaction is actually pending.
       resolvePendingInteraction(session_id, data, now, getToolDetails(tool_name, tool_input))
       const toolDetails = getToolDetails(tool_name, tool_input)
-      const attentionTools = ['ExitPlanMode', 'AskUserQuestion', 'mcp__conductor__AskUserQuestion']
-      const needsAttention = attentionTools.includes(tool_name)
-      const questionTool = isQuestionTool(tool_name)
       updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), pendingDescriptionUpdate(session_id, pendingSubagentDescription(data)), {
         status: 'working',
-        needsAttention: needsAttention ? tool_name : null,
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
+        // Keep lifecycle state separate from the display-oriented tool details.
+        // The idle fallback relies on this bare tool name to protect long-running work.
         activeTool: tool_name || 'unknown',
-        lastEvent: { type: AGENT_EVENTS.TOOL_USE, timestamp: now, details: toolDetails },
-        lifecycleEvent: needsAttention ? {
-          type: questionTool ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.PERMISSION_REQUEST,
-          source: 'hook',
-          stateSource: 'claude-hooks',
-          timestamp: now,
-          details: toolDetails,
-          attentionReason: questionTool ? 'waiting for answer' : 'waiting for approval',
-          pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
-          activeTool: tool_name || 'unknown',
-          force: true
-        } : undefined,
+        lastEvent: { type: AGENT_EVENTS.TOOL_USE, timestamp: now, details: toolDetails }
       })))
       break
     }
@@ -450,7 +441,8 @@ function handleClaudeHook(data) {
         status: 'working',
         needsAttention: questionTool ? 'waiting for answer' : (planTool ? 'waiting for plan approval' : 'waiting for approval'),
         pendingToolUse: { tool: tool_name || 'unknown', details: toolDetails, timestamp: now },
-        activeTool: tool_name || 'unknown',
+        // permissionRequested only changes the wait phase; it keeps
+        // whatever activeTool was already present.
         lastEvent: {
           type: questionTool ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.PERMISSION_REQUEST,
           timestamp: now,
@@ -462,11 +454,23 @@ function handleClaudeHook(data) {
 
     case 'PostToolUse':
       resolvePendingInteraction(session_id, data, now, tool_name || 'tool completed')
+      // ClaudeAdapter emits permissionResolved even after
+      // clearStalePendingInteraction has handled a pending interaction.
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        needsAttention: null,
+        pendingToolUse: null,
+        lastEvent: { type: AGENT_EVENTS.PERMISSION_RESOLVED, timestamp: now, details: tool_name || 'tool completed' }
+      })))
       updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'working',
         pendingToolUse: null,
-        activeTool: null,
         lastEvent: { type: AGENT_EVENTS.POST_TOOL_USE, timestamp: now },
+      })))
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        currentActivity: `${tool_name || 'Tool'} done`,
+        lastEvent: { type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, timestamp: now, details: `${tool_name || 'Tool'} done` }
       })))
       break
 
@@ -479,14 +483,25 @@ function handleClaudeHook(data) {
         status: 'working',
         needsAttention: null,
         pendingToolUse: null,
-        activeTool: null,
+        lastEvent: { type: AGENT_EVENTS.PERMISSION_RESOLVED, timestamp: now, details }
+      })))
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        needsAttention: null,
+        pendingToolUse: null,
         lastToolError: error || true,
         lastEvent: { type: AGENT_EVENTS.POST_TOOL_USE_FAILURE, timestamp: now, details }
+      })))
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        currentActivity: details,
+        lastEvent: { type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, timestamp: now, details }
       })))
       break
     }
 
     case 'Stop': {
+      resolvePendingInteraction(session_id, data, now, data.last_assistant_message || 'turn completed')
       const ralphLoopState = readRalphLoopState(data.cwd, session_id)
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
@@ -502,6 +517,7 @@ function handleClaudeHook(data) {
     }
 
     case 'StopFailure':
+      resolvePendingInteraction(session_id, data, now, data.error_details || data.error || 'turn failed')
       updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
         status: 'completed',
         needsAttention: null,
@@ -517,9 +533,17 @@ function handleClaudeHook(data) {
       }))
       break
 
-    case 'SubagentStart':
+    case 'SubagentStart': {
       startSubagent(session_id, data, now)
+      const agentType = getSubagentType(data)
+      const activity = agentType ? `Starting ${agentType} subagent` : 'Starting subagent'
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        currentActivity: activity,
+        lastEvent: { type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, timestamp: now, details: activity }
+      })))
       break
+    }
 
     case 'SubagentStop': {
       const parentSessionId = findParentSessionIdForSubagent(data, session_id)
@@ -528,98 +552,30 @@ function handleClaudeHook(data) {
     }
 
     case 'Notification': {
-      // Claude signals "the agent needs the user" only through Notification text
-      // ("Claude needs your permission" / "...approval for the plan" / "Claude is
-      // waiting for your input"). Standard Claude Code never delivers a real
-      // PermissionRequest hook, so without classifying this the session stays
-      // stuck showing BUSY, so normalize every waiting signal into an explicit
-      // lifecycle event through the one reducer.
-      const { intent, details, tool } = classifyNotification(data)
-      const notificationText = data.message || data.notification || data.title || details || null
-
-      if (intent === 'permission' || intent === 'plan' || intent === 'question') {
-        const questionIntent = intent === 'question'
-        const eventType = questionIntent ? AGENT_EVENTS.QUESTION_ASKED : AGENT_EVENTS.PERMISSION_REQUEST
-        const attentionReason = questionIntent
-          ? 'waiting for answer'
-          : intent === 'plan' ? 'waiting for plan approval' : 'waiting for approval'
-        const session = hookContext.readSession(session_id)
-        const knownTool = tool ||
-          (session && session.activeTool) ||
-          (session && session.pendingToolUse && session.pendingToolUse.tool) ||
-          undefined
-        const waitDetails = details || attentionReason
-        const pendingToolUse = knownTool ? { tool: knownTool, details: waitDetails, timestamp: now } : undefined
-        updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
-          status: 'working',
-          needsAttention: attentionReason,
-          lastNotification: notificationText,
-          pendingToolUse: pendingToolUse || null,
-          activeTool: knownTool || null,
-          lastEvent: { type: eventType, timestamp: now, details: waitDetails },
-          lifecycleEvent: {
-            type: eventType,
-            source: 'hook',
-            stateSource: 'claude-hooks',
-            timestamp: now,
-            details: waitDetails,
-            attentionReason,
-            pendingToolUse,
-            activeTool: knownTool || undefined,
-            force: true
-          }
-        })))
-        break
-      }
-
-      if (intent === 'idle') {
-        // "Claude is waiting for your input" — turn ended / idle at the prompt.
-        // Only demote a still-running session to completed; never resurrect a
-        // completed/idle session or clobber a real pending WAIT.
-        const session = hookContext.readSession(session_id)
-        if (session && session.phase === 'running') {
-          updateSession(session_id, Object.assign(eventBase(data, now, tmuxPane, pid), {
-            status: 'completed',
-            needsAttention: null,
-            pendingToolUse: null,
-            activeTool: null,
-            lastNotification: notificationText,
-            lastEvent: { type: AGENT_EVENTS.TURN_COMPLETE, timestamp: now, details: 'idle prompt' }
-          }))
-          break
-        }
-      }
-
-      // Informational notification (or idle on a non-running session): record it
-      // without touching the state machine.
-      updateSession(session_id, {
-        lastNotification: notificationText,
-        lastEvent: {
-          type: AGENT_EVENTS.NOTIFICATION,
-          timestamp: now,
-          details: notificationText
-        },
-        tmuxPane,
-        pid
-      })
+      // Log and ACK Notification without emitting state events.
+      // A metadata write would still refresh updatedAt and could create a
+      // phantom session, so this branch is a true no-op.
       break
     }
 
     case 'PreCompact':
-      updateSession(session_id, {
+      // Emit activityUpdated here: it preserves WAIT, but
+      // otherwise proves the agent is actively compacting and therefore BUSY.
+      updateSession(session_id, liveSessionState(Object.assign(eventBase(data, now, tmuxPane, pid), {
+        status: 'working',
+        currentActivity: 'Compacting conversation...',
         lastCompactAt: now,
         lastCompactReason: data.trigger || data.reason || null,
         lastEvent: {
-          type: AGENT_EVENTS.PRE_COMPACT,
+          type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE,
           timestamp: now,
-          details: data.trigger || data.reason || null
-        },
-        tmuxPane,
-        pid
-      })
+          details: 'Compacting conversation...'
+        }
+      })))
       break
 
     case 'SessionEnd':
+      resolvePendingInteraction(session_id, data, now, reason || 'session ended')
       updateSession(session_id, {
         status: 'idle',
         endedAt: now,

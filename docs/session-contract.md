@@ -16,6 +16,11 @@ contract change.
 and debug commands. Per-session files mirror individual snapshots for easier
 inspection and recovery.
 
+The picker and status bar intentionally operate only on sessions linked to a
+live tmux pane. Unbound Codex App, IDE, plain-terminal, and transcript-only
+snapshots are outside tmux-scout's management boundary even when their canonical
+phase is otherwise valid.
+
 The aggregate registry is maintained by `scripts/lib/session-registry.js`.
 It supports explicit session deletion and periodic pruning of snapshots that no
 longer need to be shown:
@@ -23,6 +28,8 @@ longer need to be shown:
 - hidden Codex/internal sessions after the short terminal display window
 - `crashed` / `stale` terminal sessions after the same display window
 - sessions with an explicit `endedAt` older than the 24-hour retention window
+- snapshots in any phase whose last activity is older than the seven-day
+  stale-session window
 - old inactive snapshots when the registry exceeds its capacity cap
 
 ## Snapshot Shape
@@ -52,7 +59,7 @@ fields such as picker colors or formatted text.
 
 | Phase | Legacy status | Meaning |
 |---|---|---|
-| `idle` | `idle` | Session exists but is not currently working |
+| `idle` | `idle` | Internal pane-discovery placeholder; not rendered as an agent state |
 | `running` | `working` | Agent is processing a prompt or tool |
 | `waitingForApproval` | `working` | Agent is blocked on permission or plan confirmation |
 | `waitingForAnswer` | `working` | Agent is blocked on user input |
@@ -103,12 +110,14 @@ details, and an optional blocked reason.
 `session_delete` is the canonical delete event. It does not map to a phase;
 the registry removes the aggregate entry and its per-session JSON file.
 
-## Source Priority
+## Evidence Sources
 
 tmux-scout accepts observations from hooks, transcript readers, pane/process
-checks, watchdog reconciliation, and debug injection. The reducer favors
-higher-confidence lifecycle sources during short races, while terminal states
-from process/pane reconciliation can still close dead sessions.
+checks, watchdog reconciliation, and debug injection. Source/confidence fields
+are retained as evidence, but they do not guess lifecycle transitions: pane
+contents never override hook state, WAIT only changes through an adapter-defined
+resolver or explicit new turn, and only `activityUpdated` semantics—not a
+bare tool event—can reopen DONE as BUSY.
 
 Use the reducer instead of writing lifecycle fields by hand. It keeps
 `phase`, `status`, `needsAttention`, `pendingInteraction`, `pendingToolUse`,

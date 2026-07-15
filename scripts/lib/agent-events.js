@@ -21,6 +21,7 @@ const AGENT_EVENTS = Object.freeze({
   SESSION_END: 'session_end',
   SESSION_DELETE: 'session_delete',
   INTERRUPTED: 'interrupted',
+  PROCESS_DETACHED: 'process_detached',
   PROCESS_EXIT_DETECTED: 'process_exit_detected',
   STALE: 'stale',
   PANE_STATE: 'pane_state',
@@ -37,7 +38,7 @@ const AGENT_EVENTS = Object.freeze({
 const AGENT_EVENT_ALIASES = Object.freeze({
   sessionStarted: AGENT_EVENTS.SESSION_START,
   turnStarted: AGENT_EVENTS.PROMPT_SUBMIT,
-  activityUpdated: AGENT_EVENTS.TOOL_USE,
+  activityUpdated: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE,
   permissionRequested: AGENT_EVENTS.PERMISSION_REQUEST,
   permissionResolved: AGENT_EVENTS.PERMISSION_RESOLVED,
   questionAsked: AGENT_EVENTS.QUESTION_ASKED,
@@ -46,7 +47,7 @@ const AGENT_EVENT_ALIASES = Object.freeze({
   toolUseCompleted: AGENT_EVENTS.POST_TOOL_USE,
   sessionCompleted: AGENT_EVENTS.STOP,
   sessionDeleted: AGENT_EVENTS.SESSION_DELETE,
-  processDetached: AGENT_EVENTS.PROCESS_EXIT_DETECTED,
+  processDetached: AGENT_EVENTS.PROCESS_DETACHED,
   subagentStarted: AGENT_EVENTS.SUBAGENT_START,
   subagentStopped: AGENT_EVENTS.SUBAGENT_STOP,
   subagentToolActivity: AGENT_EVENTS.SUBAGENT_TOOL_ACTIVITY
@@ -77,7 +78,19 @@ function normalizeAgentEvent(event, defaults = {}) {
   const input = event && typeof event === 'object' ? event : { type: event }
   const base = defaults && typeof defaults === 'object' ? defaults : {}
   const timestamp = normalizeTimestamp(firstDefined(input.timestamp, base.timestamp))
-  const type = normalizeAgentEventType(firstDefined(input.type, base.type))
+  const rawType = firstDefined(input.type, base.type)
+  const isSessionEnd = firstDefined(
+    input.isSessionEnd,
+    input.is_session_end,
+    base.isSessionEnd,
+    base.is_session_end
+  )
+  // sessionCompleted uses an explicit isSessionEnd bit. Preserve it
+  // when accepting canonical events instead of collapsing every completion to
+  // an ordinary STOP.
+  const type = rawType === 'sessionCompleted' && isSessionEnd === true
+    ? AGENT_EVENTS.SESSION_END
+    : normalizeAgentEventType(rawType)
 
   const normalized = Object.assign({}, base, input, {
     type,
@@ -101,6 +114,12 @@ function normalizeAgentEvent(event, defaults = {}) {
     tmuxPane: firstDefined(input.tmuxPane, base.tmuxPane),
     pid: firstDefined(input.pid, base.pid)
   })
+
+  if (rawType === 'sessionCompleted' && isSessionEnd === undefined) {
+    // Nullish inheritance means an omitted flag preserves the prior
+    // isSessionEnded bit, while explicit false clears it.
+    normalized.preserveSessionEnd = true
+  }
 
   if (normalized.rawEventName === undefined && type) {
     normalized.rawEventName = type

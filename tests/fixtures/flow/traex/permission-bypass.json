@@ -42,7 +42,6 @@
   },
   "expectEvidenceTypes": [
     "session_start",
-    "prompt_submit",
-    "permission_bypassed"
+    "prompt_submit"
   ]
 }

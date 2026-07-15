@@ -8,34 +8,28 @@ const { buildNodeHookCommand, extractHookPathFromCommand } = require('../lib/hoo
 
 const HOOK_PATH = path.join(__dirname, '..', 'hooks', 'generic.js')
 const HOOK_IDENTIFIER = 'tmux-scout/scripts/hooks/generic.js'
+const CONFIG_FILE = path.join(os.homedir(), '.hermes', 'config.yaml')
+const LEGACY_CONFIG_FILE = path.join(os.homedir(), '.hermes', 'cli-config.yaml')
 const HOOK_EVENTS = [
   { event: 'on_session_start' },
   { event: 'on_session_reset' },
   { event: 'pre_llm_call' },
   { event: 'post_llm_call' },
-  { event: 'pre_tool_call', timeout: 600 },
+  { event: 'pre_tool_call', timeout: 300 },
   { event: 'post_tool_call' },
   { event: 'pre_approval_request' },
   { event: 'post_approval_response' },
   { event: 'on_session_finalize' },
   { event: 'on_session_end' },
-  { event: 'subagent_start' },
   { event: 'subagent_stop' }
 ]
 
 function configCandidates() {
-  const home = os.homedir()
-  return [
-    path.join(home, '.hermes', 'cli-config.yaml'),
-    path.join(home, '.hermes', 'config.yaml')
-  ]
+  return [CONFIG_FILE, LEGACY_CONFIG_FILE]
 }
 
 function configPath() {
-  for (const candidate of configCandidates()) {
-    if (fs.existsSync(candidate)) return candidate
-  }
-  return configCandidates()[0]
+  return CONFIG_FILE
 }
 
 function readConfig(filePath = configPath()) {
@@ -199,20 +193,40 @@ function buildContent(before, hookLines, after) {
   return lines.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '\n')
 }
 
+function ensureHooksAutoAccept(content) {
+  const lines = contentLines(content)
+  const hasSetting = lines.some(line => /^hooks_auto_accept\s*:/.test(line))
+  if (hasSetting) return String(content || '').replace(/\s*$/, '\n')
+  if (lines.length === 0) return 'hooks_auto_accept: true\n'
+  return ['hooks_auto_accept: true', ...lines].join('\n').replace(/\s*$/, '\n')
+}
+
+function removeLegacyScoutHooks() {
+  if (!fs.existsSync(LEGACY_CONFIG_FILE)) return false
+  const original = readConfig(LEGACY_CONFIG_FILE)
+  const section = splitHooksSection(original)
+  if (!section.hookLines) return false
+  const cleaned = removeScoutHookEntries(section.hookLines)
+  if (!cleaned.removed) return false
+  writeAtomic(LEGACY_CONFIG_FILE, buildContent(section.before, cleaned.hookLines, section.after))
+  return true
+}
+
 function install() {
   const target = configPath()
-  const original = readConfig(target)
+  const original = ensureHooksAutoAccept(readConfig(target))
   const section = splitHooksSection(original)
   const cleaned = removeScoutHookEntries(section.hookLines)
   const nextHooks = cleaned.hookLines.slice()
   const hookCommand = command()
   for (const eventConfig of HOOK_EVENTS) appendEntry(nextHooks, eventConfig, hookCommand)
   writeAtomic(target, buildContent(section.before, nextHooks, section.after))
+  const removedLegacy = removeLegacyScoutHooks()
   return {
     results: HOOK_EVENTS.map(eventConfig => ({
       event: eventConfig.event,
       action: cleaned.removed ? 'updated' : 'installed'
-    })),
+    })).concat(removedLegacy ? [{ event: 'legacy cli-config.yaml', action: 'removed_legacy' }] : []),
     path: HOOK_PATH
   }
 }

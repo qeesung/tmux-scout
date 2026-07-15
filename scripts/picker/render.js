@@ -107,7 +107,7 @@ function canUseShellFallback(session) {
 }
 
 function isNeedsAttention(session, now) {
-  return Boolean(session && (session.needsAttention || session.pendingInteraction || isWaitingPhase(phaseForSession(session))))
+  return Boolean(session && isWaitingPhase(phaseForSession(session)))
 }
 
 // Access-order (MRU) on a unified recency timeline: a session's sort key is the
@@ -135,6 +135,10 @@ function isTerminalSession(session) {
 
 function isActiveSession(session, panes, now = Date.now()) {
   if (!session) return false
+  // tmux-scout's management boundary is the tmux server. Canonical lifecycle state
+  // remains authoritative after a session is bound, but Codex App/IDE/plain
+  // terminal sessions without a real tmux pane are outside this picker.
+  if (!session.tmuxPane) return false
   if (isHiddenCodexSession(session)) return false
 
   // Phase/lifecycle visibility lives in the contract module (pure + testable).
@@ -158,7 +162,6 @@ function isActiveSession(session, panes, now = Date.now()) {
 
 function getActiveSessions(status, panes) {
   const byPane = new Map()
-  const unbound = []
   const now = Date.now()
 
   function paneActivityRank(session) {
@@ -190,16 +193,12 @@ function getActiveSessions(status, panes) {
 
   for (const session of Object.values(status.sessions || {})) {
     if (!isActiveSession(session, panes, now)) continue
-    if (!session.tmuxPane) {
-      unbound.push(session)
-      continue
-    }
     const existing = byPane.get(session.tmuxPane)
     if (shouldReplacePaneSession(existing, session)) {
       byPane.set(session.tmuxPane, session)
     }
   }
-  return Array.from(byPane.values()).concat(unbound)
+  return Array.from(byPane.values())
 }
 
 function cleanText(value, fallback) {
@@ -361,10 +360,10 @@ function formatLine(session, now, currentPane) {
     ? `  \x1b[31m${attentionDetail(session).slice(0, 55)}\x1b[0m`
     : unbound
     ? `  \x1b[2m(pane not yet linked — waiting for first response)\x1b[0m`
-    : session.pendingToolUse && session.pendingToolUse.details
-      ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n\t]+/g, ' ').slice(0, 40)}\x1b[0m`
-      : subagents
-        ? `  \x1b[35m${subagents.slice(0, 55)}\x1b[0m`
+    : subagents
+      ? `  \x1b[35m${subagents.slice(0, 55)}\x1b[0m`
+      : phaseForSession(session) === 'running' && session.activeTool && session.pendingToolUse && session.pendingToolUse.details
+        ? `  \x1b[36m${String(session.pendingToolUse.details).replace(/[\r\n\t]+/g, ' ').slice(0, 40)}\x1b[0m`
       : evidence
         ? `  \x1b[2m${evidence.slice(0, 55)}\x1b[0m`
       : ''

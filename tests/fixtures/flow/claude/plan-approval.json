@@ -1,0 +1,45 @@
+{
+  "name": "claude ExitPlanMode waits only on PermissionRequest",
+  "agent": "claude",
+  "sessionId": "fixture-claude-plan-approval",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-plan-approval",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "make a plan"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "ExitPlanMode",
+        "tool_input": { "plan": "Implement the change" }
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "ExitPlanMode",
+        "tool_input": { "plan": "Implement the change" }
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "working",
+    "phase": "waitingForApproval",
+    "needsAttention": "waiting for plan approval",
+    "pendingInteraction.type": "plan",
+    "pendingInteraction.tool": "ExitPlanMode",
+    "activeTool": "ExitPlanMode"
+  },
+  "expectEvidenceTypes": [
+    "prompt_submit",
+    "tool_use",
+    "permission_request"
+  ]
+}

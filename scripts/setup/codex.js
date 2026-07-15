@@ -7,6 +7,8 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const crypto = require('crypto')
+const { execFileSync, spawnSync } = require('child_process')
+const TOML = require('../vendor/iarna-toml/toml')
 const { buildNodeHookCommand, extractHookPathFromCommand } = require('../lib/hook-command')
 
 const CODEX_DIR = path.join(os.homedir(), '.codex')
@@ -17,8 +19,19 @@ const ORIGINAL_NOTIFY_FILE = path.join(SCOUT_DIR, 'codex-original-notify.json')
 const MODERN_MANIFEST_FILE = path.join(SCOUT_DIR, 'codex-hooks-manifest.json')
 const HOOK_PATH = path.join(__dirname, '..', 'hooks', 'codex.js')
 const HOOK_IDENTIFIER = 'tmux-scout/scripts/hooks/codex.js'
-
-const NOTIFY_REGEX = /^notify\s*=\s*\[([^\]]*)\]/m
+const MIN_CLI_HOOKS_ONLY_VERSION = '0.129.0'
+const MIN_APP_HOOKS_ONLY_VERSION = '26.506.0'
+const APP_BUNDLE_ID = 'com.openai.codex'
+const APP_CANDIDATES = [
+  {
+    plist: '/Applications/ChatGPT.app/Contents/Info.plist',
+    binary: '/Applications/ChatGPT.app/Contents/Resources/codex'
+  },
+  {
+    plist: '/Applications/Codex.app/Contents/Info.plist',
+    binary: '/Applications/Codex.app/Contents/Resources/codex'
+  }
+]
 
 const CODEX_EVENTS = [
   { event: 'SessionStart', timeout: 5 },
@@ -59,6 +72,86 @@ function readJson(filePath, fallback) {
   return fallback
 }
 
+function extractVersion(value) {
+  const normalized = String(value || '').trim()
+  if (!normalized) return null
+  const keywordPatterns = [
+    /\bcodex(?:\.app)?(?:\s+cli)?(?:\s+version)?[^0-9\n]{0,20}v?(\d+(?:\.\d+)+(?:-[0-9A-Za-z.+-]+)?)/i,
+    /\bcodex(?:\.app)?[^\n]{0,40}?v?(\d+(?:\.\d+)+(?:-[0-9A-Za-z.+-]+)?)/i,
+    /v?(\d+(?:\.\d+)+(?:-[0-9A-Za-z.+-]+)?)[^\n]{0,40}?\bcodex(?:\.app)?\b/i
+  ]
+  for (const pattern of keywordPatterns) {
+    const match = normalized.match(pattern)
+    if (match && match[1]) return match[1]
+  }
+  const matches = Array.from(normalized.matchAll(/\bv?(\d+(?:\.\d+)+(?:-[0-9A-Za-z.+-]+)?)\b/g))
+  const unique = [...new Set(matches.map(match => match[1]).filter(Boolean))]
+  return unique.length === 1 ? unique[0] : null
+}
+
+function versionGte(version, minimum) {
+  const left = String(version || '').split(/[.-]/).slice(0, 4).map(part => Number.parseInt(part, 10) || 0)
+  const right = String(minimum || '').split(/[.-]/).slice(0, 4).map(part => Number.parseInt(part, 10) || 0)
+  const length = Math.max(left.length, right.length)
+  for (let index = 0; index < length; index++) {
+    const delta = (left[index] || 0) - (right[index] || 0)
+    if (delta !== 0) return delta > 0
+  }
+  return true
+}
+
+function readPlistValue(plist, key) {
+  try {
+    const output = execFileSync('/usr/bin/plutil', ['-extract', key, 'raw', plist], {
+      encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore']
+    })
+    return String(output || '').trim() || null
+  } catch (_) {
+    return null
+  }
+}
+
+function detectAppVersion() {
+  for (const candidate of APP_CANDIDATES) {
+    if (!fs.existsSync(candidate.plist) || !fs.existsSync(candidate.binary)) continue
+    if (readPlistValue(candidate.plist, 'CFBundleIdentifier') !== APP_BUNDLE_ID) continue
+    return {
+      installed: true,
+      version: extractVersion(readPlistValue(candidate.plist, 'CFBundleShortVersionString'))
+    }
+  }
+  return { installed: false, version: null }
+}
+
+function detectCliVersion() {
+  let binary
+  try {
+    binary = execFileSync('/usr/bin/env', ['which', 'codex'], {
+      encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+    if (!binary || !fs.existsSync(binary)) return { installed: false, version: null }
+    const resolved = fs.realpathSync(binary)
+    const isBundled = APP_CANDIDATES.some(candidate => {
+      try { return fs.existsSync(candidate.binary) && fs.realpathSync(candidate.binary) === resolved } catch (_) { return false }
+    })
+    if (isBundled) return { installed: false, version: null }
+  } catch (_) {
+    return { installed: false, version: null }
+  }
+
+  const result = spawnSync(binary, ['--version'], {
+    encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe']
+  })
+  return {
+    installed: true,
+    version: extractVersion(`${result.stdout || ''}\n${result.stderr || ''}`)
+  }
+}
+
+function detectCodexVersions() {
+  return { app: detectAppVersion(), cli: detectCliVersion() }
+}
+
 function writeJson(filePath, data) {
   writeAtomic(filePath, JSON.stringify(data, null, 2) + '\n')
 }
@@ -68,86 +161,84 @@ function buildHookCommand() {
 }
 
 function parseNotifyArray(content) {
-  const match = content.match(NOTIFY_REGEX)
-  if (!match) return null
-  const strings = []
-  const strRegex = /"([^"\\]*(?:\\.[^"\\]*)*)"/g
-  let strMatch
-  while ((strMatch = strRegex.exec(match[1])) !== null) {
-    strings.push(strMatch[1].replace(/\\"/g, '"'))
-  }
-  return strings.length > 0 ? strings : null
+  const parsed = parseToml(content)
+  if (!parsed || !Array.isArray(parsed.notify)) return null
+  const values = parsed.notify.filter(value => typeof value === 'string')
+  return values.length === parsed.notify.length && values.length > 0 ? values : null
 }
 
-function tomlString(value) {
-  return JSON.stringify(String(value))
-}
-
-function buildNotifyLine(hookPath) {
-  const values = [
+function buildNotifyValues(hookPath) {
+  return [
     'sh',
     '-c',
     'test -e "$1" || exit 0; exec node "$1" "$2"',
     'tmux-scout',
     hookPath
   ]
-  return `notify = [\n${values.map(value => `  ${tomlString(value)}`).join(',\n')}\n]`
 }
 
-function notifyArrayMatchesExpected(content, hookPath) {
-  const current = parseNotifyArray(content)
-  const expected = parseNotifyArray(buildNotifyLine(hookPath))
-  return Boolean(current && expected && JSON.stringify(current) === JSON.stringify(expected))
+function normalizeNotifyValue(value) {
+  return String(value || '').replace(/\\+\//g, '/')
+}
+
+function normalizedNotifyText(values) {
+  return JSON.stringify((values || []).map(normalizeNotifyValue))
+}
+
+function notifyValuesEqual(left, right) {
+  return Array.isArray(left) && Array.isArray(right) &&
+    left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function isStandaloneScoutHookPath(value) {
+  const normalized = normalizeNotifyValue(value).trim()
+  return normalized === HOOK_PATH || normalized.includes(HOOK_IDENTIFIER)
+}
+
+function isDirectScoutNotify(values) {
+  if (!Array.isArray(values) || values.length < 2) return false
+  const executable = path.basename(normalizeNotifyValue(values[0])).toLowerCase()
+  const hasHookPathArgument = values.slice(1).some(isStandaloneScoutHookPath)
+  if (!hasHookPathArgument) return false
+  if (executable === 'node' || executable === 'nodejs') return true
+  return (executable === 'sh' || executable === 'bash' || executable === 'zsh') && values[1] === '-c'
+}
+
+function hasWrappedScoutNotify(values) {
+  if (!Array.isArray(values) || isDirectScoutNotify(values)) return false
+  const normalized = normalizedNotifyText(values)
+  return normalized.includes(HOOK_PATH) || normalized.includes(HOOK_IDENTIFIER)
+}
+
+function writeNotifyArray(content, values) {
+  const parsed = parseToml(content)
+  if (!parsed) throw new Error('Invalid ~/.codex/config.toml')
+  if (values && values.length > 0) parsed.notify = values
+  else delete parsed.notify
+  return TOML.stringify(parsed)
 }
 
 function installLegacyNotify() {
   const content = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf-8') : ''
+  const currentNotify = parseNotifyArray(content)
+  const wantedNotify = buildNotifyValues(HOOK_PATH)
 
-  if (content.includes(HOOK_PATH)) {
-    if (notifyArrayMatchesExpected(content, HOOK_PATH)) {
-      return { action: 'ok', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
-    }
-    if (!NOTIFY_REGEX.test(content)) {
-      return { action: 'ok', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
-    }
-    const newNotify = buildNotifyLine(HOOK_PATH)
-    const newContent = content.replace(NOTIFY_REGEX, () => newNotify)
-    writeAtomic(CODEX_CONFIG, newContent)
-    return { action: 'updated', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
+  if (notifyValuesEqual(currentNotify, wantedNotify) || hasWrappedScoutNotify(currentNotify)) {
+    return { action: 'ok', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
   }
 
-  if (content.includes(HOOK_IDENTIFIER)) {
-    const newNotify = buildNotifyLine(HOOK_PATH)
-    const newContent = content.replace(NOTIFY_REGEX, () => newNotify)
-    writeAtomic(CODEX_CONFIG, newContent)
-    return { action: 'updated', hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE) }
-  }
-
-  const originalNotify = parseNotifyArray(content)
+  const originalNotify = currentNotify
+  const updatesManagedNotify = isDirectScoutNotify(currentNotify)
   fs.mkdirSync(SCOUT_DIR, { recursive: true })
-  if (!fs.existsSync(ORIGINAL_NOTIFY_FILE)) {
+  if (!updatesManagedNotify && originalNotify !== null && !fs.existsSync(ORIGINAL_NOTIFY_FILE)) {
     writeJson(ORIGINAL_NOTIFY_FILE, { notify: originalNotify })
   }
 
-  const newNotify = buildNotifyLine(HOOK_PATH)
-  const match = content.match(NOTIFY_REGEX)
-  let newContent
-  if (match) {
-    newContent = content.replace(NOTIFY_REGEX, () => newNotify)
-  } else if (content.trim()) {
-    const lines = content.split('\n')
-    let insertIdx = 0
-    while (insertIdx < lines.length && lines[insertIdx].startsWith('#')) {
-      insertIdx++
-    }
-    lines.splice(insertIdx, 0, newNotify)
-    newContent = lines.join('\n')
-  } else {
-    newContent = newNotify + '\n'
+  writeAtomic(CODEX_CONFIG, writeNotifyArray(content, wantedNotify))
+  return {
+    action: updatesManagedNotify ? 'updated' : 'installed',
+    hasOriginalNotify: fs.existsSync(ORIGINAL_NOTIFY_FILE)
   }
-
-  writeAtomic(CODEX_CONFIG, newContent)
-  return { action: 'installed', hasOriginalNotify: originalNotify !== null }
 }
 
 function uninstallLegacyNotify() {
@@ -156,47 +247,39 @@ function uninstallLegacyNotify() {
   }
 
   const content = fs.readFileSync(CODEX_CONFIG, 'utf-8')
-  if (!content.includes(HOOK_IDENTIFIER) && !content.includes(HOOK_PATH)) {
+  const currentNotify = parseNotifyArray(content)
+  if (!isDirectScoutNotify(currentNotify)) {
     return { action: 'not_found' }
   }
 
-  let newContent
+  let restoredNotify = null
   if (fs.existsSync(ORIGINAL_NOTIFY_FILE)) {
     try {
       const saved = JSON.parse(fs.readFileSync(ORIGINAL_NOTIFY_FILE, 'utf-8'))
       if (saved && Array.isArray(saved.notify) && saved.notify.length > 0) {
-        const restored = `notify = [\n${saved.notify.map(s => `  "${String(s).replace(/"/g, '\\"')}"`).join(',\n')}\n]`
-        newContent = content.replace(NOTIFY_REGEX, () => restored)
-      } else {
-        newContent = content.replace(NOTIFY_REGEX, '').replace(/^\s*\n/gm, '\n')
+        restoredNotify = saved.notify
       }
       fs.unlinkSync(ORIGINAL_NOTIFY_FILE)
-    } catch (_) {
-      newContent = content.replace(NOTIFY_REGEX, '').replace(/^\s*\n/gm, '\n')
-    }
-  } else {
-    newContent = content.replace(NOTIFY_REGEX, '').replace(/^\s*\n/gm, '\n')
+    } catch (_) {}
   }
 
-  writeAtomic(CODEX_CONFIG, newContent)
+  writeAtomic(CODEX_CONFIG, writeNotifyArray(content, restoredNotify))
   return { action: 'removed' }
 }
 
 function statusLegacyNotify() {
   if (!fs.existsSync(CODEX_CONFIG)) return { installed: false, path: null }
   const content = fs.readFileSync(CODEX_CONFIG, 'utf-8')
-  if (!content.includes(HOOK_IDENTIFIER) && !content.includes(HOOK_PATH)) {
+  const strings = parseNotifyArray(content) || []
+  const normalized = normalizedNotifyText(strings)
+  if (!normalized.includes(HOOK_IDENTIFIER) && !normalized.includes(HOOK_PATH)) {
     return { installed: false, path: null }
   }
 
-  const match = content.match(NOTIFY_REGEX)
   let currentPath = null
-  if (match) {
-    const strings = parseNotifyArray(content) || []
-    currentPath = strings.find(value => path.basename(value) === 'codex.js') || null
-    if (!currentPath) {
-      currentPath = extractHookPathFromCommand(strings.join(' '), 'codex.js')
-    }
+  currentPath = strings.find(value => path.basename(value) === 'codex.js') || null
+  if (!currentPath) {
+    currentPath = extractHookPathFromCommand(normalized, 'codex.js')
   }
   return { installed: true, path: currentPath }
 }
@@ -311,104 +394,125 @@ function computeTrustEntries(hooksConfigPath, hooksConfig) {
   return entries
 }
 
-function tomlQuote(value) {
-  return '"' + String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+function parseToml(content) {
+  if (!String(content || '').trim()) return {}
+  try { return TOML.parse(content) } catch (_) { return null }
+}
+
+function asTable(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+function featureConfig(content) {
+  const parsed = parseToml(content)
+  const features = parsed ? asTable(parsed.features) : {}
+  return {
+    hooks: {
+      present: Object.prototype.hasOwnProperty.call(features, 'hooks'),
+      value: features.hooks
+    },
+    legacy: {
+      present: Object.prototype.hasOwnProperty.call(features, 'codex_hooks'),
+      value: features.codex_hooks
+    }
+  }
+}
+
+function hasHooksFeature(content) {
+  return featureConfig(content).hooks.value === true
+}
+
+function hooksOnlyCapable(probe, minimum) {
+  return Boolean(probe && probe.installed && probe.version && versionGte(probe.version, minimum))
+}
+
+function resolveFeatureFlags(content, detectedVersions) {
+  const versions = detectedVersions || { app: { installed: false, version: null }, cli: { installed: false, version: null } }
+  if (versions.app.installed && versions.app.version && !versionGte(versions.app.version, MIN_APP_HOOKS_ONLY_VERSION)) {
+    return ['hooks', 'codex_hooks']
+  }
+  if (versions.cli.installed && versions.cli.version && !versionGte(versions.cli.version, MIN_CLI_HOOKS_ONLY_VERSION)) {
+    return ['hooks', 'codex_hooks']
+  }
+  if (versions.app.installed || versions.cli.installed) return ['hooks']
+
+  const current = featureConfig(content)
+  return current.hooks.value === true && current.legacy.value !== true
+    ? ['hooks']
+    : ['hooks', 'codex_hooks']
+}
+
+function selectFeatureFlags(content, detectedVersions) {
+  const current = featureConfig(content)
+  if (!current.hooks.present) return resolveFeatureFlags(content, detectedVersions)
+
+  if (current.hooks.value === true && current.legacy.value === true) {
+    const bothModern = hooksOnlyCapable(detectedVersions && detectedVersions.app, MIN_APP_HOOKS_ONLY_VERSION) &&
+      hooksOnlyCapable(detectedVersions && detectedVersions.cli, MIN_CLI_HOOKS_ONLY_VERSION)
+    return bothModern ? ['hooks'] : ['hooks', 'codex_hooks']
+  }
+
+  return current.legacy.value === true ? ['hooks', 'codex_hooks'] : ['hooks']
+}
+
+function upsertFeatures(content, featureFlags = ['hooks']) {
+  const parsed = parseToml(content) || {}
+  const existing = asTable(parsed.features)
+  const wanted = new Set(featureFlags)
+  const features = {}
+  if (wanted.has('hooks')) features.hooks = true
+  if (wanted.has('codex_hooks')) features.codex_hooks = true
+  for (const [key, value] of Object.entries(existing)) {
+    if (key === 'hooks' || key === 'codex_hooks') continue
+    features[key] = value
+  }
+  parsed.features = features
+  return TOML.stringify(parsed)
+}
+
+function applyConfigToml(content, trustEntries, staleKeys, featureFlags) {
+  const parsed = parseToml(content) || {}
+  const withFeatures = TOML.parse(upsertFeatures(TOML.stringify(parsed), featureFlags))
+  const managedKeys = new Set(staleKeys || [])
+  for (const entry of trustEntries) managedKeys.add(entry.key)
+
+  const hooks = asTable(withFeatures.hooks)
+  const existingState = asTable(hooks.state)
+  const merged = {}
+  for (const [key, value] of Object.entries(existingState)) {
+    if (!managedKeys.has(key)) merged[key] = value
+  }
+  for (const entry of trustEntries) {
+    merged[entry.key] = { trusted_hash: entry.trustedHash }
+  }
+  const ordered = {}
+  for (const key of Object.keys(merged).sort()) ordered[key] = merged[key]
+  if (Object.keys(ordered).length > 0) hooks.state = ordered
+  else delete hooks.state
+  if (Object.keys(hooks).length > 0) withFeatures.hooks = hooks
+  else delete withFeatures.hooks
+  return TOML.stringify(withFeatures)
 }
 
 function removeTrustTables(content, keys) {
   if (!keys || keys.length === 0 || !content.trim()) return content
-  const headers = new Set(keys.map(key => `[hooks.state.${tomlQuote(key)}]`))
-  const lines = content.split('\n')
-  const kept = []
-  let skipping = false
-  for (const line of lines) {
-    const trimmed = line.trim()
-    if (/^\[[^\]]+\]\s*$/.test(trimmed)) {
-      skipping = headers.has(trimmed)
-      if (skipping) continue
-    }
-    if (!skipping) kept.push(line)
-  }
-  return kept.join('\n').replace(/\n{3,}/g, '\n\n')
-}
-
-function findTableBody(content, header) {
-  const lines = content.split('\n')
-  let start = -1
-  let end = lines.length
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === header) {
-      start = i + 1
-      continue
-    }
-    if (start >= 0 && i >= start && /^\s*\[[^\]]+\]\s*$/.test(lines[i])) {
-      end = i
-      break
-    }
-  }
-  return start >= 0 ? lines.slice(start, end) : null
-}
-
-function hasHooksFeature(content) {
-  const body = findTableBody(content, '[features]')
-  if (!body) return false
-  return body.some(line => /^\s*hooks\s*=\s*true\s*(?:#.*)?$/.test(line))
+  const parsed = parseToml(content)
+  if (!parsed) return content
+  const hooks = asTable(parsed.hooks)
+  const state = asTable(hooks.state)
+  for (const key of keys) delete state[key]
+  if (Object.keys(state).length > 0) hooks.state = state
+  else delete hooks.state
+  if (Object.keys(hooks).length > 0) parsed.hooks = hooks
+  else delete parsed.hooks
+  return TOML.stringify(parsed)
 }
 
 function readTrustHash(content, key) {
-  const body = findTableBody(content, `[hooks.state.${tomlQuote(key)}]`)
-  if (!body) return null
-  for (const line of body) {
-    const match = line.match(/^\s*trusted_hash\s*=\s*"([^"]+)"/)
-    if (match) return match[1]
-  }
-  return null
-}
-
-function upsertFeatures(content) {
-  const lines = content.split('\n')
-  let start = -1
-  let end = lines.length
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === '[features]') {
-      start = i
-      continue
-    }
-    if (start >= 0 && i > start && /^\s*\[[^\]]+\]\s*$/.test(lines[i])) {
-      end = i
-      break
-    }
-  }
-
-  if (start < 0) {
-    const prefix = content.trim() ? content.replace(/\s*$/, '\n\n') : ''
-    return prefix + '[features]\nhooks = true\n'
-  }
-
-  const body = lines.slice(start + 1, end)
-    .filter(line => !/^\s*(hooks|codex_hooks)\s*=/.test(line))
-  const replacement = ['[features]', 'hooks = true', ...body]
-  lines.splice(start, end - start, ...replacement)
-  return lines.join('\n')
-}
-
-function applyConfigToml(content, trustEntries, staleKeys) {
-  const managedKeys = new Set(staleKeys || [])
-  for (const entry of trustEntries) managedKeys.add(entry.key)
-
-  let updated = removeTrustTables(content, Array.from(managedKeys))
-  updated = upsertFeatures(updated)
-  updated = updated.replace(/\s*$/, '\n')
-
-  if (trustEntries.length > 0) {
-    updated += '\n'
-    for (const entry of trustEntries) {
-      updated += `[hooks.state.${tomlQuote(entry.key)}]\n`
-      updated += `trusted_hash = ${tomlQuote(entry.trustedHash)}\n\n`
-    }
-  }
-
-  return updated.replace(/\n{3,}/g, '\n\n')
+  const parsed = parseToml(content)
+  if (!parsed) return null
+  const entry = asTable(asTable(asTable(parsed.hooks).state)[key])
+  return typeof entry.trusted_hash === 'string' ? entry.trusted_hash : null
 }
 
 function installModernHooks() {
@@ -437,7 +541,14 @@ function installModernHooks() {
 
   const trustEntries = computeTrustEntries(CODEX_HOOKS_CONFIG, hooksFile.hooks)
   const oldToml = fs.existsSync(CODEX_CONFIG) ? fs.readFileSync(CODEX_CONFIG, 'utf-8') : ''
-  const newToml = applyConfigToml(oldToml, trustEntries, previousManifest && previousManifest.trustKeys)
+  const detectedVersions = detectCodexVersions()
+  const featureFlags = selectFeatureFlags(oldToml, detectedVersions)
+  const newToml = applyConfigToml(
+    oldToml,
+    trustEntries,
+    previousManifest && previousManifest.trustKeys,
+    featureFlags
+  )
   writeAtomic(CODEX_CONFIG, newToml)
 
   writeJson(MODERN_MANIFEST_FILE, {
@@ -445,11 +556,13 @@ function installModernHooks() {
     tomlConfigPath: CODEX_CONFIG,
     events: CODEX_EVENTS.map(e => e.event),
     trustKeys: trustEntries.map(e => e.key),
+    featureFlags,
+    detectedVersions,
     installedAt: new Date().toISOString()
   })
 
   const allHadScout = actions.every(a => a.action === 'ok')
-  return { action: allHadScout ? 'ok' : 'installed', results: actions, trustEntries }
+  return { action: allHadScout ? 'ok' : 'installed', results: actions, trustEntries, featureFlags, detectedVersions }
 }
 
 function uninstallModernHooks() {
@@ -569,7 +682,19 @@ function status() {
   }
 }
 
-module.exports = { install, uninstall, status }
+module.exports = {
+  install,
+  uninstall,
+  status,
+  extractVersion,
+  versionGte,
+  detectAppVersion,
+  detectCliVersion,
+  detectCodexVersions,
+  resolveFeatureFlags,
+  selectFeatureFlags,
+  upsertFeatures
+}
 
 if (require.main === module) {
   const cmd = process.argv[2]

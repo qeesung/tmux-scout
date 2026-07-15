@@ -13,6 +13,9 @@ const {
 } = require('./session-contract')
 
 const DEFAULT_SESSION_RETENTION_MS = 24 * 60 * 60 * 1000
+// Stale snapshots are removed after the default auto-collapse interval regardless
+// of phase so an obsolete RUNNING/WAIT cannot survive forever.
+const DEFAULT_STALE_SESSION_MS = 7 * 24 * 60 * 60 * 1000
 const DEFAULT_TERMINAL_DISPLAY_MS = 5 * 60 * 1000
 const DEFAULT_MAX_SESSIONS = 200
 
@@ -61,6 +64,9 @@ function shouldPruneSession(session, now, options = {}) {
   const terminalDisplayMs = Number.isFinite(options.terminalDisplayMs)
     ? Math.max(0, options.terminalDisplayMs)
     : DEFAULT_TERMINAL_DISPLAY_MS
+  const staleSessionMs = Number.isFinite(options.staleSessionMs)
+    ? Math.max(0, options.staleSessionMs)
+    : DEFAULT_STALE_SESSION_MS
   const phase = currentPhase(session)
   const endedAt = timestampValue(session.endedAt)
 
@@ -74,6 +80,11 @@ function shouldPruneSession(session, now, options = {}) {
 
   if (endedAt && retentionMs > 0 && now - endedAt >= retentionMs) {
     return 'ended-expired'
+  }
+
+  const touchedAt = lastTouchedAt(session)
+  if (touchedAt && staleSessionMs > 0 && now - touchedAt >= staleSessionMs) {
+    return 'stale-expired'
   }
 
   return null
@@ -153,6 +164,7 @@ function pruneSessions(status, paths, options = {}) {
 
 module.exports = {
   DEFAULT_SESSION_RETENTION_MS,
+  DEFAULT_STALE_SESSION_MS,
   DEFAULT_TERMINAL_DISPLAY_MS,
   DEFAULT_MAX_SESSIONS,
   safeSessionId,

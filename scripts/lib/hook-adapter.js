@@ -4,7 +4,7 @@ const fs = require('fs')
 const path = require('path')
 const os = require('os')
 const net = require('net')
-const { applySessionEvent } = require('./session-state')
+const { applySessionEvent, currentPhase } = require('./session-state')
 const { AGENT_EVENTS, createAgentEvent } = require('./agent-events')
 const { hookRuntimeContext } = require('./terminal-context')
 const { deleteSession: deleteRegistrySession, safeSessionId } = require('./session-registry')
@@ -29,8 +29,7 @@ const LIFECYCLE_FIELDS = new Set([
   'currentTurnId',
   'turnStartedAt',
   'turnEndedAt',
-  'lastTurnId',
-  'preserveActiveTool'
+  'lastTurnId'
 ])
 
 function defaultPaths(homeDir = os.homedir()) {
@@ -156,7 +155,6 @@ function createLifecycleEvent(updates, config) {
     attentionReason: updates.needsAttention || null,
     pendingToolUse: updates.pendingToolUse,
     activeTool: updates.activeTool,
-    preserveActiveTool: updates.preserveActiveTool,
     requestId: updates.requestId,
     toolCallId: updates.toolCallId,
     toolUseId: updates.toolUseId,
@@ -184,14 +182,33 @@ function updateSessionDirect(config, paths, sessionId, updates) {
   const nextUpdates = Object.assign({}, updates || {})
 
   const sessionFile = sessionPath(paths, sessionId)
-  let session = readJson(sessionFile, null) || {
+  const existingSession = readJson(sessionFile, null)
+  let session = existingSession || {
     sessionId,
     agentType: adapterConfig.agentType,
-    startedAt: Date.now()
+    startedAt: Date.now(),
+    // Every event-created agent session defaults to running.
+    // session to running. This matters when the first observed hook is
+    // phase-neutral (for example a late PostToolUse); IDLE is reserved for the
+    // explicit pane-discovery transport path.
+    phase: 'running',
+    status: 'working',
+    endedAt: null,
+    needsAttention: null,
+    pendingInteraction: null,
+    activeTool: null
   }
 
   const lifecycleEvent = createLifecycleEvent(nextUpdates, adapterConfig)
   delete nextUpdates.lifecycleEvent
+
+  // Preserve the reducer no-op through persistence as well: do not create a
+  // session, merge transport metadata, rewrite files, or refresh lastUpdated.
+  if (lifecycleEvent &&
+    lifecycleEvent.type === AGENT_EVENTS.PERMISSION_RESOLVED &&
+    (!existingSession || currentPhase(existingSession) !== 'waitingForApproval')) {
+    return existingSession
+  }
 
   if (lifecycleEvent && lifecycleEvent.type === AGENT_EVENTS.SESSION_DELETE) {
     const status = readStatus(paths)

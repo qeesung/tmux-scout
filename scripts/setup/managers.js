@@ -65,7 +65,7 @@ const HOOK_MANAGERS = [
     id: 'hermes',
     flag: '--hermes',
     label: 'Hermes',
-    detail: '(~/.hermes/cli-config.yaml)',
+    detail: '(~/.hermes/config.yaml)',
     module: hermes
   },
   {

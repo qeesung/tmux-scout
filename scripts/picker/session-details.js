@@ -4,6 +4,7 @@
 const fs = require('fs')
 const path = require('path')
 const { agentDisplay } = require('../lib/agents')
+const { currentPhase } = require('../lib/session-state')
 
 const statusFile = process.argv[2] || ''
 const sessionId = process.argv[3] || ''
@@ -67,24 +68,30 @@ function shortAge(now, timestamp) {
 
 function statusLabel(session) {
   if (session.isRalphLoopIteration) return 'LOOP'
-  if (session.needsAttention) return 'WAITING'
-  if (session.status === 'working') return 'BUSY'
-  if (session.status === 'interrupted') return 'INTERRUPTED'
-  if (session.status === 'crashed') return 'CRASHED'
-  if (session.status === 'stale') return 'STALE'
-  if (session.status === 'completed') return 'DONE'
-  return 'IDLE'
+  switch (currentPhase(session)) {
+    case 'waitingForApproval':
+    case 'waitingForAnswer': return 'WAITING'
+    case 'running': return 'BUSY'
+    case 'interrupted': return 'INTERRUPTED'
+    case 'crashed': return 'CRASHED'
+    case 'stale': return 'STALE'
+    case 'completed': return 'DONE'
+    default: return 'IDLE'
+  }
 }
 
 function statusColor(session) {
   if (session.isRalphLoopIteration) return COLOR.magenta
-  if (session.needsAttention) return `${COLOR.red};${COLOR.bold}`
-  if (session.status === 'working') return COLOR.yellow
-  if (session.status === 'interrupted') return COLOR.magenta
-  if (session.status === 'crashed') return `${COLOR.red};${COLOR.bold}`
-  if (session.status === 'stale') return COLOR.gray
-  if (session.status === 'completed') return COLOR.green
-  return COLOR.blue
+  switch (currentPhase(session)) {
+    case 'waitingForApproval':
+    case 'waitingForAnswer': return `${COLOR.red};${COLOR.bold}`
+    case 'running': return COLOR.yellow
+    case 'interrupted': return COLOR.magenta
+    case 'crashed': return `${COLOR.red};${COLOR.bold}`
+    case 'stale': return COLOR.gray
+    case 'completed': return COLOR.green
+    default: return COLOR.blue
+  }
 }
 
 function phaseColor(phase) {
@@ -108,7 +115,10 @@ function phaseColor(phase) {
 }
 
 function currentActivity(session) {
-  if (session.pendingToolUse && session.pendingToolUse.details) return session.pendingToolUse.details
+  const phase = currentPhase(session)
+  const waiting = phase === 'waitingForApproval' || phase === 'waitingForAnswer'
+  if (waiting && session.pendingToolUse && session.pendingToolUse.details) return session.pendingToolUse.details
+  if (session.activeTool && session.pendingToolUse && session.pendingToolUse.details) return session.pendingToolUse.details
   if (session.activeTool) return session.activeTool
   if (session.currentActivity) return session.currentActivity
   if (session.lastEvent && session.lastEvent.details) return session.lastEvent.details
@@ -180,14 +190,15 @@ function formatHeader(session) {
 }
 
 function formatCurrent(session, now) {
-  const phase = session.phase || session.status || 'unknown'
+  const phase = currentPhase(session)
+  const waiting = phase === 'waitingForApproval' || phase === 'waitingForAnswer'
   const lines = [colorText('Current', `${COLOR.cyan};${COLOR.bold}`)]
   pushField(lines, 'phase', colorText(phase, phaseColor(phase)))
   pushField(lines, 'activity', colorText(truncateText(currentActivity(session), 120), COLOR.yellow))
-  pushField(lines, 'request', colorText(session.needsAttention, COLOR.red))
+  pushField(lines, 'request', colorText(waiting ? session.needsAttention : null, COLOR.red))
   pushField(lines, 'ralph', colorText(ralphLoopDetail(session), COLOR.magenta))
-  pushField(lines, 'pending', colorText(pendingInteractionDetail(session.pendingInteraction), COLOR.red))
-  pushField(lines, 'evidence', pendingInteractionEvidence(session.pendingInteraction, now))
+  pushField(lines, 'pending', colorText(waiting ? pendingInteractionDetail(session.pendingInteraction) : null, COLOR.red))
+  pushField(lines, 'evidence', waiting ? pendingInteractionEvidence(session.pendingInteraction, now) : null)
   pushField(lines, 'updated', updatedLine(session, now))
   return lines
 }

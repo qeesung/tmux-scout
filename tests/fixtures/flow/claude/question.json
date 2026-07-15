@@ -1,0 +1,53 @@
+{
+  "name": "claude AskUserQuestion waits only on PermissionRequest",
+  "agent": "claude",
+  "sessionId": "fixture-claude-question",
+  "payloadDefaults": {
+    "session_id": "fixture-claude-question",
+    "cwd": "/tmp/tmux-scout-fixtures/claude"
+  },
+  "steps": [
+    {
+      "payload": {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "ask before continuing"
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "AskUserQuestion",
+        "tool_input": {
+          "questions": [
+            { "question": "Continue?" }
+          ]
+        }
+      }
+    },
+    {
+      "payload": {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "AskUserQuestion",
+        "tool_input": {
+          "questions": [
+            { "question": "Continue?" }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "agentType": "claude",
+    "status": "working",
+    "phase": "waitingForAnswer",
+    "needsAttention": "waiting for answer",
+    "pendingInteraction.type": "question",
+    "pendingInteraction.tool": "AskUserQuestion",
+    "activeTool": "AskUserQuestion"
+  },
+  "expectEvidenceTypes": [
+    "prompt_submit",
+    "tool_use",
+    "question_asked"
+  ]
+}

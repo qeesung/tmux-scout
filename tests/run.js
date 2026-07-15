@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 
 const assert = require('assert')
-const { execFileSync } = require('child_process')
+const { execFileSync, spawn } = require('child_process')
 const fs = require('fs')
 const net = require('net')
 const os = require('os')
 const path = require('path')
+const TOML = require('../scripts/vendor/iarna-toml/toml')
 
 const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, splitJsonlLines } = require('../scripts/lib/jsonl-tail-reader')
-const { applySessionEvent, currentPhase, PROTECTED_PHASE_MS } = require('../scripts/lib/session-state')
+const { applySessionEvent, currentPhase } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
 const { compareSessions, formatLine, getActiveSessions } = require('../scripts/picker/render')
 const { recordAccess, readAccessTimes } = require('../scripts/lib/access-history')
@@ -35,12 +36,8 @@ const {
   validateSessionSnapshot
 } = require('../scripts/lib/session-contract')
 const { collectFixtureFiles, runFlowFixture, validateFixtureExpectations } = require('../scripts/lib/flow-fixtures')
-const {
-  findLatestCodexInterrupt,
-  findLatestCodexPlanWait,
-  findLatestCodexOpenTurnActivity
-} = require('../scripts/lib/codex-transcript-detector')
-const { DEFAULT_TERMINAL_DISPLAY_MS } = require('../scripts/lib/session-registry')
+const { findLatestCodexInterrupt, findLatestCodexTurnEnd } = require('../scripts/lib/codex-transcript-detector')
+const { DEFAULT_STALE_SESSION_MS, DEFAULT_TERMINAL_DISPLAY_MS } = require('../scripts/lib/session-registry')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
 const statusBar = require('../scripts/status-bar')
 const sync = require('../scripts/picker/sync')
@@ -51,7 +48,7 @@ const { HOOK_EVENTS: TRAEX_HOOK_EVENTS } = require('../scripts/setup/traex')
 const { HOOK_MANAGERS, selectManagers, checkManagerHealth } = require('../scripts/setup/managers')
 const claudeHook = require('../scripts/hooks/claude')
 const codexHook = require('../scripts/hooks/codex')
-const { backgroundShellDetails, isBackgroundShellRunningText } = require('../scripts/lib/background-activity')
+const codexSetup = require('../scripts/setup/codex')
 
 const tests = []
 
@@ -74,14 +71,36 @@ function runHook(scriptRelativePath, payload, homeDir) {
   })
 }
 
-function runGenericHook(agent, payload, homeDir, extraArgs = []) {
+function runGenericHook(agent, payload, homeDir, extraArgs = [], tmuxPane = '%1') {
   execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts/hooks/generic.js'), '--agent', agent, ...extraArgs], {
     input: JSON.stringify(payload),
     env: Object.assign({}, process.env, {
       HOME: homeDir,
-      TMUX_PANE: '%1'
+      TMUX_PANE: tmuxPane
     }),
     stdio: ['pipe', 'ignore', 'pipe']
+  })
+}
+
+function runGenericHookAsync(agent, payload, homeDir, extraArgs = []) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'scripts/hooks/generic.js'), '--agent', agent, ...extraArgs], {
+      env: Object.assign({}, process.env, {
+        HOME: homeDir,
+        TMUX_PANE: '%1',
+        TMUX_SCOUT_BRIDGE: '0'
+      }),
+      stdio: ['pipe', 'ignore', 'pipe']
+    })
+    let stderr = ''
+    child.stderr.setEncoding('utf-8')
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.on('error', reject)
+    child.on('close', code => {
+      if (code === 0) resolve()
+      else reject(new Error(`generic hook exited ${code}: ${stderr}`))
+    })
+    child.stdin.end(JSON.stringify(payload))
   })
 }
 
@@ -252,77 +271,35 @@ test('codex transcript detector matches interrupted turns by id or timestamp', (
   }
 })
 
-test('codex transcript detector matches plan waits from Plan item task completion', () => {
+test('codex transcript detector matches structured task completion for the exact turn', () => {
   const dir = tempDir()
   try {
-    const file = path.join(dir, 'codex-plan.jsonl')
+    const file = path.join(dir, 'codex-completed.jsonl')
     fs.writeFileSync(file, [
       JSON.stringify({
         type: 'event_msg',
         timestamp: new Date(1000).toISOString(),
-        payload: {
-          type: 'item_completed',
-          thread_id: 'thread-1',
-          turn_id: 'turn-plan',
-          item: { type: 'Plan', id: 'plan-item', text: '# Implement fix\n\n- Step 1' }
-        }
+        payload: { type: 'task_complete', turn_id: 'old-turn', last_agent_message: 'old result' }
       }),
       JSON.stringify({
         type: 'event_msg',
         timestamp: new Date(2000).toISOString(),
-        payload: { type: 'task_complete', turn_id: 'turn-plan', completed_at: 2 }
+        payload: { type: 'agent_message', turn_id: 'current-turn', message: 'not terminal' }
       }),
       JSON.stringify({
         type: 'event_msg',
         timestamp: new Date(3000).toISOString(),
-        payload: { type: 'task_complete', turn_id: 'ordinary-turn', completed_at: 3 }
+        payload: { type: 'task_complete', turn_id: 'current-turn', last_agent_message: 'current result' }
       })
     ].join('\n') + '\n')
 
-    const hit = findLatestCodexPlanWait(file, { expectTurnId: 'turn-plan' })
-    assert.strictEqual(hit.turnId, 'turn-plan')
-    assert.strictEqual(hit.planId, 'plan-item')
-    assert.strictEqual(hit.completedAtMs, 2000)
-    assert.match(hit.rawEventName, /item_completed:Plan\/task_complete/)
-    assert.strictEqual(findLatestCodexPlanWait(file, { expectTurnId: 'ordinary-turn' }), null)
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('codex transcript detector finds open turn activity but ignores completed turns', () => {
-  const dir = tempDir()
-  try {
-    const file = path.join(dir, 'codex-open-turn.jsonl')
-    fs.writeFileSync(file, [
-      JSON.stringify({
-        type: 'response_item',
-        timestamp: new Date(1000).toISOString(),
-        payload: {
-          type: 'message',
-          internal_chat_message_metadata_passthrough: { turn_id: 'old-turn' }
-        }
-      }),
-      JSON.stringify({
-        type: 'event_msg',
-        timestamp: new Date(2000).toISOString(),
-        payload: { type: 'task_complete', turn_id: 'old-turn' }
-      }),
-      JSON.stringify({
-        type: 'response_item',
-        timestamp: new Date(3000).toISOString(),
-        payload: {
-          type: 'function_call',
-          name: 'exec_command',
-          internal_chat_message_metadata_passthrough: { turn_id: 'new-turn' }
-        }
-      })
-    ].join('\n') + '\n')
-
-    const hit = findLatestCodexOpenTurnActivity(file, { minTimestampMs: 0 })
-    assert.strictEqual(hit.turnId, 'new-turn')
-    assert.strictEqual(hit.timestampMs, 3000)
-    assert.strictEqual(findLatestCodexOpenTurnActivity(file, { expectTurnId: 'old-turn' }), null)
+    const hit = findLatestCodexTurnEnd(file, { expectTurnId: 'current-turn' })
+    assert.strictEqual(hit.turnId, 'current-turn')
+    assert.strictEqual(hit.completedAtMs, 3000)
+    assert.strictEqual(hit.completionKind, 'completed')
+    assert.strictEqual(hit.rawEventName, 'task_complete')
+    assert.strictEqual(hit.lastAgentMessage, 'current result')
+    assert.strictEqual(findLatestCodexTurnEnd(file, { expectTurnId: 'missing-turn' }), null)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -355,6 +332,34 @@ test('setup manager registry selects agent managers by flags', () => {
   assert.deepStrictEqual(selectManagers(new Set(['--trae'])).map(manager => manager.id), ['coco'])
   assert.deepStrictEqual(selectManagers(new Set(['--coco'])).map(manager => manager.id), ['coco'])
   assert.deepStrictEqual(selectManagers(new Set(['--traex'])).map(manager => manager.id), ['traex'])
+})
+
+test('setup commands run from a clean plugin tree without package installation', () => {
+  const dir = tempDir()
+  try {
+    const pluginDir = path.join(dir, 'plugin')
+    const homeDir = path.join(dir, 'home')
+    const settingsFile = path.join(homeDir, '.claude', 'settings.json')
+    fs.cpSync(path.join(__dirname, '..', 'scripts'), path.join(pluginDir, 'scripts'), { recursive: true })
+    fs.mkdirSync(path.dirname(settingsFile), { recursive: true })
+    fs.writeFileSync(settingsFile, '{}\n')
+
+    assert.strictEqual(fs.existsSync(path.join(pluginDir, 'node_modules')), false)
+    execFileSync(process.execPath, [path.join(pluginDir, 'scripts', 'setup.js'), 'install', '--claude'], {
+      env: Object.assign({}, process.env, { HOME: homeDir }),
+      stdio: ['ignore', 'ignore', 'pipe']
+    })
+    execFileSync(process.execPath, [path.join(pluginDir, 'scripts', 'setup.js'), 'status', '--claude'], {
+      env: Object.assign({}, process.env, { HOME: homeDir }),
+      stdio: ['ignore', 'ignore', 'pipe']
+    })
+
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'))
+    assert.ok(settings.hooks)
+    assert.ok(settings.hooks.SessionStart)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('setup manager health normalizes partial hook states', () => {
@@ -586,7 +591,9 @@ test('Hermes setup manager preserves unrelated YAML and hooks', () => {
     assert.ok(installed.includes('--agent'))
     assert.ok(installed.includes('hermes'))
     assert.ok(installed.includes('on_session_start:'))
-    assert.ok(installed.includes('timeout: 600'))
+    assert.ok(installed.includes('hooks_auto_accept: true'))
+    assert.ok(installed.includes('timeout: 300'))
+    assert.ok(!installed.includes('subagent_start:'))
     assert.ok(installed.includes('theme: dark'))
     assert.ok(installed.indexOf('on_session_start:') < installed.indexOf('theme: dark'))
 
@@ -626,7 +633,7 @@ test('Hermes setup manager appends to commented existing event headers', () => {
     assert.ok(eventBlock.includes('command: "echo keep"'))
     assert.ok(eventBlock.includes('--agent'))
     assert.ok(eventBlock.includes('hermes'))
-    assert.ok(eventBlock.includes('timeout: 600'))
+    assert.ok(eventBlock.includes('timeout: 300'))
 
     runScript('scripts/setup/hermes.js', ['uninstall'], dir)
     const removed = fs.readFileSync(settingsPath, 'utf-8')
@@ -666,9 +673,38 @@ test('Hermes setup manager preserves YAML without hooks and trailing newline', (
     runScript('scripts/setup/hermes.js', ['install'], dir)
 
     const installed = fs.readFileSync(settingsPath, 'utf-8')
-    assert.ok(installed.startsWith('model: hermes-3\n\nhooks:\n'))
+    assert.ok(installed.includes('hooks_auto_accept: true'))
+    assert.ok(installed.includes('model: hermes-3'))
+    assert.ok(installed.includes('hooks:\n'))
     assert.ok(installed.includes('--agent'))
     assert.ok(installed.includes('hermes'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes setup installs canonical config and only cleans legacy cli-config', () => {
+  const dir = tempDir()
+  try {
+    const legacyPath = path.join(dir, '.hermes', 'cli-config.yaml')
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true })
+    fs.writeFileSync(legacyPath, [
+      'hooks:',
+      '  pre_llm_call:',
+      '    - command: "echo keep"',
+      `    - command: "node ${path.join(__dirname, '..', 'scripts/hooks/generic.js')} --agent hermes"`
+    ].join('\n') + '\n')
+
+    runScript('scripts/setup/hermes.js', ['install'], dir)
+    const canonicalPath = path.join(dir, '.hermes', 'config.yaml')
+    const canonical = fs.readFileSync(canonicalPath, 'utf-8')
+    const legacy = fs.readFileSync(legacyPath, 'utf-8')
+    assert.ok(canonical.includes('hooks_auto_accept: true'))
+    assert.ok(canonical.includes('timeout: 300'))
+    assert.ok(canonical.includes('subagent_stop:'))
+    assert.ok(!canonical.includes('subagent_start:'))
+    assert.ok(legacy.includes('command: "echo keep"'))
+    assert.ok(!legacy.includes('--agent hermes'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -975,6 +1011,47 @@ test('OpenCode setup status rejects stale plugin hook paths', () => {
       error = caught
     }
     assert.ok(error, 'broken OpenCode plugin should not satisfy --any status')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode managed plugin carries exact child filtering and archive lifecycle logic', () => {
+  const dir = tempDir()
+  try {
+    runScript('scripts/setup/opencode.js', ['install'], dir)
+    const pluginFile = path.join(dir, '.config', 'opencode', 'plugins', 'tmux-scout-opencode-plugin.js')
+    const content = fs.readFileSync(pluginFile, 'utf-8')
+    assert.ok(content.includes('version: v2'))
+    assert.ok(content.includes('const childSessions = new Set()'))
+    assert.ok(content.includes('p.part.state?.metadata?.sessionId'))
+    assert.ok(content.includes('p.info?.parentID'))
+    assert.ok(content.includes('childSessions.has(p.sessionID)'))
+    assert.ok(content.includes('p.info.time?.archived'))
+    assert.ok(content.includes('makePayload("SessionEnd"'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode setup accepts JSONC comments and trailing commas', () => {
+  const dir = tempDir()
+  try {
+    const configPath = path.join(dir, '.config', 'opencode', 'opencode.json')
+    fs.mkdirSync(path.dirname(configPath), { recursive: true })
+    fs.writeFileSync(configPath, [
+      '{',
+      '  // OpenCode accepts JSONC',
+      '  "server": "https://example.com/a//b",',
+      '  "labels": ["text,]inside",],',
+      '}'
+    ].join('\n'))
+
+    runScript('scripts/setup/opencode.js', ['install'], dir)
+    const installed = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+    assert.strictEqual(installed.server, 'https://example.com/a//b')
+    assert.deepStrictEqual(installed.labels, ['text,]inside'])
+    assert.ok(installed.plugin.some(ref => ref.includes('tmux-scout-opencode-plugin.js')))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -1389,6 +1466,8 @@ test('sync discovers tmux agent panes without an existing hook snapshot', () => 
   assert.strictEqual(session.phase, SESSION_PHASES.IDLE)
   assert.strictEqual(session.status, 'idle')
   assert.strictEqual(session.stateSource, 'pane-discovery')
+  assert.strictEqual(isVisibleInPicker(session), 'hidden')
+  assert.deepStrictEqual(getActiveSessions(status, panes), [])
   assert.strictEqual(session.stateEvidence[0].rawEventName, 'tmux_pane_discovered')
   assert.strictEqual(stats.reconcile.paneDiscoveries, 1)
 
@@ -1654,6 +1733,46 @@ test('bridge server applies session delete events to the registry', async () => 
   }
 })
 
+test('hook persistence keeps redundant permission resolution byte-for-byte inert', async () => {
+  const dir = tempDir()
+  try {
+    const paths = defaultPaths(dir)
+    const context = createHookContext({
+      agentType: 'codex',
+      defaultStateSource: 'codex-hooks',
+      paths
+    })
+    context.updateSession('resolver-persisted', {
+      status: 'working',
+      lastHookEventName: 'UserPromptSubmit',
+      lastUserPrompt: 'run tests',
+      lastEvent: { type: AGENT_EVENTS.PROMPT_SUBMIT, timestamp: 1000, details: 'run tests' }
+    })
+    await context.flush()
+
+    const sessionFile = path.join(paths.sessionsDir, 'resolver-persisted.json')
+    const beforeSession = fs.readFileSync(sessionFile, 'utf-8')
+    const beforeStatus = fs.readFileSync(paths.statusFile, 'utf-8')
+
+    context.updateSession('resolver-persisted', {
+      status: 'completed',
+      lastHookEventName: 'PostToolUse',
+      lastEvent: { type: AGENT_EVENTS.PERMISSION_RESOLVED, timestamp: 9000, details: 'duplicate' }
+    })
+    context.updateSession('resolver-ghost', {
+      lastHookEventName: 'PostToolUse',
+      lastEvent: { type: AGENT_EVENTS.PERMISSION_RESOLVED, timestamp: 9000, details: 'orphan' }
+    })
+    await context.flush()
+
+    assert.strictEqual(fs.readFileSync(sessionFile, 'utf-8'), beforeSession)
+    assert.strictEqual(fs.readFileSync(paths.statusFile, 'utf-8'), beforeStatus)
+    assert.strictEqual(fs.existsSync(path.join(paths.sessionsDir, 'resolver-ghost.json')), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('agent event aliases normalize to persisted event names', () => {
   assert.strictEqual(normalizeAgentEventType('sessionStarted'), AGENT_EVENTS.SESSION_START)
   assert.strictEqual(normalizeAgentEventType('toolUseStarted'), AGENT_EVENTS.TOOL_USE)
@@ -1661,7 +1780,12 @@ test('agent event aliases normalize to persisted event names', () => {
   assert.strictEqual(normalizeAgentEventType('sessionDeleted'), AGENT_EVENTS.SESSION_DELETE)
   assert.strictEqual(normalizeAgentEventType('permissionResolved'), AGENT_EVENTS.PERMISSION_RESOLVED)
   assert.strictEqual(normalizeAgentEventType('questionAnswered'), AGENT_EVENTS.QUESTION_ANSWERED)
+  assert.strictEqual(normalizeAgentEventType('activityUpdated'), AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
+  assert.strictEqual(normalizeAgentEventType('processDetached'), AGENT_EVENTS.PROCESS_DETACHED)
   assert.strictEqual(normalizeAgentEventType(AGENT_EVENTS.PERMISSION_REQUEST), AGENT_EVENTS.PERMISSION_REQUEST)
+  assert.strictEqual(createAgentEvent({ type: 'sessionCompleted', isSessionEnd: false }).type, AGENT_EVENTS.STOP)
+  assert.strictEqual(createAgentEvent({ type: 'sessionCompleted', isSessionEnd: true }).type, AGENT_EVENTS.SESSION_END)
+  assert.strictEqual(createAgentEvent({ type: 'sessionCompleted' }).preserveSessionEnd, true)
 })
 
 test('agent events normalize source metadata for reducer evidence', () => {
@@ -1682,8 +1806,36 @@ test('agent events normalize source metadata for reducer evidence', () => {
   assert.strictEqual(event.timestamp, new Date('2026-01-01T00:00:00.000Z').getTime())
 })
 
+test('canonical sessionCompleted distinguishes true, false, and omitted end flags', () => {
+  const session = { sessionId: 'canonical-completion-end-bit', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, createAgentEvent({
+    type: 'sessionCompleted',
+    isSessionEnd: true,
+    source: 'hook',
+    timestamp: 1100
+  }))
+  assert.strictEqual(currentPhase(session), 'completed')
+  assert.strictEqual(session.endedAt, 1100)
+
+  applySessionEvent(session, createAgentEvent({
+    type: 'sessionCompleted',
+    source: 'hook',
+    timestamp: 1200
+  }))
+  assert.strictEqual(session.endedAt, 1100, 'omitted isSessionEnd inherits the ended bit')
+
+  applySessionEvent(session, createAgentEvent({
+    type: 'sessionCompleted',
+    isSessionEnd: false,
+    source: 'hook',
+    timestamp: 1300
+  }))
+  assert.strictEqual(session.endedAt, null, 'explicit false clears the ended bit')
+})
+
 test('session contract maps events to canonical phases', () => {
   assert.strictEqual(statusForPhase(SESSION_PHASES.WAITING_FOR_APPROVAL), 'working')
+  assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.SESSION_START }), SESSION_PHASES.RUNNING)
   assert.strictEqual(phaseFromLegacyStatus('crashed', 'waiting for approval'), SESSION_PHASES.CRASHED)
   assert.strictEqual(phaseFromLegacyStatus('stale', 'waiting for answer'), SESSION_PHASES.STALE)
   assert.strictEqual(phaseFromLegacyStatus('interrupted', 'waiting for approval'), SESSION_PHASES.INTERRUPTED)
@@ -1693,6 +1845,7 @@ test('session contract maps events to canonical phases', () => {
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.PANE_STATE, status: 'crashed', needsAttention: 'waiting for approval' }), SESSION_PHASES.CRASHED)
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.TRANSCRIPT_STATUS, needsAttention: 'waiting for answer' }), SESSION_PHASES.WAITING_FOR_ANSWER)
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.PROCESS_EXIT_DETECTED }), SESSION_PHASES.INTERRUPTED)
+  assert.strictEqual(phaseForAgentEvent({ type: 'processDetached' }), undefined)
   assert.strictEqual(phaseForAgentEvent({ type: AGENT_EVENTS.SESSION_DELETE }), undefined)
 
   const valid = validateAgentEvent(createAgentEvent('toolUseStarted', {
@@ -1728,7 +1881,7 @@ test('session contract validates factual state invariants', () => {
     phase: SESSION_PHASES.WAITING_FOR_APPROVAL,
     status: 'working',
     needsAttention: 'waiting for approval',
-    activeTool: null,
+    activeTool: 'Bash',
     pendingInteraction: {
       type: 'approval',
       phase: SESSION_PHASES.WAITING_FOR_APPROVAL,
@@ -1788,6 +1941,10 @@ test('session contract computes phase-based picker visibility', () => {
 
   // A finished turn with endedAt is hidden even if a pane is still bound.
   assert.strictEqual(isVisibleInPicker({ phase: 'completed', endedAt: recent, tmuxPane: '%1' }, { now }), 'hidden')
+  // The protocol keeps a separate isSessionEnded flag. A late activity event may
+  // update phase, but it cannot resurrect the row until a new turn starts.
+  assert.strictEqual(isVisibleInPicker({ phase: 'running', endedAt: recent, tmuxPane: '%1' }, { now }), 'hidden')
+  assert.strictEqual(isVisibleInPicker({ phase: 'waitingForApproval', endedAt: recent }, { now }), 'visible')
 
   // Legacy status-only snapshots resolve through phaseFromLegacyStatus.
   assert.strictEqual(isVisibleInPicker({ status: 'working' }, { now }), 'visible')
@@ -2032,6 +2189,61 @@ test('picker rows omit duplicated generic wait details', () => {
   assert.ok(!line.includes('waiting for answer: waiting for answer'), line)
 })
 
+test('picker ignores stale wait fields when canonical phase says BUSY or DONE', () => {
+  const now = Date.now()
+  const pane = {
+    paneId: '%1',
+    panePid: process.pid,
+    currentCommand: 'node',
+    paneDead: false,
+    windowName: 'main'
+  }
+  const running = {
+    sessionId: 'canonical-busy',
+    agentType: 'codex',
+    phase: 'running',
+    status: 'completed',
+    needsAttention: 'waiting for approval',
+    pendingInteraction: {
+      type: 'approval',
+      phase: 'waitingForApproval',
+      reason: 'waiting for approval'
+    },
+    pendingToolUse: { tool: 'Bash', details: 'Bash: stale-running-detail', timestamp: now - 5000 },
+    tmuxPane: '%1',
+    lastUpdated: now - 1000,
+    _tmuxPaneSnapshot: pane
+  }
+  const staleDone = {
+    sessionId: 'canonical-done',
+    agentType: 'codex',
+    phase: 'completed',
+    status: 'working',
+    needsAttention: 'waiting for answer',
+    pendingToolUse: { tool: 'Read', details: 'Read: stale-done-detail', timestamp: now - 5000 },
+    tmuxPane: '%1',
+    lastUpdated: now,
+    _tmuxPaneSnapshot: pane
+  }
+
+  const busyLine = stripAnsi(formatLine(running, now, '%9'))
+  const doneLine = stripAnsi(formatLine(staleDone, now, '%9'))
+  assert.ok(busyLine.includes('BUSY'), busyLine)
+  assert.ok(!busyLine.includes('W:APP'), busyLine)
+  assert.ok(!busyLine.includes('stale-running-detail'), busyLine)
+  assert.ok(doneLine.includes('DONE'), doneLine)
+  assert.ok(!doneLine.includes('W:ANS'), doneLine)
+  assert.ok(!doneLine.includes('stale-done-detail'), doneLine)
+
+  const busyDetails = stripAnsi(formatSessionDetails(running, { now }))
+  const doneDetails = stripAnsi(formatSessionDetails(staleDone, { now }))
+  assert.ok(!busyDetails.includes('stale-running-detail'), busyDetails)
+  assert.ok(!doneDetails.includes('stale-done-detail'), doneDetails)
+
+  const active = getActiveSessions({ sessions: { running, staleDone } }, new Map([['%1', pane]]))
+  assert.deepStrictEqual(active.map(session => session.sessionId), ['canonical-busy'])
+})
+
 test('picker ordering: unvisited-but-recent session floats above stale prior visits', () => {
   const now = Date.now()
   const sessions = [
@@ -2227,6 +2439,49 @@ test('status bar treats canonical WAIT phase as wait even with stale legacy stat
   assert.strictEqual(counts.busy, 0)
 })
 
+test('status bar never lets stale legacy fields override canonical phase', () => {
+  const counts = statusBar.summarizeSessions([
+    {
+      phase: 'completed',
+      status: 'working',
+      needsAttention: 'waiting for answer',
+      pendingInteraction: { type: 'question' }
+    },
+    {
+      phase: 'running',
+      status: 'completed',
+      needsAttention: 'waiting for plan approval',
+      pendingInteraction: { type: 'plan' }
+    },
+    {
+      phase: 'idle',
+      status: 'working',
+      needsAttention: 'waiting for approval'
+    },
+    {
+      phase: 'waitingForAnswer',
+      status: 'completed',
+      pendingInteraction: { type: 'approval' }
+    },
+    {
+      phase: 'waitingForApproval',
+      status: 'completed',
+      pendingInteraction: { type: 'question' }
+    }
+  ])
+
+  assert.deepStrictEqual(counts, {
+    wait: 2,
+    busy: 1,
+    done: 1,
+    idle: 1,
+    approval: 1,
+    question: 1,
+    plan: 0,
+    total: 5
+  })
+})
+
 test('status bar keeps compact default output clickable', () => {
   const output = statusBar.renderStatusBar({
     wait: 1,
@@ -2340,6 +2595,30 @@ test('session details render as an information panel', () => {
   assert.ok(plain.includes('PermissionRequest'))
 })
 
+test('session details derive the headline from canonical phase', () => {
+  const running = stripAnsi(formatSessionDetails({
+    sessionId: 'details-running',
+    agentType: 'codex',
+    phase: 'running',
+    status: 'idle',
+    needsAttention: 'waiting for approval',
+    lastUpdated: 1000
+  }, { now: 2000 }))
+  assert.ok(running.includes('BUSY'))
+  assert.ok(!running.includes('WAITING'))
+
+  const waiting = stripAnsi(formatSessionDetails({
+    sessionId: 'details-waiting',
+    agentType: 'codex',
+    phase: 'waitingForAnswer',
+    status: 'completed',
+    needsAttention: null,
+    lastUpdated: 1000
+  }, { now: 2000 }))
+  assert.ok(waiting.includes('WAITING'))
+  assert.ok(!waiting.includes('DONE'))
+})
+
 test('debug CLI injects mock sessions and prints evidence', () => {
   const dir = tempDir()
   try {
@@ -2415,6 +2694,123 @@ test('generic hook tracks Gemini prompt, tool and completion events', () => {
   }
 })
 
+test('generic SessionStart shells never surface as semantic IDLE rows', () => {
+  const cases = [
+    ['gemini', 'SessionStart'],
+    ['kimi', 'SessionStart'],
+    ['copilot-cli', 'sessionStart'],
+    ['opencode', 'SessionStart'],
+    ['cursor', 'sessionStart'],
+    ['coco', 'session_start'],
+    ['traex', 'SessionStart'],
+    ['hermes', 'on_session_start']
+  ]
+  for (const [agent, eventName] of cases) {
+    const dir = tempDir()
+    try {
+      const sessionId = `${agent}-unconfirmed-shell`
+      runGenericHook(agent, {
+        hook_event_name: eventName,
+        session_id: sessionId,
+        conversation_id: sessionId,
+        cwd: '/tmp/demo'
+      }, dir)
+      const statusPath = path.join(dir, '.tmux-scout', 'status.json')
+      if (!fs.existsSync(statusPath)) continue
+      const status = readScoutStatus(dir)
+      assert.deepStrictEqual(getActiveSessions(status, new Map()), [], agent)
+      if (status.sessions[sessionId]) {
+        assert.notStrictEqual(currentPhase(status.sessions[sessionId]), 'idle', agent)
+        assert.strictEqual(isVisibleInPicker(status.sessions[sessionId]), 'hidden', agent)
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('first phase-neutral hook event inherits the running default, never IDLE', () => {
+  const cases = [
+    ['cursor', { hook_event_name: 'postToolUse', conversation_id: 'cursor-first-post', tool_name: 'ReadFile' }, 'cursor-first-post'],
+    ['opencode', { hook_event_name: 'PostToolUse', session_id: 'opencode-first-post', tool_name: 'Read' }, 'opencode-first-post']
+  ]
+  for (const [agent, payload, sessionId] of cases) {
+    const dir = tempDir()
+    try {
+      runGenericHook(agent, Object.assign({ cwd: '/tmp/demo' }, payload), dir)
+      const session = readScoutStatus(dir).sessions[sessionId]
+      assert.strictEqual(currentPhase(session), 'running', agent)
+      assert.strictEqual(session.status, 'working', agent)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('Gemini ordinary completion cannot plant latent DONE behind ToolPermission WAIT', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'gemini-wait-completion'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'BeforeAgent',
+      prompt: 'guard this tool'
+    }), dir)
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'Notification',
+      notification_type: 'ToolPermission',
+      details: { type: 'tool', title: 'Shell' }
+    }), dir)
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'BeforeTool',
+      tool_name: 'ReadFile'
+    }), dir)
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'AfterAgent',
+      prompt_response: 'waiting'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.deferredCompletion, null)
+
+    runGenericHook('gemini', Object.assign({}, base, {
+      hook_event_name: 'AfterTool',
+      tool_name: 'ReadFile'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Gemini PreCompress activity makes DONE BUSY and keeps WAIT sticky', () => {
+  const dir = tempDir()
+  try {
+    const doneId = 'gemini-precompress-done'
+    const doneBase = { session_id: doneId, cwd: '/tmp/demo' }
+    runGenericHook('gemini', Object.assign({}, doneBase, { hook_event_name: 'BeforeAgent', prompt: 'finish' }), dir)
+    runGenericHook('gemini', Object.assign({}, doneBase, { hook_event_name: 'AfterAgent' }), dir)
+    runGenericHook('gemini', Object.assign({}, doneBase, { hook_event_name: 'PreCompress' }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[doneId]), 'running')
+
+    const waitId = 'gemini-precompress-wait'
+    const waitBase = { session_id: waitId, cwd: '/tmp/demo' }
+    runGenericHook('gemini', Object.assign({}, waitBase, { hook_event_name: 'BeforeAgent', prompt: 'ask' }), dir)
+    runGenericHook('gemini', Object.assign({}, waitBase, {
+      hook_event_name: 'Notification',
+      notification_type: 'ToolPermission',
+      details: { type: 'tool', title: 'Shell' }
+    }), dir)
+    runGenericHook('gemini', Object.assign({}, waitBase, { hook_event_name: 'PreCompress' }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[waitId]), 'waitingForApproval')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('generic hook treats capitalized Kimi tools as permission requests', () => {
   const dir = tempDir()
   try {
@@ -2440,6 +2836,143 @@ test('generic hook treats capitalized Kimi tools as permission requests', () => 
   }
 })
 
+test('Kimi keeps WAIT across parallel native approvals and unrelated low-risk tools', async () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'kimi-parallel-approvals'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run two guarded tools'
+    }), dir)
+
+    await Promise.all([
+      runGenericHookAsync('kimi', Object.assign({}, base, {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Shell',
+        tool_call_id: 'kimi-call-a',
+        tool_input: { command: 'npm test' }
+      }), dir),
+      runGenericHookAsync('kimi', Object.assign({}, base, {
+        hook_event_name: 'PreToolUse',
+        tool_name: 'WriteFile',
+        tool_call_id: 'kimi-call-b',
+        tool_input: { path: '/tmp/demo/a.txt', content: 'a' }
+      }), dir)
+    ])
+
+    const markerDir = path.join(dir, '.tmux-scout', 'run', 'kimi-hooks', 'active-native-approvals', sessionId)
+    assert.strictEqual(fs.readdirSync(markerDir).filter(name => name.endsWith('.approval')).length, 2)
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'ReadFile',
+      tool_call_id: 'kimi-read',
+      tool_input: { path: '/tmp/demo/a.txt' }
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Shell',
+      tool_call_id: 'kimi-call-a'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(fs.readdirSync(markerDir).filter(name => name.endsWith('.approval')).length, 1)
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'WriteFile',
+      tool_call_id: 'kimi-call-b'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(fs.existsSync(markerDir), true)
+    assert.deepStrictEqual(fs.readdirSync(markerDir), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Kimi discards stale approval markers when a new turn starts', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'kimi-new-turn-clears-approval'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    const markerDir = path.join(dir, '.tmux-scout', 'run', 'kimi-hooks', 'active-native-approvals', sessionId)
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'first turn'
+    }), dir)
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Shell',
+      tool_call_id: 'stale-call',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    assert.deepStrictEqual(fs.readdirSync(markerDir), ['stale-call.approval'])
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'second turn'
+    }), dir)
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(fs.existsSync(markerDir), false)
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Shell',
+      tool_call_id: 'current-call',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Shell',
+      tool_call_id: 'current-call'
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.deepStrictEqual(fs.readdirSync(markerDir), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Kimi AskUserQuestion clears only on its matching PostToolUse', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'kimi-question-approval'
+    const base = { session_id: sessionId, cwd: '/tmp/demo', tool_call_id: 'kimi-question-call' }
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Continue?' }] }
+    }), dir)
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+
+    runGenericHook('kimi', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'AskUserQuestion'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('generic hook treats mutating Copilot tools as permission requests', () => {
   const dir = tempDir()
   try {
@@ -2448,7 +2981,7 @@ test('generic hook treats mutating Copilot tools as permission requests', () => 
       hook_event_name: 'preToolUse',
       session_id: sessionId,
       cwd: '/tmp/demo',
-      tool_name: 'Bash',
+      tool_name: 'WriteBash',
       tool_input: { command: 'npm test' }
     }, dir)
 
@@ -2456,11 +2989,59 @@ test('generic hook treats mutating Copilot tools as permission requests', () => 
     assert.strictEqual(session.agentType, 'copilot-cli')
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
-    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
+    assert.strictEqual(session.pendingToolUse.tool, 'WriteBash')
     assert.strictEqual(session.pendingInteraction.type, 'approval')
     assert.strictEqual(session.pendingInteraction.source, 'hook')
-    assert.strictEqual(session.pendingInteraction.tool, 'Bash')
+    assert.strictEqual(session.pendingInteraction.tool, 'WriteBash')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Copilot normalized read-only tool names never create fake WAIT', () => {
+  const readOnlyTools = [
+    'bash', 'powershell', 'read_bash', 'read_powershell', 'list_bash',
+    'list_powershell', 'read_agent', 'list_agents', 'report_intent', 'rg'
+  ]
+  for (const toolName of readOnlyTools) {
+    const dir = tempDir()
+    try {
+      const sessionId = `copilot-readonly-${toolName}`
+      runGenericHook('copilot-cli', {
+        hook_event_name: 'preToolUse',
+        session_id: sessionId,
+        cwd: '/tmp/demo',
+        tool_name: toolName,
+        toolArgs: '{}'
+      }, dir)
+      const session = readScoutStatus(dir).sessions[sessionId]
+      assert.strictEqual(currentPhase(session), 'running', toolName)
+      assert.strictEqual(session.pendingInteraction, null, toolName)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('Copilot subagentStop is activity and reopens DONE as BUSY', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'copilot-subagent-stop'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'userPromptSubmitted',
+      prompt: 'delegate work'
+    }), dir)
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'agentStop'
+    }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[sessionId]), 'completed')
+
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'subagentStop'
+    }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[sessionId]), 'running')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2495,6 +3076,27 @@ test('generic hook tracks Cursor prompt, shell and stop events', () => {
     assert.strictEqual(session.sessionTitle, 'ship cursor support')
     assert.strictEqual(session.lastAssistantMessage, 'done')
     assert.strictEqual(session.pendingToolUse, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Cursor afterAgentResponse with text completes the turn exactly', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'cursor-agent-response'
+    const base = { conversation_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('cursor', Object.assign({}, base, {
+      hook_event_name: 'beforeSubmitPrompt',
+      prompt: 'answer me'
+    }), dir)
+    runGenericHook('cursor', Object.assign({}, base, {
+      hook_event_name: 'afterAgentResponse',
+      text: 'done'
+    }), dir)
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.lastAssistantMessage, 'done')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2590,16 +3192,22 @@ test('generic hook does not reopen Trae completion idle notifications as waits',
     assert.strictEqual(currentPhase(session), 'completed')
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.pendingInteraction, null)
-    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.NOTIFICATION)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('generic hook still maps Trae elicitation notifications as answer waits', () => {
+test('generic Coco hook keeps unsupported notification types phase-neutral', () => {
   const dir = tempDir()
   try {
     const sessionId = 'trae-elicitation'
+    runGenericHook('trae', {
+      hook_event_name: 'user_prompt_submit',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      prompt: 'continue the task'
+    }, dir)
     runGenericHook('trae', {
       hook_event_name: 'notification',
       session_id: sessionId,
@@ -2609,19 +3217,77 @@ test('generic hook still maps Trae elicitation notifications as answer waits', (
     }, dir)
 
     const session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'waitingForAnswer')
-    assert.strictEqual(session.needsAttention, 'waiting for answer')
-    assert.strictEqual(session.pendingInteraction.type, 'question')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.NOTIFICATION)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('generic hook classifies text-only notifications and preserves tool and plan intent', () => {
+test('Coco reads nested prompt/tool payloads and compact hooks are no-ops', () => {
   const dir = tempDir()
   try {
-    // Permission text that names the tool — the recovered tool must survive.
+    const sessionId = 'coco-nested-payloads'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('coco', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      user_prompt_submit: { prompt: 'nested prompt' }
+    }), dir)
+    runGenericHook('coco', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      pre_tool_use: { tool_name: 'ReadFile', tool_input: { path: '/tmp/demo/a.txt' } }
+    }), dir)
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.lastUserPrompt, 'nested prompt')
+    assert.strictEqual(session.activeTool, 'ReadFile')
+
+    runGenericHook('coco', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      post_tool_use: { tool_name: 'ReadFile' }
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(session.activeTool, null)
+    const beforeCompact = JSON.stringify(session)
+    runGenericHook('coco', Object.assign({}, base, { hook_event_name: 'PreCompact' }), dir)
+    runGenericHook('coco', Object.assign({}, base, { hook_event_name: 'PostCompact' }), dir)
+    assert.strictEqual(JSON.stringify(readScoutStatus(dir).sessions[sessionId]), beforeCompact)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Coco invalid AskUserQuestion payload stays BUSY instead of inventing WAIT', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'coco-invalid-question'
+    runGenericHook('coco', {
+      hook_event_name: 'PreToolUse',
+      session_id: sessionId,
+      cwd: '/tmp/demo',
+      tool_name: 'AskUserQuestion',
+      tool_input: {}
+    }, dir)
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('generic hook never derives lifecycle state from notification prose', () => {
+  const dir = tempDir()
+  try {
     const permId = 'gemini-text-perm'
+    runGenericHook('gemini', {
+      session_id: permId,
+      cwd: '/tmp/demo',
+      hook_event_name: 'BeforeAgent',
+      prompt: 'run the checks'
+    }, dir)
     runGenericHook('gemini', {
       session_id: permId,
       cwd: '/tmp/demo',
@@ -2629,12 +3295,16 @@ test('generic hook classifies text-only notifications and preserves tool and pla
       message: 'Gemini needs your permission to use Bash'
     }, dir)
     let session = readScoutStatus(dir).sessions[permId]
-    assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.pendingInteraction.type, 'approval')
-    assert.strictEqual(session.pendingInteraction.tool, 'Bash')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
 
-    // Plan-approval text must land as a plan wait (W:PLAN), not a bare approval.
     const planId = 'gemini-text-plan'
+    runGenericHook('gemini', {
+      session_id: planId,
+      cwd: '/tmp/demo',
+      hook_event_name: 'BeforeAgent',
+      prompt: 'draft a plan'
+    }, dir)
     runGenericHook('gemini', {
       session_id: planId,
       cwd: '/tmp/demo',
@@ -2642,8 +3312,325 @@ test('generic hook classifies text-only notifications and preserves tool and pla
       message: 'Gemini needs your approval for the plan'
     }, dir)
     session = readScoutStatus(dir).sessions[planId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode keeps WAIT through unrelated tools and child-agent events', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'opencode-wait-routing'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run guarded task'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Read'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.pendingInteraction.type, 'plan')
+
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'Read'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.activeTool, null)
+
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'still waiting for approval'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.deferredCompletion, null)
+
+    const beforeChild = JSON.stringify(session)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      agent_id: 'opencode-child',
+      last_assistant_message: 'child done'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(JSON.stringify(session), beforeChild)
+
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode empty assistant updates are exact no-ops', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'opencode-empty-assistant'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'finish'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'done'
+    }), dir)
+    const before = JSON.stringify(readScoutStatus(dir).sessions[sessionId])
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'AssistantMessageUpdate',
+      assistant_message_preview: ''
+    }), dir)
+    assert.strictEqual(JSON.stringify(readScoutStatus(dir).sessions[sessionId]), before)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode keeps only the newest session for a concrete terminal key', () => {
+  const dir = tempDir()
+  try {
+    const terminal = { terminal_session_id: 'opencode-terminal-1', cwd: '/tmp/demo' }
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'SessionStart',
+      session_id: 'opencode-old'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'opencode-old',
+      prompt: 'old work'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'SessionStart',
+      session_id: 'opencode-new'
+    }), dir)
+
+    let status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions['opencode-old']), 'completed')
+    assert.strictEqual(currentPhase(status.sessions['opencode-new']), 'running')
+
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'opencode-new',
+      prompt: 'new work'
+    }), dir)
+    status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions['opencode-new']), 'running')
+    assert.strictEqual(status.sessions['opencode-old'].status, 'completed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode scopes terminal replacement to the tmux pane', () => {
+  const dir = tempDir()
+  try {
+    const terminal = { terminal_session_id: 'shared-outer-terminal', cwd: '/tmp/demo' }
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'SessionStart',
+      session_id: 'opencode-pane-one'
+    }), dir, [], '%1')
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'opencode-pane-one',
+      prompt: 'work in pane one'
+    }), dir, [], '%1')
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'SessionStart',
+      session_id: 'opencode-pane-two'
+    }), dir, [], '%2')
+    runGenericHook('opencode', Object.assign({}, terminal, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'opencode-pane-two',
+      prompt: 'work in pane two'
+    }), dir, [], '%2')
+
+    const status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions['opencode-pane-one']), 'running')
+    assert.strictEqual(status.sessions['opencode-pane-one'].status, 'working')
+    assert.strictEqual(currentPhase(status.sessions['opencode-pane-two']), 'running')
+    assert.strictEqual(status.sessions['opencode-pane-two'].status, 'working')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('OpenCode Stop clears stale session-end state while preserving WAIT', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'opencode-late-permission'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run command'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'SessionEnd'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.ok(Number.isFinite(session.endedAt))
+
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      last_assistant_message: 'command finished'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.endedAt, null)
+    assert.strictEqual(session.deferredCompletion, null)
+
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.endedAt, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('adapter-specific completion activity reopens late DONE as BUSY', () => {
+  const cases = [
+    {
+      agent: 'gemini',
+      start: { hook_event_name: 'BeforeAgent', prompt: 'work' },
+      done: { hook_event_name: 'AfterAgent' },
+      late: { hook_event_name: 'AfterTool', tool_name: 'ReadFile' }
+    },
+    {
+      agent: 'copilot-cli',
+      start: { hook_event_name: 'userPromptSubmitted', prompt: 'work' },
+      done: { hook_event_name: 'agentStop' },
+      late: { hook_event_name: 'postToolUse', tool_name: 'ReadBash' }
+    },
+    {
+      agent: 'coco',
+      start: { hook_event_name: 'user_prompt_submit', prompt: 'work' },
+      done: { hook_event_name: 'stop' },
+      late: { hook_event_name: 'post_tool_use', tool_name: 'ReadFile' }
+    },
+    {
+      agent: 'cursor',
+      start: { hook_event_name: 'beforeSubmitPrompt', prompt: 'work' },
+      done: { hook_event_name: 'stop' },
+      late: { hook_event_name: 'afterFileEdit', file_path: '/tmp/demo/a.txt' }
+    },
+    {
+      agent: 'hermes',
+      start: { hook_event_name: 'pre_llm_call', user_message: 'work' },
+      done: { hook_event_name: 'post_llm_call', response: 'done' },
+      late: { hook_event_name: 'post_approval_response', command: 'echo ok', status: 'approved' }
+    }
+  ]
+
+  for (const item of cases) {
+    const dir = tempDir()
+    try {
+      const sessionId = `${item.agent}-late-activity`
+      const base = { session_id: sessionId, conversation_id: sessionId, cwd: '/tmp/demo' }
+      runGenericHook(item.agent, Object.assign({}, base, item.start), dir)
+      if (item.agent === 'hermes') {
+        runGenericHook(item.agent, Object.assign({}, base, {
+          hook_event_name: 'pre_approval_request',
+          command: 'echo ok'
+        }), dir)
+        runGenericHook(item.agent, Object.assign({}, base, {
+          hook_event_name: 'post_approval_response',
+          command: 'echo ok'
+        }), dir)
+      }
+      runGenericHook(item.agent, Object.assign({}, base, item.done), dir)
+      assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[sessionId]), 'completed', item.agent)
+      runGenericHook(item.agent, Object.assign({}, base, item.late), dir)
+      assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[sessionId]), 'running', item.agent)
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  const dir = tempDir()
+  try {
+    const sessionId = 'opencode-late-assistant-activity'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('opencode', Object.assign({}, base, { hook_event_name: 'UserPromptSubmit', prompt: 'work' }), dir)
+    runGenericHook('opencode', Object.assign({}, base, {
+      hook_event_name: 'AssistantMessageUpdate',
+      assistant_message_preview: 'latest assistant text'
+    }), dir)
+    runGenericHook('opencode', Object.assign({}, base, { hook_event_name: 'Stop' }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[sessionId]), 'completed')
+    runGenericHook('opencode', Object.assign({}, base, { hook_event_name: 'PostToolUse', tool_name: 'Read' }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[sessionId]), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('SessionEnd stays hidden across late activity until a new turn starts', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'copilot-ended-late-activity'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'userPromptSubmitted',
+      prompt: 'work'
+    }), dir)
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'sessionEnd'
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.ok(session.endedAt)
+    assert.strictEqual(isVisibleInPicker(session), 'hidden')
+
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'postToolUse',
+      tool_name: 'Read'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.ok(session.endedAt, 'late activity must preserve isSessionEnded state')
+    assert.strictEqual(isVisibleInPicker(session), 'hidden')
+
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'agentStop'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.endedAt, null, 'ordinary sessionCompleted clears isSessionEnded')
+
+    runGenericHook('copilot-cli', Object.assign({}, base, {
+      hook_event_name: 'userPromptSubmitted',
+      prompt: 'new turn'
+    }), dir)
+    session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.endedAt, null)
+    assert.strictEqual(isVisibleInPicker(session), 'pane')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -2683,6 +3670,206 @@ test('generic hook maps Hermes clarify questions and completion', () => {
   }
 })
 
+test('Hermes routes empty-session approvals by exact command matching and finalize deletes the row', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'hermes-command-parent'
+    const runtime = { terminal_session_id: 'term-hermes-1', terminal_tty: '/dev/ttys101', pid: '4101' }
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'pre_llm_call',
+      session_id: sessionId,
+      user_message: 'run tests'
+    }, runtime), dir)
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'pre_tool_call',
+      session_id: sessionId,
+      tool_name: 'Shell',
+      tool_input: { command: 'npm   test' }
+    }, runtime), dir)
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'pre_approval_request',
+      session_id: '',
+      command: 'npm test'
+    }, runtime), dir)
+
+    let status = readScoutStatus(dir)
+    assert.deepStrictEqual(Object.keys(status.sessions), [sessionId])
+    assert.strictEqual(currentPhase(status.sessions[sessionId]), 'waitingForApproval')
+
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'post_approval_response',
+      session_id: '',
+      command: 'npm test'
+    }, runtime), dir)
+    status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[sessionId]), 'running')
+    assert.strictEqual(status.sessions[sessionId].pendingInteraction, null)
+
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'on_session_finalize',
+      session_id: sessionId
+    }, runtime), dir)
+    status = readScoutStatus(dir)
+    assert.strictEqual(status.sessions[sessionId], undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes child hooks attach to the parent and never create top-level DONE rows', () => {
+  const dir = tempDir()
+  try {
+    const parentId = 'hermes-parent'
+    const childId = 'hermes-child'
+    runGenericHook('hermes', {
+      hook_event_name: 'pre_llm_call',
+      session_id: parentId,
+      user_message: 'coordinate worker'
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'pre_llm_call',
+      session_id: childId,
+      parent_session_id: parentId,
+      agent_id: 'worker-1',
+      user_message: 'inspect tests'
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'post_llm_call',
+      session_id: childId,
+      parent_session_id: parentId,
+      agent_id: 'worker-1',
+      response: 'child done'
+    }, dir)
+
+    let status = readScoutStatus(dir)
+    assert.strictEqual(status.sessions[childId], undefined)
+    assert.strictEqual(currentPhase(status.sessions[parentId]), 'running')
+    assert.strictEqual(status.sessions[parentId].activeSubagents.length, 1)
+
+    runGenericHook('hermes', {
+      hook_event_name: 'on_session_end',
+      session_id: childId,
+      parent_session_id: parentId,
+      agent_id: 'worker-1'
+    }, dir)
+    status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[parentId]), 'running')
+    assert.deepStrictEqual(status.sessions[parentId].activeSubagents, [])
+
+    const before = JSON.stringify(status)
+    runGenericHook('hermes', {
+      hook_event_name: 'post_llm_call',
+      session_id: 'hermes-unowned-child',
+      agent_id: 'unknown-worker',
+      response: 'must be ignored'
+    }, dir)
+    assert.strictEqual(JSON.stringify(readScoutStatus(dir)), before)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes heuristic delegate_task launch stays nested under its parent', () => {
+  const dir = tempDir()
+  try {
+    const parentId = 'hermes-heuristic-parent'
+    const childId = 'hermes-heuristic-child'
+    const runtime = { terminal_session_id: 'term-hermes-heuristic', pid: '4201' }
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'pre_llm_call',
+      session_id: parentId,
+      user_message: 'delegate work'
+    }, runtime), dir)
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'pre_tool_call',
+      session_id: '',
+      tool_name: 'delegate_task',
+      tool_input: { task: 'inspect files' }
+    }, runtime), dir)
+    runGenericHook('hermes', Object.assign({
+      hook_event_name: 'on_session_start',
+      session_id: childId
+    }, runtime), dir)
+
+    const status = readScoutStatus(dir)
+    assert.strictEqual(status.sessions[childId], undefined)
+    assert.strictEqual(currentPhase(status.sessions[parentId]), 'running')
+    assert.strictEqual(status.sessions[parentId].activeSubagents.length, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes finalize removes child bindings so late child hooks cannot recreate ghosts', () => {
+  const dir = tempDir()
+  try {
+    const parentId = 'hermes-finalized-parent'
+    const childId = 'hermes-finalized-child'
+    runGenericHook('hermes', {
+      hook_event_name: 'pre_llm_call',
+      session_id: parentId,
+      user_message: 'start worker'
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'pre_llm_call',
+      session_id: childId,
+      parent_session_id: parentId,
+      agent_id: 'worker-finalize'
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'on_session_finalize',
+      session_id: parentId
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'post_tool_call',
+      session_id: childId,
+      agent_id: 'worker-finalize',
+      tool_name: 'ReadFile'
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    assert.strictEqual(status.sessions[parentId], undefined)
+    assert.strictEqual(status.sessions[childId], undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Hermes on_session_end reads nested booleans and interrupted fallback is DONE', () => {
+  const dir = tempDir()
+  try {
+    const completedId = 'hermes-nested-completed'
+    runGenericHook('hermes', {
+      hook_event_name: 'pre_llm_call',
+      session_id: completedId,
+      user_message: 'keep state'
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'on_session_end',
+      session_id: completedId,
+      extra: { completed: true }
+    }, dir)
+    let status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[completedId]), 'running')
+
+    const interruptedId = 'hermes-interrupted-fallback'
+    runGenericHook('hermes', {
+      hook_event_name: 'pre_llm_call',
+      session_id: interruptedId,
+      user_message: 'interrupt me'
+    }, dir)
+    runGenericHook('hermes', {
+      hook_event_name: 'on_session_end',
+      session_id: interruptedId,
+      interrupted: true
+    }, dir)
+    status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[interruptedId]), 'completed')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('generic hook maps Traex approval modes and idle completion', () => {
   const dir = tempDir()
   try {
@@ -2706,7 +3893,7 @@ test('generic hook maps Traex approval modes and idle completion', () => {
     assert.strictEqual(session.agentType, 'traex')
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.pendingInteraction, null)
-    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.PERMISSION_BYPASSED)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.PROMPT_SUBMIT)
 
     runGenericHook('traex', Object.assign({}, base, {
       hook_event_name: 'PermissionRequest',
@@ -2734,7 +3921,112 @@ test('generic hook maps Traex approval modes and idle completion', () => {
   }
 })
 
-test('generic hook defers Stop while waiting for permission until resolver arrives', () => {
+test('Traex compact hooks preserve the exact existing phase', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'traex-compact-noop'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runGenericHook('traex', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'finish first'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, base, { hook_event_name: 'Stop' }), dir)
+    const before = JSON.stringify(readScoutStatus(dir).sessions[sessionId])
+    runGenericHook('traex', Object.assign({}, base, { hook_event_name: 'PreCompact' }), dir)
+    runGenericHook('traex', Object.assign({}, base, { hook_event_name: 'PostCompact' }), dir)
+    assert.strictEqual(JSON.stringify(readScoutStatus(dir).sessions[sessionId]), before)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('unknown adapters never infer completion from event-name substrings', () => {
+  const dir = tempDir()
+  try {
+    runGenericHook('unknown-agent', {
+      hook_event_name: 'frontend_update',
+      session_id: 'unknown-frontend-update',
+      cwd: '/tmp/demo'
+    }, dir)
+    const statusPath = path.join(dir, '.tmux-scout', 'status.json')
+    assert.strictEqual(fs.existsSync(statusPath), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Traex payloads without session_id are ACK-only and create no synthetic BUSY row', () => {
+  const dir = tempDir()
+  try {
+    runGenericHook('traex', {
+      hook_event_name: 'UserPromptSubmit',
+      cwd: '/tmp/demo',
+      prompt: 'must not create a cwd session'
+    }, dir)
+    assert.strictEqual(fs.existsSync(path.join(dir, '.tmux-scout', 'status.json')), false)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Traex child WAIT never replaces its BUSY parent in the picker', () => {
+  const dir = tempDir()
+  try {
+    const parentId = 'traex-parent-busy'
+    const childId = 'traex-child-wait'
+    const parentBase = { session_id: parentId, cwd: '/tmp/demo' }
+    runGenericHook('traex', Object.assign({}, parentBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'coordinate a worker'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, parentBase, {
+      hook_event_name: 'SubagentStart',
+      agent_id: childId,
+      agent_type: 'worker'
+    }), dir)
+
+    const childBase = { session_id: childId, cwd: '/tmp/demo' }
+    runGenericHook('traex', Object.assign({}, childBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'inspect the tests'
+    }), dir)
+    runGenericHook('traex', Object.assign({}, childBase, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: { question: 'continue?' }
+    }), dir)
+
+    let status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[parentId]), 'running')
+    assert.strictEqual(currentPhase(status.sessions[childId]), 'running')
+    assert.strictEqual(status.sessions[childId].parentSessionId, parentId)
+
+    runGenericHook('traex', Object.assign({}, childBase, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    status = readScoutStatus(dir)
+    const parent = status.sessions[parentId]
+    const child = status.sessions[childId]
+    assert.strictEqual(currentPhase(parent), 'running')
+    assert.strictEqual(currentPhase(child), 'waitingForApproval')
+    assert.strictEqual(child.parentSessionId, parentId)
+    assert.strictEqual(child.activeTool, 'AskUserQuestion')
+    assert.strictEqual(isVisibleInPicker(child), 'hidden')
+
+    const pane = { paneId: '%1', currentCommand: 'traex', paneDead: false, windowName: 'main' }
+    assert.deepStrictEqual(
+      getActiveSessions(status, new Map([['%1', pane]])).map(session => session.sessionId),
+      [parentId]
+    )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Traex Stop clears a stale permission wait before completing', () => {
   const dir = tempDir()
   try {
     const sessionId = 'traex-stop-while-waiting'
@@ -2753,11 +4045,11 @@ test('generic hook defers Stop while waiting for permission until resolver arriv
     }), dir)
 
     let session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.status, 'working')
-    assert.strictEqual(session.pendingInteraction.type, 'approval')
-    assert.strictEqual(session.deferredCompletion.phase, 'completed')
-    assert.strictEqual(session.lastEvent.deferred, true)
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.deferredCompletion, null)
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
 
     runGenericHook('traex', Object.assign({}, base, {
       hook_event_name: 'PostToolUse',
@@ -2765,25 +4057,17 @@ test('generic hook defers Stop while waiting for permission until resolver arriv
     }), dir)
 
     session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.pendingInteraction, null)
     assert.strictEqual(session.pendingToolUse, null)
     assert.strictEqual(session.activeTool, null)
-    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
-    assert.strictEqual(session.lastEvent.resolvedBy, AGENT_EVENTS.PERMISSION_RESOLVED)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('background activity classifier recognizes extraction poll copy', () => {
-  const message = 'Extraction is running in the background. I\'ll be notified when the poll completes (either DONE or TIMEOUT, up to 30 minutes). Waiting for the artifacts to be written by cx.'
-  assert.strictEqual(isBackgroundShellRunningText(message), true)
-  assert.ok(backgroundShellDetails({ message }).includes('Extraction is running in the background'))
-  assert.strictEqual(isBackgroundShellRunningText('Agent finished and is waiting for your input'), false)
-})
-
-test('generic hook keeps Traex background shell notification busy', () => {
+test('Traex idle_prompt completion does not inspect background prose', () => {
   const dir = tempDir()
   try {
     const sessionId = 'traex-background-shell'
@@ -2810,13 +4094,11 @@ test('generic hook keeps Traex background shell notification busy', () => {
 
     session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(session.agentType, 'traex')
-    assert.strictEqual(currentPhase(session), 'running')
-    assert.strictEqual(session.status, 'working')
-    assert.strictEqual(session.activeTool, 'Bash')
-    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
-    assert.ok(session.pendingToolUse.details.includes('Artifact poll is running in background'))
-    assert.ok(session.lastAssistantMessage.includes('Artifact poll is running in background'))
-    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
 
     const extractionSessionId = 'traex-extraction-poll-background'
     const extractionBase = { session_id: extractionSessionId, cwd: '/tmp/demo' }
@@ -2835,12 +4117,11 @@ test('generic hook keeps Traex background shell notification busy', () => {
 
     session = readScoutStatus(dir).sessions[extractionSessionId]
     assert.strictEqual(session.agentType, 'traex')
-    assert.strictEqual(currentPhase(session), 'running')
-    assert.strictEqual(session.status, 'working')
-    assert.strictEqual(session.activeTool, 'Bash')
-    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
-    assert.ok(session.pendingToolUse.details.includes('Extraction is running in the background'))
-    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
 
     runGenericHook('traex', Object.assign({}, base, {
       hook_event_name: 'Notification',
@@ -2857,7 +4138,7 @@ test('generic hook keeps Traex background shell notification busy', () => {
   }
 })
 
-test('sync recovers completed Traex background shell sessions as busy', () => {
+test('sync never revives DONE from background prose', () => {
   const dir = tempDir()
   try {
     const scoutDir = path.join(dir, '.tmux-scout')
@@ -2903,19 +4184,18 @@ test('sync recovers completed Traex background shell sessions as busy', () => {
     })
 
     const session = result.status.sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'running')
-    assert.strictEqual(session.status, 'working')
-    assert.strictEqual(session.activeTool, 'Bash')
-    assert.strictEqual(session.pendingToolUse.tool, 'Bash')
-    assert.ok(session.pendingToolUse.details.includes('Artifact poll is running in background'))
-    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
-    assert.strictEqual(result.stats.reconcile.backgroundActivity, 1)
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(session.activeTool, undefined)
+    assert.strictEqual(session.pendingToolUse, undefined)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
+    assert.strictEqual(result.stats.reconcile.backgroundActivity, undefined)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('session reducer protects recent high-confidence hook state', () => {
+test('session reducer keeps pane observations phase-neutral at every age', () => {
   const session = { sessionId: 's1', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'prompt_submit',
@@ -2936,32 +4216,203 @@ test('session reducer protects recent high-confidence hook state', () => {
   assert.strictEqual(ignored.applied, false)
   assert.strictEqual(currentPhase(session), 'running')
 
-  const applied = applySessionEvent(session, {
+  const stillIgnored = applySessionEvent(session, {
     type: 'pane_state',
     source: 'pane',
-    timestamp: 1000 + PROTECTED_PHASE_MS + 1,
+    timestamp: 1000 + 10 * 60 * 1000,
     phase: 'completed',
     status: 'completed'
   })
 
-  assert.strictEqual(applied.applied, true)
-  assert.strictEqual(currentPhase(session), 'completed')
+  assert.strictEqual(stillIgnored.applied, false)
+  assert.strictEqual(currentPhase(session), 'running')
 })
 
-test('session reducer recovers a stuck interrupted session on genuine new activity', () => {
+test('WAIT stays sticky until an explicit resolution event', () => {
+  function waitingSession(id) {
+    const session = { sessionId: id, agentType: 'claude', startedAt: 1000 }
+    applySessionEvent(session, {
+      type: AGENT_EVENTS.PERMISSION_REQUEST,
+      source: 'hook',
+      timestamp: 1000,
+      pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
+    })
+    return session
+  }
+
+  const phaseChangingNoise = [
+    { type: AGENT_EVENTS.TOOL_USE, source: 'hook', timestamp: 1100, activeTool: 'Bash' },
+    { type: AGENT_EVENTS.PANE_STATE, source: 'pane', timestamp: 1100, phase: 'running', status: 'working' },
+    { type: AGENT_EVENTS.SUBAGENT_START, source: 'hook', timestamp: 1100 },
+    { type: AGENT_EVENTS.PROCESS_EXIT_DETECTED, source: 'pid', timestamp: 1100, force: true },
+    { type: AGENT_EVENTS.STALE, source: 'pane', timestamp: 1100, force: true }
+  ]
+
+  for (const [index, event] of phaseChangingNoise.entries()) {
+    const session = waitingSession(`sticky-wait-${index}`)
+    const result = applySessionEvent(session, event)
+    assert.strictEqual(result.applied, false, `${event.type} must not resolve WAIT`)
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
+  }
+
+  const completedWhileWaiting = waitingSession('sticky-wait-completion')
+  const stopped = applySessionEvent(completedWhileWaiting, {
+    type: AGENT_EVENTS.STOP,
+    source: 'hook',
+    timestamp: 1200,
+    details: 'turn finished'
+  })
+  assert.strictEqual(stopped.applied, false)
+  assert.strictEqual(currentPhase(completedWhileWaiting), 'waitingForApproval')
+  assert.strictEqual(completedWhileWaiting.deferredCompletion, undefined)
+
+  const questionResolver = applySessionEvent(completedWhileWaiting, {
+    type: AGENT_EVENTS.QUESTION_ANSWERED,
+    source: 'hook',
+    timestamp: 1300
+  })
+  assert.strictEqual(questionResolver.applied, true)
+  assert.strictEqual(currentPhase(completedWhileWaiting), 'running')
+})
+
+test('late pending resolution returns an ended hook session to DONE', () => {
+  for (const [requestType, answerType] of [
+    [AGENT_EVENTS.PERMISSION_REQUEST, AGENT_EVENTS.PERMISSION_RESOLVED],
+    [AGENT_EVENTS.QUESTION_ASKED, AGENT_EVENTS.QUESTION_ANSWERED]
+  ]) {
+    const session = { sessionId: `ended-${requestType}`, agentType: 'codex', startedAt: 1000 }
+    applySessionEvent(session, { type: AGENT_EVENTS.SESSION_START, source: 'hook', timestamp: 1000 })
+    applySessionEvent(session, { type: AGENT_EVENTS.SESSION_END, source: 'hook', timestamp: 1100 })
+    applySessionEvent(session, { type: requestType, source: 'hook', timestamp: 1200 })
+    assert.ok(['waitingForApproval', 'waitingForAnswer'].includes(currentPhase(session)))
+
+    const resolved = applySessionEvent(session, { type: answerType, source: 'hook', timestamp: 1300 })
+    assert.strictEqual(resolved.applied, true)
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.endedAt, 1100)
+    assert.strictEqual(session.pendingInteraction, null)
+  }
+})
+
+test('sessionStarted explicitly exits WAIT and clears pending state', () => {
+  const session = { sessionId: 'wait-new-session', agentType: 'gemini', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.PERMISSION_REQUEST,
+    source: 'hook',
+    timestamp: 1000,
+    pendingToolUse: { tool: 'Shell', details: 'Shell', timestamp: 1000 },
+    activeTool: 'Shell'
+  })
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+
+  const started = applySessionEvent(session, {
+    type: AGENT_EVENTS.SESSION_START,
+    source: 'hook',
+    timestamp: 2000
+  })
+  assert.strictEqual(started.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.pendingInteraction, null)
+  assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, null)
+})
+
+test('turnStarted prompt explicitly exits stale WAIT as BUSY', () => {
+  const session = { sessionId: 'wait-new-turn', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.QUESTION_ASKED,
+    source: 'hook',
+    timestamp: 1000,
+    pendingToolUse: { tool: 'request_user_input', details: 'continue?', timestamp: 1000 }
+  })
+  assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+
+  const started = applySessionEvent(session, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'hook',
+    timestamp: 2000,
+    details: 'new prompt'
+  })
+  assert.strictEqual(started.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.pendingInteraction, null)
+  assert.strictEqual(session.pendingToolUse, null)
+})
+
+test('tool noise stays sticky but activityUpdated reopens DONE', () => {
+  const session = { sessionId: 'done-activity', agentType: 'opencode', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'hook',
+    timestamp: 1000,
+    turnId: 'turn-one'
+  })
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.STOP,
+    source: 'hook',
+    timestamp: 2000,
+    turnId: 'turn-one'
+  })
+
+  const toolNoise = applySessionEvent(session, {
+    type: AGENT_EVENTS.TOOL_USE,
+    source: 'hook',
+    timestamp: 3000,
+    turnId: 'turn-two',
+    activeTool: 'Bash'
+  })
+  assert.strictEqual(toolNoise.applied, false)
+  assert.strictEqual(currentPhase(session), 'completed')
+
+  const activity = applySessionEvent(session, {
+    type: 'activityUpdated',
+    source: 'hook',
+    timestamp: 3100,
+    updates: { currentActivity: 'streaming response' }
+  })
+  assert.strictEqual(activity.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.STOP,
+    source: 'hook',
+    timestamp: 3500,
+    turnId: 'turn-one'
+  })
+
+  const newTurn = applySessionEvent(session, {
+    type: AGENT_EVENTS.PROMPT_SUBMIT,
+    source: 'transcript',
+    timestamp: 4000,
+    turnId: 'turn-two'
+  })
+  assert.strictEqual(newTurn.applied, true)
+  assert.strictEqual(currentPhase(session), 'running')
+})
+
+test('session reducer keeps interrupted sticky until an explicit new turn', () => {
   const session = { sessionId: 'int-recover', agentType: 'claude', startedAt: 1000 }
   applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
   applySessionEvent(session, { type: 'interrupted', source: 'transcript', timestamp: 2000 })
   assert.strictEqual(currentPhase(session), 'interrupted')
 
-  // A real tool hook newer than the interrupt proves the agent resumed — recover.
-  const recovered = applySessionEvent(session, {
+  const activity = applySessionEvent(session, {
     type: 'tool_use',
     source: 'hook',
     timestamp: 3000,
     activeTool: 'Bash'
   })
-  assert.strictEqual(recovered.applied, true)
+  assert.strictEqual(activity.applied, false)
+  assert.strictEqual(currentPhase(session), 'interrupted')
+
+  const newTurn = applySessionEvent(session, {
+    type: 'prompt_submit',
+    source: 'hook',
+    timestamp: 4000,
+    turnId: 'turn-new'
+  })
+  assert.strictEqual(newTurn.applied, true)
   assert.strictEqual(currentPhase(session), 'running')
   assert.strictEqual(session.endedAt, null)
 })
@@ -2995,17 +4446,19 @@ test('session reducer does not resume an interrupted turn from a late post-tool 
   assert.strictEqual(currentPhase(session), 'interrupted')
 })
 
-test('session reducer recovers an idle-sweep completed session on a genuinely new tool', () => {
+test('session reducer does not reopen an inferred completion from tool activity', () => {
   const session = { sessionId: 'idle-done-recover', agentType: 'claude', startedAt: 1000 }
   applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 1000 })
   // The idle-complete sweep INFERS the turn ended (source 'stale'), not a real Stop.
   applySessionEvent(session, { type: 'turn_complete', source: 'stale', timestamp: 2000, force: true })
   assert.strictEqual(currentPhase(session), 'completed')
 
-  // A genuinely new tool start proves the inference wrong -> reopen (self-heal),
-  // so a wrongly idle-completed turn can never stay stuck at DONE.
-  const recovered = applySessionEvent(session, { type: 'tool_use', source: 'hook', timestamp: 3000, activeTool: 'Bash' })
-  assert.strictEqual(recovered.applied, true)
+  const activity = applySessionEvent(session, { type: 'tool_use', source: 'hook', timestamp: 3000, activeTool: 'Bash' })
+  assert.strictEqual(activity.applied, false)
+  assert.strictEqual(currentPhase(session), 'completed')
+
+  const newTurn = applySessionEvent(session, { type: 'prompt_submit', source: 'hook', timestamp: 4000 })
+  assert.strictEqual(newTurn.applied, true)
   assert.strictEqual(currentPhase(session), 'running')
 })
 
@@ -3026,8 +4479,8 @@ test('session reducer keeps completed sticky against later activity (only a new 
   assert.strictEqual(stray.applied, false)
   assert.strictEqual(currentPhase(session), 'completed')
 
-  // Codex goal continuations can start a fresh turn without a UserPromptSubmit
-  // hook. A new-turn tool start is Flux's turnStarted equivalent and reopens it.
+  // A different turn id on an ordinary tool hook is still not a turnStarted
+  // event and cannot revive DONE.
   const newTurnTool = applySessionEvent(session, {
     type: 'tool_use',
     source: 'hook',
@@ -3035,12 +4488,7 @@ test('session reducer keeps completed sticky against later activity (only a new 
     turnId: 'turn-new',
     activeTool: 'Bash'
   })
-  assert.strictEqual(newTurnTool.applied, true)
-  assert.strictEqual(currentPhase(session), 'running')
-  assert.strictEqual(session.lastTurnId, 'turn-new')
-  assert.strictEqual(session.activeTool, 'Bash')
-
-  applySessionEvent(session, { type: 'stop', source: 'hook', timestamp: 3600, turnId: 'turn-new' })
+  assert.strictEqual(newTurnTool.applied, false)
   assert.strictEqual(currentPhase(session), 'completed')
 
   // A fresh prompt still reopens it.
@@ -3080,7 +4528,7 @@ test('session reducer records applied and blocked state evidence', () => {
   assert.strictEqual(blocked.applied, false)
   assert.strictEqual(blocked.evidenceChanged, true)
   assert.strictEqual(session.stateEvidence[0].applied, false)
-  assert.ok(/priority/.test(session.stateEvidence[0].blockedReason))
+  assert.ok(/phase-neutral/.test(session.stateEvidence[0].blockedReason))
   assert.strictEqual(currentPhase(session), 'running')
 
   const duplicate = applySessionEvent(session, {
@@ -3126,7 +4574,7 @@ test('session reducer does not let same-phase pane reads downgrade hook protecti
   assert.strictEqual(currentPhase(session), 'running')
 })
 
-test('session reducer lets pane busy clear transcript-inferred waits', () => {
+test('session reducer does not let pane busy clear transcript waits', () => {
   const session = { sessionId: 's1c', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'transcript_status',
@@ -3145,13 +4593,19 @@ test('session reducer lets pane busy clear transcript-inferred waits', () => {
     status: 'working'
   })
 
-  assert.strictEqual(cleared.applied, true)
-  assert.strictEqual(currentPhase(session), 'running')
-  assert.strictEqual(session.needsAttention, null)
+  assert.strictEqual(cleared.applied, false)
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.needsAttention, 'waiting for approval')
 })
 
-test('session reducer applies attention and terminal events', () => {
+test('session reducer keeps liveness events from overriding WAIT', () => {
   const session = { sessionId: 's2', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: 'tool_use',
+    source: 'hook',
+    timestamp: 900,
+    activeTool: 'Bash'
+  })
   applySessionEvent(session, {
     type: 'permission_request',
     source: 'hook',
@@ -3164,11 +4618,12 @@ test('session reducer applies attention and terminal events', () => {
   assert.strictEqual(session.status, 'working')
   assert.strictEqual(session.needsAttention, 'waiting for approval')
   assert.deepStrictEqual(session.pendingToolUse.tool, 'Bash')
-  assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.activeTool, 'Bash')
   assert.deepStrictEqual(session.pendingInteraction, {
     type: 'approval',
     phase: 'waitingForApproval',
     source: 'hook',
+    stateSource: 'hook',
     rawEventName: 'permission_request',
     startedAt: 1000,
     updatedAt: 1000,
@@ -3186,9 +4641,27 @@ test('session reducer applies attention and terminal events', () => {
     force: true
   })
 
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.status, 'working')
+  assert.strictEqual(session.endedAt, undefined)
+  assert.strictEqual(session.pendingInteraction.type, 'approval')
+  assert.strictEqual(session.activeTool, 'Bash')
+
+  applySessionEvent(session, {
+    type: 'permission_resolved',
+    source: 'hook',
+    timestamp: 3000
+  })
+  applySessionEvent(session, {
+    type: 'process_exit_detected',
+    source: 'pid',
+    timestamp: 4000,
+    reason: 'pid exited',
+    force: true
+  })
+
   assert.strictEqual(currentPhase(session), 'interrupted')
   assert.strictEqual(session.status, 'interrupted')
-  assert.strictEqual(session.endedAt, null)
   assert.strictEqual(session.terminalKind, 'processExit')
   assert.strictEqual(session.terminalReason, 'pid exited')
   assert.strictEqual(session.activeTool, null)
@@ -3219,24 +4692,75 @@ test('session reducer tracks active tool separately from pending approval state'
   assert.strictEqual(session.pendingToolUse, null)
   assert.strictEqual(session.activeTool, null)
 
+})
+
+test('session reducer keeps redundant permission resolution as an exact no-op', () => {
+  const cases = [
+    {
+      sessionId: 'resolver-running-noop',
+      agentType: 'codex',
+      phase: 'running',
+      status: 'working',
+      activeTool: 'Bash',
+      lastUpdated: 1000,
+      stateEvidence: [{ type: 'tool_use', timestamp: 1000 }]
+    },
+    {
+      sessionId: 'resolver-answer-noop',
+      agentType: 'codex',
+      phase: 'waitingForAnswer',
+      status: 'working',
+      needsAttention: 'waiting for answer',
+      pendingInteraction: {
+        type: 'question',
+        phase: 'waitingForAnswer',
+        source: 'hook',
+        startedAt: 1000,
+        updatedAt: 1000,
+        reason: 'waiting for answer'
+      },
+      lastUpdated: 1000
+    }
+  ]
+
+  for (const session of cases) {
+    const before = JSON.stringify(session)
+    const result = applySessionEvent(session, {
+      type: AGENT_EVENTS.PERMISSION_RESOLVED,
+      source: 'hook',
+      timestamp: 9000,
+      details: 'duplicate resolver'
+    })
+    assert.strictEqual(result.applied, false)
+    assert.strictEqual(result.changed, false)
+    assert.strictEqual(JSON.stringify(session), before)
+  }
+})
+
+test('session reducer keeps activeTool through permission bypass until tool completion', () => {
+  const session = { sessionId: 's2-bypass-tool', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'tool_use',
     source: 'hook',
-    timestamp: 3000,
-    pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 3000 },
+    timestamp: 1000,
     activeTool: 'Bash'
   })
+
   applySessionEvent(session, {
-    type: 'post_tool_use',
+    type: 'permission_bypassed',
     source: 'hook',
-    timestamp: 4000,
-    pendingToolUse: null,
-    preserveActiveTool: true
+    timestamp: 1100
   })
 
   assert.strictEqual(currentPhase(session), 'running')
-  assert.strictEqual(session.pendingToolUse, null)
   assert.strictEqual(session.activeTool, 'Bash')
+
+  applySessionEvent(session, {
+    type: 'post_tool_use',
+    source: 'hook',
+    timestamp: 1200
+  })
+  assert.strictEqual(session.activeTool, null)
 })
 
 test('session reducer does not infer active tool from pending display fields', () => {
@@ -3322,7 +4846,7 @@ test('session reducer clears waits with explicit pending lifecycle events', () =
   })
 
   assert.strictEqual(currentPhase(session), 'waitingForAnswer')
-  assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.activeTool, 'AskUserQuestion')
   assert.strictEqual(session.pendingInteraction.type, 'question')
 
   applySessionEvent(session, {
@@ -3336,11 +4860,18 @@ test('session reducer clears waits with explicit pending lifecycle events', () =
   assert.strictEqual(session.needsAttention, null)
   assert.strictEqual(session.pendingInteraction, null)
   assert.strictEqual(session.pendingToolUse, null)
+  assert.strictEqual(session.activeTool, 'AskUserQuestion')
+
+  applySessionEvent(session, {
+    type: 'post_tool_use',
+    source: 'hook',
+    timestamp: 2600
+  })
   assert.strictEqual(session.activeTool, null)
 })
 
-test('session reducer defers completion while a pending interaction is visible', () => {
-  const session = { sessionId: 's2-deferred', agentType: 'claude', startedAt: 1000 }
+test('session reducer keeps ordinary completion phase-neutral while a pending interaction is visible', () => {
+  const session = { sessionId: 's2-deferred', agentType: 'claude', startedAt: 1000, endedAt: 900 }
   applySessionEvent(session, {
     type: 'permission_request',
     source: 'hook',
@@ -3363,9 +4894,10 @@ test('session reducer defers completion while a pending interaction is visible',
   assert.strictEqual(session.status, 'working')
   assert.strictEqual(session.needsAttention, 'waiting for approval')
   assert.strictEqual(session.pendingInteraction.type, 'approval')
-  assert.strictEqual(session.deferredCompletion.phase, 'completed')
-  assert.strictEqual(session.deferredCompletion.type, 'stop')
-  assert.strictEqual(session.lastEvent.deferred, true)
+  assert.strictEqual(session.activeTool, 'Bash')
+  assert.strictEqual(session.deferredCompletion, undefined)
+  assert.strictEqual(session.lastEvent.type, 'permission_request')
+  assert.strictEqual(session.endedAt, null, 'sessionCompleted clears isSessionEnded while preserving WAIT')
 
   const resolved = applySessionEvent(session, {
     type: 'permission_resolved',
@@ -3375,16 +4907,14 @@ test('session reducer defers completion while a pending interaction is visible',
   })
 
   assert.strictEqual(resolved.applied, true)
-  assert.strictEqual(currentPhase(session), 'completed')
-  assert.strictEqual(session.status, 'completed')
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.status, 'working')
   assert.strictEqual(session.pendingInteraction, null)
   assert.strictEqual(session.pendingToolUse, null)
-  assert.strictEqual(session.activeTool, null)
+  assert.strictEqual(session.activeTool, 'Bash')
   assert.strictEqual(session.deferredCompletion, null)
-  assert.strictEqual(session.terminalKind, 'completed')
-  assert.strictEqual(session.terminalReason, 'turn completed')
-  assert.strictEqual(session.lastEvent.type, 'stop')
-  assert.strictEqual(session.lastEvent.resolvedBy, 'permission_resolved')
+  assert.strictEqual(session.terminalKind, null)
+  assert.strictEqual(session.lastEvent.type, 'permission_resolved')
 
   const lateTool = applySessionEvent(session, {
     type: 'post_tool_use',
@@ -3393,7 +4923,8 @@ test('session reducer defers completion while a pending interaction is visible',
     force: true
   })
   assert.strictEqual(lateTool.applied, false)
-  assert.strictEqual(currentPhase(session), 'completed')
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.activeTool, null)
 })
 
 test('session reducer clears active subagents on applied end phases', () => {
@@ -3414,13 +4945,14 @@ test('session reducer clears active subagents on applied end phases', () => {
     pendingToolUse: { tool: 'Bash', details: 'Bash: npm test', timestamp: 1000 }
   })
   applySessionEvent(session, {
-    type: 'stop',
+    type: 'session_end',
     source: 'hook',
     timestamp: 1500,
     reason: 'turn completed'
   })
 
   assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.endedAt, 1500)
   assert.strictEqual(session.activeSubagents.length, 1)
 
   applySessionEvent(session, {
@@ -3436,7 +4968,39 @@ test('session reducer clears active subagents on applied end phases', () => {
   assert.strictEqual(session.activeTool, null)
 })
 
-test('session reducer lets interrupted deferred completion win over completed', () => {
+test('ordinary completion cancels a deferred SessionEnd while WAIT remains visible', () => {
+  const session = { sessionId: 'deferred-end-cancelled', agentType: 'codex', startedAt: 1000 }
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.PERMISSION_REQUEST,
+    source: 'hook',
+    timestamp: 1000
+  })
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.SESSION_END,
+    source: 'hook',
+    timestamp: 1100
+  })
+  assert.ok(session.deferredCompletion)
+  assert.strictEqual(session.endedAt, 1100)
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.STOP,
+    source: 'hook',
+    timestamp: 1200
+  })
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.endedAt, null)
+  assert.strictEqual(session.deferredCompletion, null)
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.PERMISSION_RESOLVED,
+    source: 'hook',
+    timestamp: 1300
+  })
+  assert.strictEqual(currentPhase(session), 'running')
+})
+
+test('session reducer does not turn blocked completion or interruption into latent DONE', () => {
   const session = { sessionId: 's2-deferred-interrupt', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'question_asked',
@@ -3459,16 +5023,16 @@ test('session reducer lets interrupted deferred completion win over completed', 
     reason: 'user interrupted'
   })
   assert.strictEqual(currentPhase(session), 'waitingForAnswer')
-  assert.strictEqual(session.deferredCompletion.phase, 'interrupted')
+  assert.strictEqual(session.deferredCompletion, undefined)
 
   applySessionEvent(session, {
     type: 'question_answered',
     source: 'hook',
     timestamp: 2000
   })
-  assert.strictEqual(currentPhase(session), 'interrupted')
-  assert.strictEqual(session.status, 'interrupted')
-  assert.strictEqual(session.terminalKind, 'interrupted')
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.status, 'working')
+  assert.strictEqual(session.terminalKind, null)
   assert.strictEqual(session.pendingInteraction, null)
 })
 
@@ -3503,7 +5067,7 @@ test('session reducer classifies plan approval as pending interaction', () => {
   assert.strictEqual(session.pendingInteraction.updatedAt, 1500)
 })
 
-test('session reducer resumes running after plan wait user confirmation', () => {
+test('session reducer resumes a plan wait only after explicit resolution', () => {
   const session = { sessionId: 's2-plan-confirmed', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'permission_request',
@@ -3516,6 +5080,15 @@ test('session reducer resumes running after plan wait user confirmation', () => 
   })
   assert.strictEqual(currentPhase(session), 'waitingForApproval')
   assert.strictEqual(session.pendingInteraction.type, 'plan')
+
+  applySessionEvent(session, {
+    type: 'permission_resolved',
+    source: 'hook',
+    rawEventName: 'PostToolUse',
+    timestamp: 1900,
+    details: 'plan approved'
+  })
+  assert.strictEqual(currentPhase(session), 'running')
 
   applySessionEvent(session, {
     type: 'prompt_submit',
@@ -3533,7 +5106,7 @@ test('session reducer resumes running after plan wait user confirmation', () => 
   assert.strictEqual(session.lastTurnId, 'turn-implement')
 })
 
-test('session reducer keeps pending tool detail on low-fidelity wait refresh', () => {
+test('session reducer ignores low-fidelity pane wait refreshes', () => {
   const session = { sessionId: 's2-wait-refresh', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'permission_request',
@@ -3547,23 +5120,23 @@ test('session reducer keeps pending tool detail on low-fidelity wait refresh', (
   const refreshed = applySessionEvent(session, {
     type: 'pane_state',
     source: 'pane',
-    timestamp: 1000 + PROTECTED_PHASE_MS + 1,
+    timestamp: 5000,
     phase: 'waitingForApproval',
     status: 'needsAttention',
     attentionReason: 'waiting for approval',
     details: 'needsAttention'
   })
 
-  assert.strictEqual(refreshed.applied, true)
+  assert.strictEqual(refreshed.applied, false)
   assert.strictEqual(currentPhase(session), 'waitingForApproval')
   assert.strictEqual(session.pendingToolUse.tool, 'Bash')
   assert.strictEqual(session.pendingInteraction.type, 'approval')
-  assert.strictEqual(session.pendingInteraction.source, 'pane')
+  assert.strictEqual(session.pendingInteraction.source, 'hook')
   assert.strictEqual(session.pendingInteraction.tool, 'Bash')
   assert.strictEqual(session.pendingInteraction.details, 'Bash: npm test')
   assert.strictEqual(session.pendingInteraction.requestId, 'req-approval-1')
   assert.strictEqual(session.pendingInteraction.startedAt, 1000)
-  assert.strictEqual(session.pendingInteraction.updatedAt, 1000 + PROTECTED_PHASE_MS + 1)
+  assert.strictEqual(session.pendingInteraction.updatedAt, 1000)
 })
 
 test('session reducer keeps ordinary approval when command details mention plan', () => {
@@ -3583,7 +5156,7 @@ test('session reducer keeps ordinary approval when command details mention plan'
   assert.strictEqual(session.pendingInteraction.details, 'Bash: terraform plan')
 })
 
-test('session reducer clears stale tool state for answer-only pane waits', () => {
+test('session reducer clears stale tool state for explicit answer waits', () => {
   const session = { sessionId: 's2-answer', agentType: 'codex', startedAt: 1000 }
   applySessionEvent(session, {
     type: 'tool_use',
@@ -3593,12 +5166,10 @@ test('session reducer clears stale tool state for answer-only pane waits', () =>
   })
 
   const answerWait = applySessionEvent(session, {
-    type: 'pane_state',
-    source: 'pane',
-    timestamp: 1000 + PROTECTED_PHASE_MS + 1,
-    phase: 'waitingForAnswer',
-    status: 'working',
-    needsAttention: 'waiting for answer'
+    type: 'question_asked',
+    source: 'hook',
+    timestamp: 2000,
+    attentionReason: 'waiting for answer'
   })
 
   assert.strictEqual(answerWait.applied, true)
@@ -3607,7 +5178,7 @@ test('session reducer clears stale tool state for answer-only pane waits', () =>
   assert.strictEqual(session.pendingToolUse, null)
   assert.strictEqual(session.activeTool, null)
   assert.strictEqual(session.pendingInteraction.type, 'question')
-  assert.strictEqual(session.pendingInteraction.source, 'pane')
+  assert.strictEqual(session.pendingInteraction.source, 'hook')
   assert.strictEqual(session.pendingInteraction.reason, 'waiting for answer')
   assert.strictEqual(session.pendingInteraction.tool, undefined)
 })
@@ -3681,7 +5252,7 @@ test('session reducer preserves terminal legacy status despite stale attention',
     const result = applySessionEvent(session, {
       type: 'pane_state',
       source: 'pane',
-      timestamp: 1000 + PROTECTED_PHASE_MS + 1,
+      timestamp: 10 * 60 * 1000,
       phase: 'running',
       status: 'working'
     })
@@ -3795,13 +5366,81 @@ test('codex setup upgrades legacy notify hook to guarded shell command', () => {
     assert.ok(config.includes('test -e \\"$1\\" || exit 0; exec node \\"$1\\" \\"$2\\"'))
     assert.ok(config.includes(hookPath))
     assert.ok(config.includes('[features]\nhooks = true'))
-    assert.ok(!config.includes('codex_hooks'))
+    if (config.includes('codex_hooks')) assert.ok(config.includes('codex_hooks = true'))
+
+    runScript('scripts/setup/codex.js', ['uninstall'], dir)
+    assert.strictEqual(TOML.parse(fs.readFileSync(configPath, 'utf-8')).notify, undefined)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex setup migrates deprecated codex_hooks feature key', () => {
+test('codex setup replaces a direct notify hook from an old checkout', () => {
+  const dir = tempDir()
+  try {
+    const codexDir = path.join(dir, '.codex')
+    fs.mkdirSync(codexDir, { recursive: true })
+    const hookPath = path.join(__dirname, '..', 'scripts', 'hooks', 'codex.js')
+    const oldHookPath = path.join(dir, 'old', 'tmux-scout', 'scripts', 'hooks', 'codex.js')
+    const configPath = path.join(codexDir, 'config.toml')
+    fs.writeFileSync(configPath, TOML.stringify({ notify: ['node', oldHookPath] }))
+
+    runScript('scripts/setup/codex.js', ['install'], dir)
+
+    const parsed = TOML.parse(fs.readFileSync(configPath, 'utf-8'))
+    assert.deepStrictEqual(Array.from(parsed.notify), [
+      'sh',
+      '-c',
+      'test -e "$1" || exit 0; exec node "$1" "$2"',
+      'tmux-scout',
+      hookPath
+    ])
+
+    runScript('scripts/setup/codex.js', ['uninstall'], dir)
+    assert.strictEqual(TOML.parse(fs.readFileSync(configPath, 'utf-8')).notify, undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex setup preserves a wrapped notify containing a JSON closing bracket', () => {
+  const dir = tempDir()
+  try {
+    const codexDir = path.join(dir, '.codex')
+    fs.mkdirSync(codexDir, { recursive: true })
+    const hookPath = path.join(__dirname, '..', 'scripts', 'hooks', 'codex.js')
+    const configPath = path.join(codexDir, 'config.toml')
+    const wrappedNotify = [
+      '/Applications/Notify Wrapper.app/Contents/MacOS/notify-wrapper',
+      'turn-ended',
+      '--previous-notify',
+      JSON.stringify(['sh', '-c', 'exec node "$1" "$2"', 'tmux-scout', hookPath]).replace(/\//g, '\\/')
+    ]
+    fs.writeFileSync(configPath, TOML.stringify({
+      model: 'default',
+      notify: wrappedNotify,
+      features: { experimental: true }
+    }))
+
+    runScript('scripts/setup/codex.js', ['install'], dir)
+    const first = fs.readFileSync(configPath, 'utf-8')
+    const parsed = TOML.parse(first)
+    assert.deepStrictEqual(Array.from(parsed.notify), wrappedNotify)
+    assert.strictEqual(parsed.features.hooks, true)
+    assert.strictEqual(parsed.features.experimental, true)
+    assert.strictEqual(Object.keys(parsed.hooks.state).length, 6)
+
+    runScript('scripts/setup/codex.js', ['install'], dir)
+    assert.strictEqual(fs.readFileSync(configPath, 'utf-8'), first)
+
+    runScript('scripts/setup/codex.js', ['uninstall'], dir)
+    assert.deepStrictEqual(Array.from(TOML.parse(fs.readFileSync(configPath, 'utf-8')).notify), wrappedNotify)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex setup preserves the legacy feature when version compatibility needs it', () => {
   const dir = tempDir()
   try {
     const codexDir = path.join(dir, '.codex')
@@ -3820,10 +5459,16 @@ test('codex setup migrates deprecated codex_hooks feature key', () => {
 
     const installed = fs.readFileSync(configPath, 'utf-8')
     assert.ok(installed.includes('model = "default"'))
-    assert.ok(installed.includes('[features]\nhooks = true\nexperimental = true'))
-    assert.ok(!installed.includes('codex_hooks'))
+    assert.ok(installed.includes('[features]\nhooks = true'))
+    assert.ok(installed.includes('experimental = true'))
+    if (installed.includes('codex_hooks')) assert.ok(installed.includes('codex_hooks = true'))
 
-    fs.writeFileSync(configPath, installed.replace(/^hooks = true\n/m, 'codex_hooks = true\n'))
+    fs.writeFileSync(configPath, [
+      '[features]',
+      'codex_hooks = true',
+      'experimental = true',
+      ''
+    ].join('\n'))
     const modernStatus = JSON.parse(execFileSync(process.execPath, ['-e', `
       const codex = require(${JSON.stringify(path.join(__dirname, '..', 'scripts/setup/codex.js'))})
       process.stdout.write(JSON.stringify(codex.status().modern))
@@ -3836,6 +5481,58 @@ test('codex setup migrates deprecated codex_hooks feature key', () => {
     assert.strictEqual(modernStatus.installed, false)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex setup selects feature flags from detected app and CLI versions', () => {
+  const none = {
+    app: { installed: false, version: null },
+    cli: { installed: false, version: null }
+  }
+  const newCli = {
+    app: { installed: false, version: null },
+    cli: { installed: true, version: '0.129.0' }
+  }
+  const oldCli = {
+    app: { installed: false, version: null },
+    cli: { installed: true, version: '0.128.9' }
+  }
+  const bothNew = {
+    app: { installed: true, version: '26.506.0' },
+    cli: { installed: true, version: '0.129.0' }
+  }
+
+  assert.deepStrictEqual(codexSetup.resolveFeatureFlags('', oldCli), ['hooks', 'codex_hooks'])
+  assert.deepStrictEqual(codexSetup.resolveFeatureFlags('', newCli), ['hooks'])
+  assert.deepStrictEqual(codexSetup.resolveFeatureFlags('', none), ['hooks', 'codex_hooks'])
+  assert.deepStrictEqual(codexSetup.resolveFeatureFlags('[features]\nhooks = true\n', none), ['hooks'])
+  assert.deepStrictEqual(
+    codexSetup.selectFeatureFlags('[features]\nhooks = true\ncodex_hooks = true\n', newCli),
+    ['hooks', 'codex_hooks']
+  )
+  assert.deepStrictEqual(
+    codexSetup.selectFeatureFlags('[features]\nhooks = true\ncodex_hooks = true\n', bothNew),
+    ['hooks']
+  )
+  assert.ok(codexSetup.upsertFeatures('', ['hooks', 'codex_hooks']).includes(
+    '[features]\nhooks = true\ncodex_hooks = true'
+  ))
+
+  assert.strictEqual(codexSetup.extractVersion('Node.js 22.17.0\ncodex 0.130.0'), '0.130.0')
+  assert.strictEqual(codexSetup.extractVersion('Codex.app version 26.506.1 (build 30905)'), '26.506.1')
+  assert.strictEqual(codexSetup.extractVersion('Node.js 22.17.0\nother 2.500.1'), null)
+
+  const tomlVariants = [
+    '[features]\n"hooks" = true\n"codex_hooks" = true\nexperimental = true\n',
+    '"features"."hooks" = true\n"features"."codex_hooks" = true\nfeatures.experimental = true\n',
+    'features = { hooks = true, codex_hooks = true, experimental = true }\n'
+  ]
+  for (const input of tomlVariants) {
+    assert.deepStrictEqual(codexSetup.selectFeatureFlags(input, bothNew), ['hooks'])
+    const rewritten = TOML.parse(codexSetup.upsertFeatures(input, ['hooks']))
+    assert.strictEqual(rewritten.features.hooks, true)
+    assert.strictEqual(rewritten.features.codex_hooks, undefined)
+    assert.strictEqual(rewritten.features.experimental, true)
   }
 })
 
@@ -3868,7 +5565,7 @@ test('session reducer keeps interrupted turns eligible for sync', () => {
   assert.strictEqual(session.endedAt, null)
 })
 
-test('sync marks running Claude session interrupted from transcript marker', () => {
+test('sync marks running Claude session completed from transcript interrupt marker', () => {
   const dir = tempDir()
   try {
     const sessionId = 'claude-transcript-interrupt'
@@ -3897,10 +5594,10 @@ test('sync marks running Claude session interrupted from transcript marker', () 
       stuckSweep: false
     })
     const session = result.status.sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'interrupted')
-    assert.strictEqual(session.status, 'interrupted')
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
     assert.strictEqual(session.endedAt, null)
-    assert.strictEqual(session.lastEvent.type, 'interrupted')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TURN_COMPLETE)
     assert.strictEqual(result.stats.claudeTranscript.filesRead, 1)
     assert.strictEqual(result.stats.claudeTranscript.interrupted, 1)
   } finally {
@@ -4034,7 +5731,7 @@ test('sync skips re-reading an unchanged Claude transcript when a scan cache is 
     assert.strictEqual(third.stats.claudeTranscript.filesRead, 1)
     assert.strictEqual(third.stats.claudeTranscript.skippedUnchanged, 0)
     assert.strictEqual(third.stats.claudeTranscript.interrupted, 1)
-    assert.strictEqual(currentPhase(third.status.sessions[sessionId]), 'interrupted')
+    assert.strictEqual(currentPhase(third.status.sessions[sessionId]), 'completed')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -4050,7 +5747,7 @@ test('sync batches every sweep into a single status.json write per run', () => {
     const now = Date.now()
 
     // Two independent sweeps must each mutate a session in the same run:
-    //   idleComplete completes `idleClaude`, the interrupt sweep interrupts
+    //   idleComplete completes `idleClaude`, the interrupt sweep completes
     //   `interruptedClaude`. Pre-batching this produced two full status writes.
     const staleTranscript = path.join(dir, 'stale.jsonl')
     fs.writeFileSync(staleTranscript, JSON.stringify({ type: 'assistant' }) + '\n')
@@ -4109,9 +5806,9 @@ test('sync batches every sweep into a single status.json write per run', () => {
     // Both mutations landed and are readable back from the single write.
     const persisted = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
     assert.strictEqual(currentPhase(persisted.sessions.idleClaude), 'completed')
-    assert.strictEqual(currentPhase(persisted.sessions.interruptedClaude), 'interrupted')
+    assert.strictEqual(currentPhase(persisted.sessions.interruptedClaude), 'completed')
     assert.strictEqual(currentPhase(result.status.sessions.idleClaude), 'completed')
-    assert.strictEqual(currentPhase(result.status.sessions.interruptedClaude), 'interrupted')
+    assert.strictEqual(currentPhase(result.status.sessions.interruptedClaude), 'completed')
   } finally {
     fs.renameSync = realRenameSync
     fs.rmSync(dir, { recursive: true, force: true })
@@ -4159,7 +5856,7 @@ test('sync leaves recently-active running sessions alone (idle-complete threshol
   }
 })
 
-test('sync completes idle running sessions past the threshold (missed-stop safety net)', () => {
+test('sync applies exact Claude-only idle interrupt conditions', () => {
   const dir = tempDir()
   try {
     const statusFile = path.join(dir, '.tmux-scout', 'status.json')
@@ -4167,14 +5864,11 @@ test('sync completes idle running sessions past the threshold (missed-stop safet
     fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
     const now = Date.now()
 
-    // Positive evidence the turn ended: a transcript that has been stale as long
-    // as the session has been silent.
     const staleTranscript = path.join(dir, 'stale.jsonl')
     fs.writeFileSync(staleTranscript, JSON.stringify({ type: 'assistant' }) + '\n')
     const staleTime = new Date(now - 300000)
     fs.utimesSync(staleTranscript, staleTime, staleTime)
 
-    // No transcript => no evidence => must NOT be completed (could be thinking).
     fs.writeFileSync(statusFile, JSON.stringify({
       version: 1,
       lastUpdated: now,
@@ -4190,8 +5884,18 @@ test('sync completes idle running sessions past the threshold (missed-stop safet
           transcriptPath: staleTranscript,
           activeTool: null
         },
-        noTranscript: {
-          sessionId: 'noTranscript',
+        noTranscriptClaude: {
+          sessionId: 'noTranscriptClaude',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          activeTool: null
+        },
+        idleGemini: {
+          sessionId: 'idleGemini',
           agentType: 'gemini',
           status: 'working',
           phase: 'running',
@@ -4202,13 +5906,24 @@ test('sync completes idle running sessions past the threshold (missed-stop safet
         },
         busyWithTool: {
           sessionId: 'busyWithTool',
-          agentType: 'codex',
+          agentType: 'claude',
           status: 'working',
           phase: 'running',
           startedAt: now - 600000,
           lastUpdated: now - 300000,
           lastHookAt: now - 300000,
           activeTool: 'Bash'
+        },
+        remoteClaude: {
+          sessionId: 'remoteClaude',
+          agentType: 'claude',
+          status: 'working',
+          phase: 'running',
+          startedAt: now - 600000,
+          lastUpdated: now - 300000,
+          lastHookAt: now - 300000,
+          activeTool: null,
+          isRemote: true
         }
       }
     }, null, 2))
@@ -4220,20 +5935,60 @@ test('sync completes idle running sessions past the threshold (missed-stop safet
       idleCompleteMs: 60000
     })
 
-    // Silent past the threshold WITH a stale transcript => the turn ended
-    // without a Stop hook; complete it (DONE, not interrupted).
     const stuck = result.status.sessions.stuckRunning
     assert.strictEqual(currentPhase(stuck), 'completed')
     assert.strictEqual(stuck.status, 'completed')
     assert.strictEqual(stuck.endedAt, null, 'completed reopens on a new turn, so endedAt stays null')
-    assert.strictEqual(result.stats.claudeTranscript.idleInterrupted, 1)
+    assert.strictEqual(result.stats.claudeTranscript.idleInterrupted, 2)
 
-    // No transcript => we have no evidence the turn ended => leave it running.
-    assert.strictEqual(currentPhase(result.status.sessions.noTranscript), 'running')
+    // The Claude 120s fallback does not require a transcript.
+    assert.strictEqual(currentPhase(result.status.sessions.noTranscriptClaude), 'completed')
 
-    // A session still holding an active tool is genuinely busy — never sweep it.
+    // The timeout is Claude-specific and excludes remote sessions.
+    assert.strictEqual(currentPhase(result.status.sessions.idleGemini), 'running')
+    assert.strictEqual(currentPhase(result.status.sessions.remoteClaude), 'running')
+
     const busy = result.status.sessions.busyWithTool
     assert.strictEqual(currentPhase(busy), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Claude long-running tool stays BUSY through the idle sweep', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-long-running-tool'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'run tests'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    const staleTime = Date.now() - 180000
+    status.sessions[sessionId].lastUpdated = staleTime
+    status.sessions[sessionId].lastHookAt = staleTime
+    fs.writeFileSync(statusFile, JSON.stringify(status, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      idleCompleteMs: 60000,
+      registryPrune: false
+    })
+    const session = result.status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(result.stats.claudeTranscript.idleInterrupted, 0)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -4290,22 +6045,22 @@ test('sync does not idle-complete Codex running sessions as done', () => {
   }
 })
 
-test('notification intent classifier maps agent notifications to wait/idle intents', () => {
+test('notification intent classifier uses structured types and ignores message prose', () => {
   const { classifyNotification } = require('../scripts/lib/notification-intent')
-  assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).intent, 'permission')
-  assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).tool, 'Bash')
-  assert.strictEqual(classifyNotification({ message: 'Claude Code needs your approval for the plan' }).intent, 'plan')
-  assert.strictEqual(classifyNotification({ message: 'Claude has a question for you' }).intent, 'question')
-  assert.strictEqual(classifyNotification({ message: 'Claude is waiting for your input' }).intent, 'idle')
+  assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).intent, 'info')
+  assert.strictEqual(classifyNotification({ message: 'Claude needs your permission to use Bash' }).tool, undefined)
+  assert.strictEqual(classifyNotification({ message: 'Claude Code needs your approval for the plan' }).intent, 'info')
+  assert.strictEqual(classifyNotification({ message: 'Claude has a question for you' }).intent, 'info')
+  assert.strictEqual(classifyNotification({ message: 'Claude is waiting for your input' }).intent, 'info')
   assert.strictEqual(classifyNotification({ message: 'Permission prompt shown' }).intent, 'info')
-  assert.strictEqual(classifyNotification({ message: '请授权执行该命令' }).intent, 'permission')
+  assert.strictEqual(classifyNotification({ message: '请授权执行该命令' }).intent, 'info')
   assert.strictEqual(classifyNotification({ notification_type: 'idle_prompt', message: 'x' }).intent, 'idle')
-  assert.strictEqual(classifyNotification({ notification_type: 'elicitation_dialog', message: '请选择' }).intent, 'question')
+  assert.strictEqual(classifyNotification({ notification_type: 'elicitation_dialog', message: '请选择' }).intent, 'info')
   assert.strictEqual(classifyNotification({ notification_type: 'ToolPermission', details: { type: 'ask_user' } }).intent, 'question')
   assert.strictEqual(classifyNotification({ notification_type: 'permission_prompt' }).intent, 'permission')
 })
 
-test('sync resolves a stale wait once the transcript advances (missed-resolve backstop)', () => {
+test('sync does not resolve WAIT from transcript mtime', () => {
   const dir = tempDir()
   try {
     const scoutDir = path.join(dir, '.tmux-scout')
@@ -4327,11 +6082,10 @@ test('sync resolves a stale wait once the transcript advances (missed-resolve ba
     fs.writeFileSync(statusFile, JSON.stringify({ version: 1, lastUpdated: now, sessions: { stuckWait: session } }))
 
     const result = sync.run(statusFile, { reconcile: false, codexMode: 'none', claudeTranscript: false })
-    const resolved = result.status.sessions.stuckWait
-    assert.strictEqual(currentPhase(resolved), 'running')
-    assert.strictEqual(resolved.needsAttention, null)
-    assert.strictEqual(resolved.pendingInteraction, null)
-    assert.strictEqual(result.stats.claudeTranscript.waitResolved, 1)
+    const unresolved = result.status.sessions.stuckWait
+    assert.strictEqual(currentPhase(unresolved), 'waitingForApproval')
+    assert.strictEqual(unresolved.needsAttention, 'waiting for approval')
+    assert.strictEqual(unresolved.pendingInteraction.type, 'approval')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -4360,7 +6114,6 @@ test('sync keeps a genuine wait while the transcript stays quiet', () => {
 
     const result = sync.run(statusFile, { reconcile: false, codexMode: 'none', claudeTranscript: false })
     assert.strictEqual(currentPhase(result.status.sessions.quietWait), 'waitingForApproval')
-    assert.strictEqual(result.stats.claudeTranscript.waitResolved, 0)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -4486,6 +6239,62 @@ test('sync prunes terminal sessions after their display window expires', () => {
   }
 })
 
+test('sync prunes every phase after seven-day stale retention', () => {
+  const dir = tempDir()
+  try {
+    const scoutDir = path.join(dir, '.tmux-scout')
+    const sessionsDir = path.join(scoutDir, 'sessions')
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.mkdirSync(sessionsDir, { recursive: true })
+    const now = Date.now()
+    const old = now - DEFAULT_STALE_SESSION_MS - 1000
+    const staleWait = {
+      sessionId: 'old-codex-app-wait',
+      agentType: 'codex',
+      phase: 'waitingForAnswer',
+      status: 'working',
+      needsAttention: 'waiting for answer',
+      startedAt: old,
+      lastUpdated: old
+    }
+    const freshBusy = {
+      sessionId: 'fresh-tmux-busy',
+      agentType: 'codex',
+      phase: 'running',
+      status: 'working',
+      tmuxPane: '%1',
+      startedAt: old,
+      lastUpdated: now - 1000
+    }
+    for (const session of [staleWait, freshBusy]) {
+      fs.writeFileSync(path.join(sessionsDir, `${session.sessionId}.json`), JSON.stringify(session, null, 2))
+    }
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        [staleWait.sessionId]: staleWait,
+        [freshBusy.sessionId]: freshBusy
+      }
+    }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      registryNow: now
+    })
+
+    assert.strictEqual(result.status.sessions[staleWait.sessionId], undefined)
+    assert.ok(result.status.sessions[freshBusy.sessionId])
+    assert.strictEqual(fs.existsSync(path.join(sessionsDir, `${staleWait.sessionId}.json`)), false)
+    assert.strictEqual(result.stats.registry.deleted, 1)
+    assert.strictEqual(result.stats.registry.expired, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('sync vanished-pane sweep skips when tmux is unavailable', () => {
   const dir = tempDir()
   try {
@@ -4529,7 +6338,7 @@ test('sync vanished-pane sweep skips when tmux is unavailable', () => {
   }
 })
 
-test('render hides completed sessions that never linked to a tmux pane', () => {
+test('render ignores every session outside the tmux management boundary', () => {
   const active = getActiveSessions({
     sessions: {
       done: {
@@ -4556,10 +6365,22 @@ test('render hides completed sessions that never linked to a tmux pane', () => {
         tmuxPane: null,
         stateSource: 'codex-hooks',
         lastUpdated: Date.now()
+      },
+      codexAppWait: {
+        sessionId: 'codexAppWait',
+        agentType: 'codex',
+        status: 'working',
+        phase: 'waitingForAnswer',
+        needsAttention: 'waiting for answer',
+        pendingInteraction: { type: 'question', phase: 'waitingForAnswer' },
+        tmuxPane: null,
+        stateSource: 'codex-hooks',
+        sessionTitle: 'Hi. What would you like to work on?',
+        lastUpdated: Date.now()
       }
     }
   }, new Map())
-  assert.deepStrictEqual(active.map(session => session.sessionId), ['working'])
+  assert.deepStrictEqual(active.map(session => session.sessionId), [])
 })
 
 test('render prefers active sessions over newer completed sessions in the same pane', () => {
@@ -4675,7 +6496,8 @@ test('codex full sync does not refresh unchanged same-phase transcript state', (
       reconcile: false,
       paneGroundTruth: false,
       stuckSweep: false,
-      claudeTranscript: false
+      claudeTranscript: false,
+      registryPrune: false
     })
     assert.strictEqual(result.status.sessions[threadId].lastUpdated, oldUpdated)
     assert.strictEqual(result.stats.codex.updated, 0)
@@ -4732,7 +6554,7 @@ test('codex sync does not refresh unchanged active unbound sessions from JSONL',
   }
 })
 
-test('codex sync marks stale active-tool sessions interrupted when no stop hook arrives', () => {
+test('codex sync marks stale active-tool sessions completed when no stop hook arrives', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -4767,9 +6589,9 @@ test('codex sync marks stale active-tool sessions interrupted when no stop hook 
     })
 
     const updated = result.status.sessions[threadId]
-    assert.strictEqual(currentPhase(updated), 'interrupted')
-    assert.strictEqual(updated.status, 'interrupted')
-    assert.strictEqual(updated.terminalKind, 'interrupted')
+    assert.strictEqual(currentPhase(updated), 'completed')
+    assert.strictEqual(updated.status, 'completed')
+    assert.strictEqual(updated.terminalKind, 'completed')
     assert.strictEqual(result.stats.codex.idleInterrupted, 1)
   } finally {
     process.env.HOME = oldHome
@@ -4777,7 +6599,7 @@ test('codex sync marks stale active-tool sessions interrupted when no stop hook 
   }
 })
 
-test('codex stuck sweep skips in-flight tools with pending tool state', () => {
+test('codex stuck sweep follows the activeTool condition despite display residue', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -4813,17 +6635,17 @@ test('codex stuck sweep skips in-flight tools with pending tool state', () => {
     })
 
     const updated = result.status.sessions[threadId]
-    assert.strictEqual(currentPhase(updated), 'running')
-    assert.strictEqual(updated.status, 'working')
-    assert.strictEqual(updated.pendingToolUse.tool, 'Bash')
-    assert.strictEqual(result.stats.codex.idleInterrupted, 0)
+    assert.strictEqual(currentPhase(updated), 'completed')
+    assert.strictEqual(updated.status, 'completed')
+    assert.strictEqual(updated.pendingToolUse, null)
+    assert.strictEqual(result.stats.codex.idleInterrupted, 1)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex sync marks matching current turn interrupted from transcript', () => {
+test('codex sync marks matching current turn completed from transcript interrupt', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -4867,7 +6689,7 @@ test('codex sync marks matching current turn interrupted from transcript', () =>
       claudeTranscript: false
     })
     const updated = result.status.sessions[threadId]
-    assert.strictEqual(currentPhase(updated), 'interrupted')
+    assert.strictEqual(currentPhase(updated), 'completed')
     assert.strictEqual(updated.lastEvent.turnId, 'turn-current')
     assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
     assert.strictEqual(result.stats.codex.interrupted, 1)
@@ -4877,7 +6699,189 @@ test('codex sync marks matching current turn interrupted from transcript', () =>
   }
 })
 
-test('codex sync maps completed plan task to WAIT plan instead of DONE', () => {
+test('codex sync marks a tmux session DONE from matching transcript task_complete', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-review-task-complete'
+    const jsonl = path.join(dir, 'codex-review-task-complete.jsonl')
+    fs.writeFileSync(jsonl, [
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(now - 10000).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'turn-old', last_agent_message: 'old result' }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        timestamp: new Date(now - 1000).toISOString(),
+        payload: { type: 'task_complete', turn_id: 'turn-current', last_agent_message: 'review finished' }
+      })
+    ].join('\n') + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: '%43',
+      lastTurnId: 'turn-current',
+      lastUpdated: now - 5000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    const sessionFile = path.join(scoutDir, 'sessions', `${threadId}.json`)
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(sessionFile, JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'completed')
+    assert.strictEqual(updated.status, 'completed')
+    assert.strictEqual(updated.lastEvent.turnId, 'turn-current')
+    assert.strictEqual(updated.stateEvidence[0].rawEventName, 'task_complete')
+    assert.strictEqual(result.stats.codex.completed, 1)
+    assert.strictEqual(result.stats.codex.interrupted, 0)
+    assert.strictEqual(currentPhase(JSON.parse(fs.readFileSync(sessionFile, 'utf-8'))), 'completed')
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync ignores task_complete from an older turn', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-stale-task-complete'
+    const jsonl = path.join(dir, 'codex-stale-task-complete.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 1000).toISOString(),
+      payload: { type: 'task_complete', turn_id: 'turn-old' }
+    }) + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: '%44',
+      lastTurnId: 'turn-current',
+      lastUpdated: now - 5000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'running')
+    assert.strictEqual(updated.status, 'working')
+    assert.strictEqual(updated.lastEvent, undefined)
+    assert.strictEqual(result.stats.codex.completed, 0)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex transcript sweep and cache ignore child and remote sessions', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const sessions = {}
+    const cases = [
+      { sessionId: 'codex-child-abort', parentSessionId: 'codex-parent', interrupted: true },
+      { sessionId: 'codex-child-no-hit', parentSessionId: 'codex-parent', interrupted: false },
+      { sessionId: 'codex-remote-abort', isRemote: true, interrupted: true }
+    ]
+
+    for (const testCase of cases) {
+      const transcriptPath = path.join(dir, `${testCase.sessionId}.jsonl`)
+      const rows = [{
+        type: 'event_msg',
+        timestamp: new Date(now - 5000).toISOString(),
+        payload: { type: 'user_message', message: 'keep working', turn_id: 'turn-current' }
+      }]
+      if (testCase.interrupted) {
+        rows.push({
+          type: 'event_msg',
+          timestamp: new Date(now - 4000).toISOString(),
+          payload: { type: 'turn_aborted', turn_id: 'turn-current', reason: 'interrupted' }
+        })
+      }
+      fs.writeFileSync(transcriptPath, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+
+      const session = {
+        sessionId: testCase.sessionId,
+        threadId: testCase.sessionId,
+        agentType: 'codex',
+        status: 'working',
+        phase: 'running',
+        transcriptPath,
+        lastTurnId: 'turn-current',
+        lastUpdated: now - 5000,
+        parentSessionId: testCase.parentSessionId,
+        isRemote: testCase.isRemote
+      }
+      sessions[testCase.sessionId] = session
+      fs.writeFileSync(
+        path.join(scoutDir, 'sessions', `${testCase.sessionId}.json`),
+        JSON.stringify(session, null, 2)
+      )
+    }
+
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions }, null, 2))
+    const codexTranscriptState = Object.fromEntries(
+      cases.map(testCase => [testCase.sessionId, { transcriptPath: 'stale-cache-entry' }])
+    )
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      idleComplete: false,
+      claudeTranscript: false,
+      codexTranscriptSettleGateMs: 0,
+      codexTranscriptState
+    })
+
+    for (const testCase of cases) {
+      assert.strictEqual(currentPhase(result.status.sessions[testCase.sessionId]), 'running')
+    }
+    assert.strictEqual(result.stats.codex.filesRead, 0)
+    assert.deepStrictEqual(codexTranscriptState, {})
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync does not invent a WAIT state from completed plan transcript text', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -4895,7 +6899,7 @@ test('codex sync maps completed plan task to WAIT plan instead of DONE', () => {
           type: 'item_completed',
           thread_id: threadId,
           turn_id: 'turn-plan',
-          item: { type: 'Plan', id: 'plan-item', text: '# Fix status sync\n\n- Use Flux semantics' }
+          item: { type: 'Plan', id: 'plan-item', text: '# Fix status sync\n\n- Use canonical semantics' }
         }
       }),
       JSON.stringify({
@@ -4931,18 +6935,18 @@ test('codex sync maps completed plan task to WAIT plan instead of DONE', () => {
       waitResolve: false
     })
     const updated = result.status.sessions[threadId]
-    assert.strictEqual(currentPhase(updated), 'waitingForApproval')
-    assert.strictEqual(updated.status, 'working')
-    assert.strictEqual(updated.needsAttention, 'waiting for plan approval')
-    assert.strictEqual(updated.pendingInteraction.type, 'plan')
-    assert.strictEqual(updated.pendingInteraction.tool, 'ExitPlanMode')
-    assert.strictEqual(updated.activeTool, null)
-    assert.strictEqual(result.stats.codex.planWaits, 1)
+    assert.strictEqual(currentPhase(updated), 'completed')
+    assert.strictEqual(updated.status, 'completed')
+    assert.strictEqual(updated.needsAttention, undefined)
+    assert.strictEqual(updated.pendingInteraction, undefined)
+    assert.strictEqual(updated.lastTurnId, 'turn-plan')
+    assert.strictEqual(result.stats.codex.updated, 0)
+    assert.strictEqual(Object.hasOwn(result.stats.codex, 'planWaits'), false)
 
     const counts = statusBar.summarizeSessions([updated])
-    assert.strictEqual(counts.wait, 1)
-    assert.strictEqual(counts.plan, 1)
-    assert.strictEqual(counts.done, 0)
+    assert.strictEqual(counts.wait, 0)
+    assert.strictEqual(counts.plan, 0)
+    assert.strictEqual(counts.done, 1)
     assert.strictEqual(counts.busy, 0)
 
     runHook('scripts/hooks/codex.js', {
@@ -4962,14 +6966,15 @@ test('codex sync maps completed plan task to WAIT plan instead of DONE', () => {
     assert.strictEqual(resumed.pendingInteraction, null)
     assert.strictEqual(resumed.pendingToolUse, null)
     assert.strictEqual(resumed.lastTurnId, 'turn-implement')
-    assert.ok(resumed.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
+    assert.ok(resumed.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PROMPT_SUBMIT))
+    assert.ok(!resumed.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex sync reopens completed session when transcript starts a new goal turn', () => {
+test('codex sync does not invent a new turn from internal goal transcript text', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -5020,11 +7025,12 @@ test('codex sync reopens completed session when transcript starts a new goal tur
       waitResolve: false
     })
     const updated = result.status.sessions[threadId]
-    assert.strictEqual(currentPhase(updated), 'running')
-    assert.strictEqual(updated.status, 'working')
-    assert.strictEqual(updated.lastTurnId, 'turn-goal')
-    assert.strictEqual(updated.activeTool, null)
-    assert.strictEqual(result.stats.codex.turnStarts, 1)
+    assert.strictEqual(currentPhase(updated), 'completed')
+    assert.strictEqual(updated.status, 'completed')
+    assert.strictEqual(updated.lastTurnId, 'turn-plan')
+    assert.strictEqual(updated.lastUpdated, now - 9000)
+    assert.strictEqual(result.stats.codex.updated, 0)
+    assert.strictEqual(Object.hasOwn(result.stats.codex, 'turnStarts'), false)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
@@ -5077,6 +7083,66 @@ test('codex sync settle gate skips very recent transcript scans', () => {
   }
 })
 
+test('codex sync rescans legacy transcript cache entries for task_complete', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const now = Date.now()
+    const threadId = 'codex-legacy-task-complete-cache'
+    const jsonl = path.join(dir, 'codex-legacy-task-complete-cache.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(now - 1000).toISOString(),
+      payload: { type: 'task_complete', turn_id: 'turn-current' }
+    }) + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: '%45',
+      lastTurnId: 'turn-current',
+      lastUpdated: now - 5000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const stat = fs.statSync(jsonl)
+    const codexTranscriptState = {
+      [threadId]: {
+        transcriptPath: jsonl,
+        latestTurnId: 'turn-current',
+        lastScannedSize: stat.size,
+        lastScannedMtimeMs: stat.mtimeMs,
+        lastScannedInode: stat.ino,
+        lastScannedAt: now - 2000
+      }
+    }
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false,
+      codexTranscriptSettleGateMs: 0,
+      codexTranscriptState
+    })
+
+    assert.strictEqual(result.stats.codex.filesRead, 1)
+    assert.strictEqual(result.stats.codex.completed, 1)
+    assert.strictEqual(currentPhase(result.status.sessions[threadId]), 'completed')
+    assert.deepStrictEqual(codexTranscriptState, {})
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('codex sync reuses transcript path, turn id, and scanned size cache', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
@@ -5117,6 +7183,7 @@ test('codex sync reuses transcript path, turn id, and scanned size cache', () =>
       codexTranscriptState
     })
     assert.strictEqual(first.stats.codex.filesRead, 1)
+    assert.strictEqual(codexTranscriptState[threadId].scanVersion, 2)
     assert.strictEqual(codexTranscriptState[threadId].transcriptPath, jsonl)
     assert.strictEqual(codexTranscriptState[threadId].latestTurnId, 'turn-current')
     assert.strictEqual(codexTranscriptState[threadId].lastScannedSize, fs.statSync(jsonl).size)
@@ -5145,7 +7212,7 @@ test('codex sync reuses transcript path, turn id, and scanned size cache', () =>
       codexTranscriptState
     })
     assert.strictEqual(third.stats.codex.filesRead, 1)
-    assert.strictEqual(currentPhase(third.status.sessions[threadId]), 'interrupted')
+    assert.strictEqual(currentPhase(third.status.sessions[threadId]), 'completed')
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
@@ -5231,14 +7298,14 @@ test('codex sync invalidates transcript cache when mtime changes at same byte si
       codexTranscriptSettleGateMs: 0
     })
     assert.strictEqual(second.stats.codex.filesRead, 1)
-    assert.strictEqual(currentPhase(second.status.sessions[threadId]), 'interrupted')
+    assert.strictEqual(currentPhase(second.status.sessions[threadId]), 'completed')
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex sync marks waiting current turns interrupted from transcript', () => {
+test('codex transcript turn-end sweep leaves WAIT sessions untouched', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -5265,6 +7332,11 @@ test('codex sync marks waiting current turns interrupted from transcript', () =>
           type: 'event_msg',
           timestamp: new Date(now - 1000).toISOString(),
           payload: { type: 'turn_aborted', turn_id: testCase.turnId, reason: 'interrupted' }
+        }),
+        JSON.stringify({
+          type: 'event_msg',
+          timestamp: new Date(now - 500).toISOString(),
+          payload: { type: 'task_complete', turn_id: testCase.turnId }
         })
       ].join('\n') + '\n')
 
@@ -5295,25 +7367,27 @@ test('codex sync marks waiting current turns interrupted from transcript', () =>
     for (const testCase of cases) {
       const updated = result.status.sessions[testCase.threadId]
       assert.strictEqual(currentPhase(updated), testCase.phase)
-      assert.strictEqual(updated.deferredCompletion.phase, 'interrupted')
-      assert.strictEqual(updated.lastEvent.turnId, testCase.turnId)
-      assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
+      assert.strictEqual(updated.deferredCompletion, undefined)
+      assert.strictEqual(updated.lastEvent, undefined)
+      assert.strictEqual(updated.stateEvidence, undefined)
 
       applySessionEvent(updated, {
         type: testCase.phase === 'waitingForAnswer' ? 'question_answered' : 'permission_resolved',
         source: 'hook',
         timestamp: now
       })
-      assert.strictEqual(currentPhase(updated), 'interrupted')
+      assert.strictEqual(currentPhase(updated), 'running')
     }
-    assert.strictEqual(result.stats.codex.interrupted, cases.length)
+    assert.strictEqual(result.stats.codex.completed, 0)
+    assert.strictEqual(result.stats.codex.interrupted, 0)
+    assert.strictEqual(result.stats.codex.filesRead, 0)
   } finally {
     process.env.HOME = oldHome
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex sync accepts current turn interrupted transcript without turn id', () => {
+test('codex sync does not degrade an exact turn lookup to a timestamp match', () => {
   const dir = tempDir()
   const oldHome = process.env.HOME
   try {
@@ -5357,7 +7431,52 @@ test('codex sync accepts current turn interrupted transcript without turn id', (
       claudeTranscript: false
     })
     const updated = result.status.sessions[threadId]
-    assert.strictEqual(currentPhase(updated), 'interrupted')
+    assert.strictEqual(currentPhase(updated), 'running')
+    assert.strictEqual(updated.stateEvidence, undefined)
+    assert.strictEqual(result.stats.codex.interrupted, 0)
+  } finally {
+    process.env.HOME = oldHome
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex sync uses timestamp fallback only when the current turn id is unknown', () => {
+  const dir = tempDir()
+  const oldHome = process.env.HOME
+  try {
+    process.env.HOME = dir
+    fs.mkdirSync(path.join(dir, '.codex', 'sessions'), { recursive: true })
+    const scoutDir = path.join(dir, '.tmux-scout')
+    fs.mkdirSync(path.join(scoutDir, 'sessions'), { recursive: true })
+    const threadId = '39393939-3939-4939-8939-393939393939'
+    const jsonl = path.join(dir, 'codex-interrupted-fallback.jsonl')
+    fs.writeFileSync(jsonl, JSON.stringify({
+      type: 'event_msg',
+      timestamp: new Date(Date.now() - 1000).toISOString(),
+      payload: { type: 'turn_aborted', reason: 'interrupted' }
+    }) + '\n')
+    const session = {
+      sessionId: threadId,
+      threadId,
+      agentType: 'codex',
+      status: 'working',
+      phase: 'running',
+      transcriptPath: jsonl,
+      tmuxPane: null,
+      lastUpdated: Date.now() - 3000
+    }
+    const statusFile = path.join(scoutDir, 'status.json')
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { [threadId]: session } }, null, 2))
+    fs.writeFileSync(path.join(scoutDir, 'sessions', `${threadId}.json`), JSON.stringify(session, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      paneGroundTruth: false,
+      stuckSweep: false,
+      claudeTranscript: false
+    })
+    const updated = result.status.sessions[threadId]
+    assert.strictEqual(currentPhase(updated), 'completed')
     assert.strictEqual(updated.stateEvidence[0].rawEventName, 'turn_aborted')
     assert.strictEqual(result.stats.codex.interrupted, 1)
   } finally {
@@ -5465,7 +7584,7 @@ test('codex sync does not mark unbound sessions stale from inactive JSONL', () =
   }
 })
 
-test('claude transcript watcher helper marks running sessions interrupted', () => {
+test('claude transcript watcher helper marks running sessions completed', () => {
   const dir = tempDir()
   try {
     const scoutDir = path.join(dir, '.tmux-scout')
@@ -5501,8 +7620,8 @@ test('claude transcript watcher helper marks running sessions interrupted', () =
 
     assert.strictEqual(markClaudeInterrupted(statusFile, sessionId), true)
     const updated = JSON.parse(fs.readFileSync(statusFile, 'utf-8')).sessions[sessionId]
-    assert.strictEqual(currentPhase(updated), 'interrupted')
-    assert.strictEqual(updated.status, 'interrupted')
+    assert.strictEqual(currentPhase(updated), 'completed')
+    assert.strictEqual(updated.status, 'completed')
     assert.strictEqual(updated.endedAt, null)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -5550,14 +7669,14 @@ test('claude transcript watcher retries missing files and preserves partial line
     assert.strictEqual(manager.scanWatch(sessionId), true)
     assert.strictEqual(markClaudeInterrupted(statusFile, sessionId), true)
     const updated = JSON.parse(fs.readFileSync(statusFile, 'utf-8')).sessions[sessionId]
-    assert.strictEqual(currentPhase(updated), 'interrupted')
+    assert.strictEqual(currentPhase(updated), 'completed')
   } finally {
     if (manager) manager.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => {
+test('claude hook waits for AskUserQuestion only at PermissionRequest', () => {
   const dir = tempDir()
   try {
     const sessionId = 'claude-question'
@@ -5576,14 +7695,71 @@ test('claude hook keeps AskUserQuestion PreToolUse in answer-wait state', () => 
       tool_input: { questions: [{ question: '继续吗？' }] }
     }), dir)
 
-    const session = readScoutStatus(dir).sessions[sessionId]
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.pendingToolUse.tool, 'AskUserQuestion')
+    assert.strictEqual(session.activeTool, 'AskUserQuestion')
+    assert.strictEqual(session.lastEvent.type, 'tool_use')
+
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: '继续吗？' }] }
+    }), dir)
+
+    session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForAnswer')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for answer')
-    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.activeTool, 'AskUserQuestion')
     assert.strictEqual(session.pendingInteraction.type, 'question')
     assert.strictEqual(session.pendingInteraction.tool, 'AskUserQuestion')
     assert.strictEqual(session.lastEvent.type, 'question_asked')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude PostToolUse resolves a pending question before completing the tool', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'claude-question-resolved'
+    const base = { session_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'ask me first'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Continue?' }] }
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Continue?' }] }
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PostToolUse',
+      tool_name: 'AskUserQuestion'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    const evidenceTypes = session.stateEvidence.map(evidence => evidence.type)
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.pendingToolUse, null)
+    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
+    assert.ok(evidenceTypes.includes('question_answered'))
+    // The adapter emits a redundant permissionResolved after questionAnswered here,
+    // and SessionState deliberately treats it as an exact no-op.
+    assert.ok(!evidenceTypes.includes('permission_resolved'))
+    assert.ok(evidenceTypes.includes('post_tool_use'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -5603,17 +7779,31 @@ test('claude hook records PermissionRequest as approval wait', () => {
       prompt: 'run tests'
     }), dir)
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.stateEvidence[0].type, 'tool_use')
+    assert.strictEqual(session.stateEvidence[0].activeTool, 'Bash')
+
+    runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'PermissionRequest',
       tool_name: 'Bash',
       tool_input: { command: 'npm test' }
     }), dir)
 
-    const session = readScoutStatus(dir).sessions[sessionId]
+    session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
     assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.needsAttention, 'waiting for approval')
     assert.strictEqual(session.pendingToolUse.details, 'Bash: npm test')
-    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.activeTool, 'Bash')
     assert.strictEqual(session.pendingInteraction.type, 'approval')
     assert.strictEqual(session.pendingInteraction.details, 'Bash: npm test')
     assert.strictEqual(session.lastEvent.type, 'permission_request')
@@ -5622,7 +7812,7 @@ test('claude hook records PermissionRequest as approval wait', () => {
   }
 })
 
-test('claude hook defers Stop while approval wait is still pending', () => {
+test('claude Stop clears a stale approval wait before completing', () => {
   const dir = tempDir()
   try {
     const sessionId = 'claude-deferred-stop'
@@ -5642,11 +7832,11 @@ test('claude hook defers Stop while approval wait is still pending', () => {
     }), dir)
 
     let session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.status, 'working')
-    assert.strictEqual(session.pendingInteraction.type, 'approval')
-    assert.strictEqual(session.deferredCompletion.phase, 'completed')
-    assert.strictEqual(session.lastEvent.deferred, true)
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.deferredCompletion, null)
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
 
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'PostToolUse',
@@ -5655,13 +7845,13 @@ test('claude hook defers Stop while approval wait is still pending', () => {
     }), dir)
 
     session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'completed')
-    assert.strictEqual(session.status, 'completed')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
     assert.strictEqual(session.pendingInteraction, null)
     assert.strictEqual(session.pendingToolUse, null)
     assert.strictEqual(session.activeTool, null)
-    assert.strictEqual(session.lastEvent.type, 'stop')
-    assert.strictEqual(session.lastEvent.resolvedBy, 'permission_resolved')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -5696,7 +7886,7 @@ test('claude hook clears approval wait on PostToolUseFailure', () => {
     assert.strictEqual(session.pendingToolUse, null)
     assert.strictEqual(session.activeTool, null)
     assert.strictEqual(session.lastToolError, 'exit code 1')
-    assert.strictEqual(session.lastEvent.type, 'post_tool_use_failure')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
     assert.ok(session.stateEvidence.some(evidence => evidence.type === 'permission_resolved'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -5839,7 +8029,7 @@ test('claude hook clears Ralph loop marker on normal Stop', () => {
   }
 })
 
-test('claude hook resets lifecycle on clear but preserves compact starts', () => {
+test('claude hook keeps compact and clear lifecycle events phase-neutral', () => {
   const dir = tempDir()
   try {
     const sessionId = 'claude-clear'
@@ -5849,14 +8039,14 @@ test('claude hook resets lifecycle on clear but preserves compact starts', () =>
       prompt: 'make a plan'
     }), dir)
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
-      hook_event_name: 'PreToolUse',
+      hook_event_name: 'PermissionRequest',
       tool_name: 'ExitPlanMode',
       tool_input: { plan: 'do it' }
     }), dir)
 
     let session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.needsAttention, 'waiting for plan approval')
     assert.strictEqual(session.pendingInteraction.type, 'plan')
     assert.strictEqual(session.pendingInteraction.tool, 'ExitPlanMode')
 
@@ -5867,7 +8057,7 @@ test('claude hook resets lifecycle on clear but preserves compact starts', () =>
 
     session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.needsAttention, 'waiting for plan approval')
 
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'SessionStart',
@@ -5875,18 +8065,17 @@ test('claude hook resets lifecycle on clear but preserves compact starts', () =>
     }), dir)
 
     session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'idle')
-    assert.strictEqual(session.status, 'idle')
-    assert.strictEqual(session.needsAttention, null)
-    assert.strictEqual(session.pendingToolUse, null)
-    assert.strictEqual(session.lastEvent.type, 'session_start')
-    assert.strictEqual(session.lastEvent.details, 'clear')
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.needsAttention, 'waiting for plan approval')
+    assert.strictEqual(session.pendingToolUse.tool, 'ExitPlanMode')
+    assert.strictEqual(session.pendingInteraction.type, 'plan')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('claude hook records metadata-only official events without changing active state', () => {
+test('claude hook ignores Notification state and maps PreCompact to activity', () => {
   const dir = tempDir()
   try {
     const sessionId = 'claude-metadata'
@@ -5901,10 +8090,25 @@ test('claude hook records metadata-only official events without changing active 
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'SubagentStop'
     }), dir)
+
+    const beforeNotification = readScoutStatus(dir).sessions[sessionId]
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'Notification',
       message: 'Permission prompt shown'
     }), dir)
+    const afterNotification = readScoutStatus(dir).sessions[sessionId]
+    assert.deepStrictEqual(afterNotification, beforeNotification)
+
+    runHook('scripts/hooks/claude.js', {
+      hook_event_name: 'Notification',
+      session_id: 'claude-notification-must-not-create-session',
+      message: 'Claude is waiting for your input'
+    }, dir)
+    assert.strictEqual(
+      readScoutStatus(dir).sessions['claude-notification-must-not-create-session'],
+      undefined
+    )
+
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'PreCompact',
       trigger: 'manual'
@@ -5913,15 +8117,47 @@ test('claude hook records metadata-only official events without changing active 
     const session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.status, 'working')
-    assert.strictEqual(session.lastNotification, 'Permission prompt shown')
+    assert.strictEqual(session.lastNotification, undefined)
     assert.strictEqual(session.lastCompactReason, 'manual')
-    assert.strictEqual(session.lastEvent.type, 'pre_compact')
+    assert.strictEqual(session.currentActivity, 'Compacting conversation...')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('claude hook resolves a notification approval wait when a subagent starts', () => {
+test('Claude PreCompact reopens DONE as BUSY but never clears WAIT', () => {
+  const dir = tempDir()
+  try {
+    const doneId = 'claude-precompact-done'
+    const doneBase = { session_id: doneId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, doneBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'compact later'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, doneBase, { hook_event_name: 'Stop' }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, doneBase, { hook_event_name: 'PreCompact' }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[doneId]), 'running')
+
+    const waitId = 'claude-precompact-wait'
+    const waitBase = { session_id: waitId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, waitBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'ask first'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, waitBase, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, waitBase, { hook_event_name: 'PreCompact' }), dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions[waitId]), 'waitingForApproval')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('claude SubagentStart does not resolve a real parent approval wait', () => {
   const dir = tempDir()
   try {
     const sessionId = 'claude-notif-subagent'
@@ -5931,22 +8167,21 @@ test('claude hook resolves a notification approval wait when a subagent starts',
       prompt: 'plan and build'
     }), dir)
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
-      hook_event_name: 'Notification',
-      message: 'Claude needs your permission'
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Task',
+      tool_input: { description: 'launch worker' }
     }), dir)
     let session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'waitingForApproval')
 
-    // Approving in the terminal produces no resolve hook — the next hook is the
-    // subagent launch. That must un-stick the wait back to running.
     runHook('scripts/hooks/claude.js', Object.assign({}, base, {
       hook_event_name: 'SubagentStart',
       sub_agent: { id: 'sa1', type: 'Plan' }
     }), dir)
     session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'running')
-    assert.strictEqual(session.needsAttention, null)
-    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(currentPhase(session), 'waitingForApproval')
+    assert.strictEqual(session.needsAttention, 'waiting for approval')
+    assert.strictEqual(session.pendingInteraction.type, 'approval')
     assert.ok(Array.isArray(session.activeSubagents) && session.activeSubagents.length === 1)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
@@ -6063,7 +8298,7 @@ test('codex hook treats question-like Stop messages as waiting for answer', () =
     }), dir)
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
       hook_event_name: 'Stop',
-      last_assistant_message: '请选择一个方案？\n1. A\n2. B'
+      last_assistant_message: '1. 请选择一个方案？\n- A\n- B'
     }), dir)
 
     const session = readScoutStatus(dir).sessions[sessionId]
@@ -6088,7 +8323,7 @@ test('codex hook records question answered before next prompt clears wait', () =
     }), dir)
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
       hook_event_name: 'Stop',
-      last_assistant_message: '请选择一个方案？\n1. A\n2. B'
+      last_assistant_message: '1. 请选择一个方案？\n- A\n- B'
     }), dir)
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
       hook_event_name: 'UserPromptSubmit',
@@ -6140,7 +8375,7 @@ test('codex hook maps request_user_input to answer wait and resolution', () => {
     assert.strictEqual(session.pendingInteraction.type, 'question')
     assert.strictEqual(session.pendingInteraction.tool, 'request_user_input')
     assert.match(session.pendingInteraction.details, /Which implementation/)
-    assert.strictEqual(session.activeTool, null)
+    assert.strictEqual(session.activeTool, 'request_user_input')
     assert.strictEqual(session.lastEvent.type, 'question_asked')
 
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
@@ -6156,14 +8391,40 @@ test('codex hook maps request_user_input to answer wait and resolution', () => {
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.pendingInteraction, null)
     assert.strictEqual(session.activeTool, null)
-    assert.strictEqual(session.lastEvent.type, 'post_tool_use')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
     assert.ok(session.stateEvidence.some(evidence => evidence.type === 'question_answered'))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('codex hook resolves deferred Stop after request_user_input answer', () => {
+test('codex request_user_input without a parseable prompt stays BUSY', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-empty-request-user-input'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo', turn_id: 'turn-empty-question' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'continue without inventing a question'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'request_user_input',
+      tool_input: {}
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.activeTool, 'request_user_input')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.TOOL_USE)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex Stop clears request_user_input wait before completing', () => {
   const dir = tempDir()
   try {
     const sessionId = 'codex-request-user-input-deferred'
@@ -6185,8 +8446,9 @@ test('codex hook resolves deferred Stop after request_user_input answer', () => 
     }), dir)
 
     let session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'waitingForAnswer')
-    assert.strictEqual(session.deferredCompletion.phase, 'completed')
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.QUESTION_ANSWERED))
 
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
       hook_event_name: 'PostToolUse',
@@ -6196,10 +8458,10 @@ test('codex hook resolves deferred Stop after request_user_input answer', () => 
     }), dir)
 
     session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.pendingInteraction, null)
-    assert.strictEqual(session.lastEvent.type, 'stop')
-    assert.strictEqual(session.lastEvent.resolvedBy, 'question_answered')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.QUESTION_ANSWERED))
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -6247,9 +8509,219 @@ test('codex hook backfills user prompt from transcript before tool activity', ()
 
     session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'completed')
-    assert.strictEqual(session.lastEvent.type, 'stop')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Codex first-event Stop uses synchronous transcript confirmation and stays visible', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-first-stop-backfill'
+    const transcriptPath = path.join(dir, 'codex-first-stop.jsonl')
+    fs.writeFileSync(transcriptPath, [
+      JSON.stringify({ type: 'session_meta', payload: { id: sessionId, source: 'cli' } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'finish this turn' } })
+    ].join('\n') + '\n')
+
+    runHook('scripts/hooks/codex.js', {
+      hook_event_name: 'Stop',
+      session_id: sessionId,
+      thread_id: sessionId,
+      transcript_path: transcriptPath,
+      cwd: '/tmp/demo',
+      last_assistant_message: 'done'
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.lastUserPrompt, 'finish this turn')
+    assert.notStrictEqual(session.isHiddenFromScout, true)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex prompt backfill scans beyond the old two MiB tail cap', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-deep-prompt-backfill'
+    const transcriptPath = path.join(dir, 'codex-deep-prompt.jsonl')
+    const lines = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { id: sessionId, source: { cli: 'codex' } }
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'real prompt before a long transcript tail' }
+      })
+    ]
+    const filler = 'x'.repeat(1024)
+    for (let index = 0; index < 2300; index++) {
+      lines.push(JSON.stringify({
+        type: 'response_item',
+        payload: { type: 'reasoning', id: index, text: filler }
+      }))
+    }
+    fs.writeFileSync(transcriptPath, lines.join('\n') + '\n')
+    assert.ok(fs.statSync(transcriptPath).size > 2 * 1024 * 1024)
+
+    runHook('scripts/hooks/codex.js', {
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath,
+      turn_id: 'turn-deep-backfill',
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    const session = status.sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.status, 'working')
+    assert.strictEqual(session.lastUserPrompt, 'real prompt before a long transcript tail')
+    assert.strictEqual(session.activeTool, 'Bash')
+    assert.strictEqual(session.isHiddenFromScout, undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Codex SessionStart without a transcript is silent', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-start-without-transcript'
+    runHook('scripts/hooks/codex.js', {
+      session_id: sessionId,
+      thread_id: sessionId,
+      cwd: '/tmp/demo',
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }, dir)
+
+    const statusPath = path.join(dir, '.tmux-scout', 'status.json')
+    if (fs.existsSync(statusPath)) {
+      assert.strictEqual(readScoutStatus(dir).sessions[sessionId], undefined)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('pre-confirm Codex and Claude SessionStart shells stay out of the picker', () => {
+  const dir = tempDir()
+  try {
+    const codexId = 'codex-pre-confirm-shell'
+    const transcriptPath = path.join(dir, 'codex-pre-confirm.jsonl')
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      type: 'session_meta',
+      payload: { id: codexId, source: { cli: 'codex' } }
+    }) + '\n')
+    runHook('scripts/hooks/codex.js', {
+      session_id: codexId,
+      thread_id: codexId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath,
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }, dir)
+
+    const claudeId = 'claude-pre-confirm-shell'
+    runHook('scripts/hooks/claude.js', {
+      session_id: claudeId,
+      cwd: '/tmp/demo',
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }, dir)
+
+    const status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[codexId]), 'running')
+    assert.strictEqual(currentPhase(status.sessions[claudeId]), 'running')
+    assert.strictEqual(status.sessions[codexId].lastUserPrompt, undefined)
+    assert.strictEqual(status.sessions[claudeId].lastUserPrompt, undefined)
+    assert.deepStrictEqual(getActiveSessions(status, new Map([['%1', {
+      paneId: '%1', currentCommand: 'codex', paneDead: false, windowName: 'main'
+    }]])), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('repeated SessionStart cannot demote confirmed Codex or Claude BUSY to IDLE', () => {
+  const dir = tempDir()
+  try {
+    const codexId = 'codex-repeat-start-busy'
+    const transcriptPath = path.join(dir, 'codex-repeat-start.jsonl')
+    fs.writeFileSync(transcriptPath, JSON.stringify({
+      type: 'session_meta',
+      payload: { id: codexId, source: { cli: 'codex' } }
+    }) + '\n')
+    const codexBase = {
+      session_id: codexId,
+      thread_id: codexId,
+      cwd: '/tmp/demo',
+      transcript_path: transcriptPath
+    }
+    runHook('scripts/hooks/codex.js', Object.assign({}, codexBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'keep working'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, codexBase, {
+      hook_event_name: 'SessionStart',
+      source: 'resume'
+    }), dir)
+
+    const claudeId = 'claude-repeat-start-busy'
+    const claudeBase = { session_id: claudeId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/claude.js', Object.assign({}, claudeBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'keep working'
+    }), dir)
+    runHook('scripts/hooks/claude.js', Object.assign({}, claudeBase, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+
+    const status = readScoutStatus(dir)
+    const pane = { paneId: '%1', currentCommand: 'node', paneDead: false, windowName: 'main' }
+    for (const sessionId of [codexId, claudeId]) {
+      const session = status.sessions[sessionId]
+      assert.strictEqual(currentPhase(session), 'running')
+      assert.strictEqual(session.status, 'working')
+      assert.strictEqual(session.lastUserPrompt, 'keep working')
+      session._tmuxPaneSnapshot = pane
+      const line = stripAnsi(formatLine(session, Date.now(), '%1'))
+      assert.ok(line.includes('BUSY'), line)
+      assert.ok(!line.includes('IDLE'), line)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('unknown Claude compact and clear starts do not create session shells', () => {
+  for (const source of ['compact', 'clear']) {
+    const dir = tempDir()
+    try {
+      const sessionId = `claude-${source}-without-session`
+      runHook('scripts/hooks/claude.js', {
+        session_id: sessionId,
+        cwd: '/tmp/demo',
+        hook_event_name: 'SessionStart',
+        source
+      }, dir)
+      const statusPath = path.join(dir, '.tmux-scout', 'status.json')
+      if (fs.existsSync(statusPath)) {
+        assert.strictEqual(readScoutStatus(dir).sessions[sessionId], undefined)
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   }
 })
 
@@ -6357,7 +8829,38 @@ test('codex hook bypasses PermissionRequest when approval_policy is never', () =
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.pendingInteraction, null)
-    assert.strictEqual(session.lastEvent.type, 'permission_bypassed')
+    assert.strictEqual(session.lastEvent.type, 'prompt_submit')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Codex bypass PermissionRequest is byte-for-byte inert during an existing WAIT', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-bypass-existing-wait'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'wait for approval'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+    const before = JSON.stringify(readScoutStatus(dir).sessions[sessionId])
+
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'PermissionRequest',
+      permission_mode: 'bypassPermissions',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm run build' }
+    }), dir)
+
+    const after = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(JSON.stringify(after), before)
+    assert.strictEqual(currentPhase(after), 'waitingForApproval')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -6402,7 +8905,8 @@ test('codex hook bypasses duplicate native-approved PermissionRequest only for t
     session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.pendingInteraction, null)
-    assert.strictEqual(session.lastEvent.type, 'permission_bypassed')
+    assert.strictEqual(session.lastEvent.type, 'tool_use')
+    assert.strictEqual(session.activeTool, 'Bash')
 
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
       hook_event_name: 'PermissionRequest',
@@ -6419,7 +8923,7 @@ test('codex hook bypasses duplicate native-approved PermissionRequest only for t
   }
 })
 
-test('codex hook defers Stop while approval wait is still pending', () => {
+test('codex Stop clears a stale approval wait before completing', () => {
   const dir = tempDir()
   try {
     const sessionId = 'codex-deferred-stop'
@@ -6439,8 +8943,9 @@ test('codex hook defers Stop while approval wait is still pending', () => {
     }), dir)
 
     let session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'waitingForApproval')
-    assert.strictEqual(session.deferredCompletion.phase, 'completed')
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.ok(session.stateEvidence.some(evidence => evidence.type === AGENT_EVENTS.PERMISSION_RESOLVED))
 
     runHook('scripts/hooks/codex.js', Object.assign({}, base, {
       hook_event_name: 'PostToolUse',
@@ -6448,9 +8953,9 @@ test('codex hook defers Stop while approval wait is still pending', () => {
     }), dir)
 
     session = readScoutStatus(dir).sessions[sessionId]
-    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.pendingInteraction, null)
-    assert.strictEqual(session.lastEvent.type, 'stop')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -6486,7 +8991,7 @@ test('codex hook persists event evidence with hook metadata', () => {
   }
 })
 
-test('codex hook preserves active tool after PostToolUse for stuck-turn fallback', () => {
+test('codex hook clears active tool after PostToolUse completion', () => {
   const dir = tempDir()
   try {
     const sessionId = 'codex-post-tool-active'
@@ -6504,8 +9009,7 @@ test('codex hook preserves active tool after PostToolUse for stuck-turn fallback
     const session = readScoutStatus(dir).sessions[sessionId]
     assert.strictEqual(currentPhase(session), 'running')
     assert.strictEqual(session.pendingToolUse, null)
-    assert.strictEqual(session.activeTool, 'Bash')
-    assert.strictEqual(session.preserveActiveTool, undefined)
+    assert.strictEqual(session.activeTool, null)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -6562,6 +9066,33 @@ test('codex hook does not treat unstructured Stop question text as input wait', 
     assert.strictEqual(currentPhase(session), 'completed')
     assert.strictEqual(session.needsAttention, null)
     assert.strictEqual(session.lastEvent.type, 'stop')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('codex Stop ignores unsupported payload wait flags and English option lists', () => {
+  const dir = tempDir()
+  try {
+    const sessionId = 'codex-payload-wait-flags'
+    const base = { session_id: sessionId, thread_id: sessionId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'finish the task'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, base, {
+      hook_event_name: 'Stop',
+      awaiting_input: true,
+      requires_input: true,
+      wait_for_user: true,
+      last_assistant_message: 'Which option should I use?\n1. Keep current API\n2. Add adapter'
+    }), dir)
+
+    const session = readScoutStatus(dir).sessions[sessionId]
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.needsAttention, null)
+    assert.strictEqual(session.pendingInteraction, null)
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -6757,7 +9288,7 @@ test('codex hook keeps fork-only transcript session visible', () => {
     assert.notStrictEqual(session.isHiddenFromScout, true)
     assert.notStrictEqual(session.isCodexSubagent, true)
     assert.strictEqual(session.codexForkedFromId, 'parent-session')
-    assert.strictEqual(currentPhase(session), 'idle')
+    assert.strictEqual(currentPhase(session), 'running')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -6853,6 +9384,107 @@ test('codex hidden subagents are summarized on parent picker rows', () => {
     assert.deepStrictEqual(status.sessions[parentId].activeSubagents, [])
     status.sessions[parentId]._tmuxPaneSnapshot = pane
     assert.ok(!stripAnsi(formatLine(status.sessions[parentId], Date.now(), '%1')).includes('subagent'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Codex routing keeps a parent BUSY when child hooks reuse the parent session_id', () => {
+  const dir = tempDir()
+  try {
+    const parentId = 'codex-reused-parent-id'
+    const childFromMeta = 'codex-child-from-meta'
+    const childFromPayload = 'codex-child-from-payload'
+    const parentBase = { session_id: parentId, thread_id: parentId, cwd: '/tmp/demo' }
+    runHook('scripts/hooks/codex.js', Object.assign({}, parentBase, {
+      hook_event_name: 'SessionStart',
+      source: 'startup'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, parentBase, {
+      hook_event_name: 'UserPromptSubmit',
+      prompt: 'coordinate two workers'
+    }), dir)
+
+    const sessionMeta = {
+      id: childFromMeta,
+      source: {
+        subagent: {
+          thread_spawn: {
+            parent_thread_id: parentId,
+            depth: 1,
+            agent_nickname: 'worker'
+          }
+        }
+      }
+    }
+    const reusedParentBase = Object.assign({}, parentBase, { _session_meta: sessionMeta })
+
+    // No agent_id: derive the child from session_meta.id because
+    // session_id is the parent_thread_id.
+    runHook('scripts/hooks/codex.js', Object.assign({}, reusedParentBase, {
+      hook_event_name: 'SessionStart'
+    }), dir)
+    runHook('scripts/hooks/codex.js', Object.assign({}, reusedParentBase, {
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' }
+    }), dir)
+
+    let status = readScoutStatus(dir)
+    assert.strictEqual(currentPhase(status.sessions[parentId]), 'running')
+    assert.notStrictEqual(status.sessions[parentId].isHiddenFromScout, true)
+    assert.strictEqual(status.sessions[parentId].activeSubagents.length, 1)
+    assert.strictEqual(status.sessions[parentId].activeSubagents[0].agentId, childFromMeta)
+    assert.strictEqual(status.sessions[childFromMeta].parentSessionId, parentId)
+    assert.strictEqual(status.sessions[childFromMeta].isHiddenFromScout, true)
+
+    // agent_id wins over session_meta.id and a child question cannot put the
+    // parent itself into WAIT.
+    runHook('scripts/hooks/codex.js', Object.assign({}, reusedParentBase, {
+      hook_event_name: 'PreToolUse',
+      agent_id: childFromPayload,
+      tool_name: 'request_user_input',
+      tool_input: { questions: [{ question: 'Which option?', options: [{ label: 'A' }] }] }
+    }), dir)
+
+    status = readScoutStatus(dir)
+    const parent = status.sessions[parentId]
+    assert.strictEqual(currentPhase(parent), 'running')
+    assert.strictEqual(parent.pendingInteraction, null)
+    assert.deepStrictEqual(
+      parent.activeSubagents.map(item => item.agentId).sort(),
+      [childFromMeta, childFromPayload].sort()
+    )
+    assert.strictEqual(
+      parent.activeSubagents.find(item => item.agentId === childFromPayload).phase,
+      'waitingForAnswer'
+    )
+
+    // Stop removes only the addressed child.
+    runHook('scripts/hooks/codex.js', Object.assign({}, reusedParentBase, {
+      hook_event_name: 'Stop',
+      agent_id: childFromPayload,
+      last_assistant_message: 'done'
+    }), dir)
+    status = readScoutStatus(dir)
+    assert.deepStrictEqual(status.sessions[parentId].activeSubagents.map(item => item.agentId), [childFromMeta])
+    assert.strictEqual(currentPhase(status.sessions[parentId]), 'running')
+
+    // An IDLE pane-discovery placeholder must not beat the real BUSY root.
+    status.sessions['tmux-pane:%1:codex'] = {
+      sessionId: 'tmux-pane:%1:codex',
+      agentType: 'codex',
+      phase: 'idle',
+      status: 'idle',
+      tmuxPane: '%1',
+      pid: null,
+      lastUpdated: Date.now()
+    }
+    const pane = { paneId: '%1', currentCommand: 'codex', paneDead: false, windowName: 'main' }
+    assert.deepStrictEqual(
+      getActiveSessions(status, new Map([['%1', pane]])).map(session => session.sessionId),
+      [parentId]
+    )
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

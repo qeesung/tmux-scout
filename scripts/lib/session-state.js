@@ -3,6 +3,7 @@
 const { AGENT_EVENTS, normalizeAgentEvent } = require('./agent-events')
 const {
   SESSION_CONTRACT_VERSION,
+  SESSION_PHASES,
   TERMINAL_SESSION_PHASES,
   NON_TERMINAL_END_PHASES,
   ACTIVE_TOOL_PHASES,
@@ -25,47 +26,12 @@ const SOURCE_PRIORITY = {
   unknown: 10
 }
 
-const PROTECTED_PHASE_MS = 120000
 const MAX_STATE_EVIDENCE = 20
 const EVIDENCE_DEDUPE_MS = 10000
 const TERMINAL_PHASES = TERMINAL_SESSION_PHASES
 const PENDING_RESOLUTION_EVENTS = new Set([
   AGENT_EVENTS.PERMISSION_RESOLVED,
   AGENT_EVENTS.QUESTION_ANSWERED
-])
-// While a WAIT is pending the agent is blocked on the user. A parent that now
-// spawns a subagent must have just approved that launch out-of-band (the user
-// acted in the terminal, which produces no explicit resolve hook), so treat
-// subagent_start as a resolution and return the phase to running. This event
-// carries no phase of its own, so without this it is dropped as "no phase
-// change". The pending interaction is cleared on the next lifecycle hook.
-// Only subagent_START qualifies: subagent_stop /
-// subagent_tool_activity come from an ALREADY-running subagent and do not prove
-// the parent's current wait was resolved, so including them could clear an
-// unrelated fresh approval. assistant_message_update is likewise excluded (it
-// may be the streamed question text) to keep genuine waits sticky.
-const WAIT_RESUME_EVENTS = new Set([
-  AGENT_EVENTS.SUBAGENT_START
-])
-// A sweep-INFERRED end state (an `interrupted` from the transcript/idle sweeps, or
-// a `completed` synthesised by the idle-complete sweep) reopens when a genuinely
-// NEW tool STARTS — proof the agent is working again after a false inference or a
-// missed reopening UserPromptSubmit. Only PreToolUse-class START signals qualify:
-// `tool_use` (PreToolUse) and `permission_bypassed` (emitted at permission-check
-// time, before the tool runs) both mean "a new tool is starting". POST_* events are
-// EXCLUDED on purpose — a delayed `post_tool_use` / `post_tool_use_failure` from the
-// just-aborted turn carries a hook-processing timestamp that can be newer than the
-// interrupt and would wrongly resurrect a genuinely interrupted turn (whose tool
-// never completed). A real Stop-hook `completed` (source 'hook') is NOT inferred and
-// stays sticky, so a normally-finished turn is never un-finished; only a sweep's own
-// inference is allowed to be overturned by the next genuine activity. A real
-// Stop-hook `completed` can also be reopened by a tool start carrying a DIFFERENT
-// turn id: Flux models this as `turnStarted`, and Codex goal continuations can
-// start a fresh turn without a UserPromptSubmit hook. Same-turn delayed tool
-// events remain blocked. See phaseDecision for both newer-than gates.
-const INFERRED_END_RESUME_EVENTS = new Set([
-  AGENT_EVENTS.TOOL_USE,
-  AGENT_EVENTS.PERMISSION_BYPASSED
 ])
 const TURN_START_EVENTS = new Set([
   AGENT_EVENTS.PROMPT_SUBMIT
@@ -79,19 +45,32 @@ const TURN_END_EVENTS = new Set([
   AGENT_EVENTS.PROCESS_EXIT_DETECTED,
   AGENT_EVENTS.STALE
 ])
-const DEFERRED_COMPLETION_EVENTS = new Set([
+// Adapters pass isSessionEnd: false for both turn starts and ordinary
+// sessionCompleted events. Keep this distinct from generic activity: a late
+// tool/message update may change phase, but must preserve the ended flag.
+const SESSION_END_RESET_EVENTS = new Set([
+  AGENT_EVENTS.SESSION_START,
+  AGENT_EVENTS.PROMPT_SUBMIT,
   AGENT_EVENTS.STOP,
   AGENT_EVENTS.STOP_FAILURE,
-  AGENT_EVENTS.TURN_COMPLETE,
-  AGENT_EVENTS.SESSION_END,
-  AGENT_EVENTS.INTERRUPTED
+  AGENT_EVENTS.TURN_COMPLETE
+])
+
+function eventResetsSessionEnd(event) {
+  return SESSION_END_RESET_EVENTS.has(event.type) && event.preserveSessionEnd !== true
+}
+const DEFERRED_COMPLETION_EVENTS = new Set([
+  // Distinguish an ordinary turn completion from a real session end.
+  // An ordinary completion received during WAIT stays phase-neutral; resolving
+  // that WAIT returns to RUNNING. Only a true SessionEnd may be finalized
+  // after the matching resolver.
+  AGENT_EVENTS.SESSION_END
 ])
 const TOOL_CLEAR_EVENTS = new Set([
   AGENT_EVENTS.SESSION_START,
   AGENT_EVENTS.PROMPT_SUBMIT,
   AGENT_EVENTS.POST_TOOL_USE,
   AGENT_EVENTS.POST_TOOL_USE_FAILURE,
-  AGENT_EVENTS.PERMISSION_BYPASSED,
   AGENT_EVENTS.STOP,
   AGENT_EVENTS.STOP_FAILURE,
   AGENT_EVENTS.TURN_COMPLETE,
@@ -247,24 +226,65 @@ function phaseForEvent(event) {
   return phaseForAgentEvent(event)
 }
 
+function isMatchingPendingResolution(session, eventType) {
+  const phase = currentPhase(session)
+  return (phase === 'waitingForApproval' && eventType === AGENT_EVENTS.PERMISSION_RESOLVED) ||
+    (phase === 'waitingForAnswer' && eventType === AGENT_EVENTS.QUESTION_ANSWERED)
+}
+
+function isHookManagedSession(session, event) {
+  return normalizeSource(event && event.source) === 'hook' ||
+    normalizeSource(session && session.lifecycle && session.lifecycle.source) === 'hook' ||
+    String(session && session.stateSource || '').endsWith('-hooks')
+}
+
 function phaseDecision(session, event, nextPhase, now) {
   if (!nextPhase) return { apply: false, blockedReason: 'no phase change' }
   const current = currentPhase(session)
-  if (TERMINAL_PHASES.has(nextPhase)) return { apply: true }
-
-  const incomingPriority = Number.isFinite(event.priority)
-    ? event.priority
-    : sourcePriority(event.source)
   const lifecycle = session.lifecycle || {}
-  const currentPriority = Number.isFinite(lifecycle.priority)
-    ? lifecycle.priority
-    : sourcePriority(session.stateSource)
   const currentUpdatedAt = Number.isFinite(lifecycle.updatedAt)
     ? lifecycle.updatedAt
     : (session.lastUpdated || 0)
-  const currentAge = now - currentUpdatedAt
   const currentIsTerminal = TERMINAL_PHASES.has(current)
-  const currentSource = normalizeSource(lifecycle.source || session.stateSource)
+
+  // Deliberately guard only permissionResolved. questionAnswered (and
+  // planConfirmationAnswered, represented by the same canonical event here)
+  // always clears the question phase and returns to running/completed.
+  if (event.type === AGENT_EVENTS.QUESTION_ANSWERED) return { apply: true }
+
+  // Keep a pending approval/question visible across ordinary
+  // activity and turn completion. Only the matching explicit resolver or a new
+  // session start may leave the wait; a real SessionEnd is the sole completion
+  // that may be parked for finalization. Pane/PID observations, notifications,
+  // subagent activity and force flags cannot guess that the user acted.
+  if (PENDING_INTERACTION_PHASES.has(current)) {
+    const matchingResolver =
+      (current === 'waitingForApproval' && event.type === AGENT_EVENTS.PERMISSION_RESOLVED) ||
+      (current === 'waitingForAnswer' && event.type === AGENT_EVENTS.QUESTION_ANSWERED)
+    const explicitWait =
+      (nextPhase === 'waitingForApproval' && event.type === AGENT_EVENTS.PERMISSION_REQUEST) ||
+      (nextPhase === 'waitingForAnswer' && event.type === AGENT_EVENTS.QUESTION_ASKED)
+    const explicitSessionStart = event.type === AGENT_EVENTS.SESSION_START ||
+      event.type === AGENT_EVENTS.PROMPT_SUBMIT
+    const deferredEnd = NON_TERMINAL_END_PHASES.has(nextPhase) &&
+      DEFERRED_COMPLETION_EVENTS.has(event.type)
+
+    if (event.resolvedPendingInteraction || matchingResolver || explicitWait || explicitSessionStart || deferredEnd) {
+      return { apply: true }
+    }
+    return {
+      apply: false,
+      blockedReason: `current phase ${current} only exits on its matching explicit resolution`
+    }
+  }
+
+  // Pane inspection is transport/liveness metadata, not an agent lifecycle
+  // event. Adapters never derive a semantic phase from terminal contents.
+  if (event.type === AGENT_EVENTS.PANE_STATE) {
+    return { apply: false, blockedReason: 'pane observations are phase-neutral' }
+  }
+
+  if (TERMINAL_PHASES.has(nextPhase)) return { apply: true }
 
   if (currentIsTerminal && !TERMINAL_PHASES.has(nextPhase) && event.type !== AGENT_EVENTS.SESSION_START) {
     // Stale is inferred from pid liveness, not observed from the agent.
@@ -291,44 +311,13 @@ function phaseDecision(session, event, nextPhase, now) {
   if (NON_TERMINAL_END_PHASES.has(current) &&
     nextPhase === 'running' &&
     event.type !== AGENT_EVENTS.PROMPT_SUBMIT &&
-    event.type !== AGENT_EVENTS.SESSION_START) {
-    // Recover a sweep-INFERRED end when a genuinely new tool starts and the event is
-    // newer than the inference: an `interrupted` (always inferred) or an idle-sweep
-    // `completed` whose lifecycle source is 'stale'. A real Stop-hook completion
-    // (source 'hook') is observed ground truth and stays sticky, so a normal turn is
-    // never un-finished. The newer-than gate stops a delayed in-flight event from the
-    // aborted turn from resurrecting a genuinely ended turn (which emits nothing new
-    // until the user's next prompt — already allowed above).
-    const eventTimestamp = Number.isFinite(event.timestamp) ? event.timestamp : now
-    const previousTurnId = session.lastTurnId || session.currentTurnId
-    const startsDifferentTurn = current === 'completed' &&
-      INFERRED_END_RESUME_EVENTS.has(event.type) &&
-      event.turnId &&
-      previousTurnId &&
-      event.turnId !== previousTurnId
-    if (startsDifferentTurn && eventTimestamp >= currentUpdatedAt) {
-      return { apply: true }
-    }
-
-    const inferredEnd = current === 'interrupted' ||
-      (current === 'completed' && currentSource === 'stale')
-    if (inferredEnd && INFERRED_END_RESUME_EVENTS.has(event.type)) {
-      if (eventTimestamp >= currentUpdatedAt) return { apply: true }
-    }
+    event.type !== AGENT_EVENTS.SESSION_START &&
+    event.type !== AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE &&
+    event.type !== AGENT_EVENTS.NOTIFICATION) {
     return { apply: false, blockedReason: `current phase ${current} only reopens on a new turn` }
   }
   if (event.force) return { apply: true }
   if (nextPhase === 'interrupted') return { apply: true }
-  if (event.type === AGENT_EVENTS.PANE_STATE && nextPhase === 'running' && currentSource === 'transcript'
-    && (current === 'waitingForApproval' || current === 'waitingForAnswer')) {
-    return { apply: true }
-  }
-  if (incomingPriority < currentPriority && currentAge < PROTECTED_PHASE_MS) {
-    return {
-      apply: false,
-      blockedReason: `source priority ${incomingPriority} below ${currentPriority} within ${PROTECTED_PHASE_MS}ms protection window`
-    }
-  }
   if (current === nextPhase) return { apply: true }
 
   return { apply: true }
@@ -458,6 +447,7 @@ function eventFromDeferredCompletion(deferred, resolver, now) {
     rawEventName,
     timestamp: now,
     originalTimestamp: deferred.originalTimestamp || deferred.timestamp,
+    endedAt: deferred.originalTimestamp || deferred.timestamp,
     reason: deferred.terminalReason || deferred.reason || resolver.reason,
     details: deferred.details || resolver.details,
     turnId: deferred.turnId || resolver.turnId,
@@ -468,6 +458,7 @@ function eventFromDeferredCompletion(deferred, resolver, now) {
     priority: Number.isFinite(deferred.priority) ? deferred.priority : sourcePriority(source),
     terminalKind: deferred.terminalKind,
     terminalReason: deferred.terminalReason || deferred.reason,
+    resolvedPendingInteraction: true,
     force: true,
     lastEvent: {
       type: deferred.type,
@@ -495,7 +486,10 @@ function setPhase(session, phase, event, now) {
   session.needsAttention = attentionForPhase(phase, event.attentionReason || event.needsAttention)
   updateTurnLifecycle(session, event, phase, now)
 
-  if (!ACTIVE_TOOL_PHASES.has(phase)) {
+  if (event.activeTool !== undefined &&
+    (event.activeTool === null || ACTIVE_TOOL_PHASES.has(phase))) {
+    session.activeTool = event.activeTool
+  } else if (!ACTIVE_TOOL_PHASES.has(phase)) {
     session.activeTool = null
   }
   if (!PENDING_INTERACTION_PHASES.has(phase)) {
@@ -515,7 +509,9 @@ function setPhase(session, phase, event, now) {
     session.endedAt = event.endedAt || now
   } else if (TERMINAL_PHASES.has(phase)) {
     session.endedAt = event.endedAt || now
-  } else if (NON_TERMINAL_END_PHASES.has(phase) || phase === 'running' || phase === 'waitingForApproval' || phase === 'waitingForAnswer' || phase === 'idle') {
+  } else if (eventResetsSessionEnd(event)) {
+    // Clear isSessionEnded on sessionStarted, turnStarted and
+    // ordinary sessionCompleted. Late activity must not resurrect an ended row.
     session.endedAt = null
   }
 
@@ -556,11 +552,7 @@ function eventClearsPendingToolUse(event) {
 
 function eventClearsActiveTool(event) {
   if (event.activeTool === null) return true
-  if (event.preserveActiveTool) return false
-  return event.pendingToolUse === null ||
-    TOOL_CLEAR_EVENTS.has(event.type) ||
-    event.type === AGENT_EVENTS.QUESTION_ASKED ||
-    event.type === AGENT_EVENTS.PERMISSION_REQUEST
+  return TOOL_CLEAR_EVENTS.has(event.type)
 }
 
 function activeToolAllowedForPhase(phase) {
@@ -637,6 +629,19 @@ function applySessionEvent(session, event) {
     pid: session.pid
   })
   const now = Number.isFinite(event.timestamp) ? event.timestamp : Date.now()
+
+  // permissionResolved outside an approval wait is a
+  // true reducer no-op. A duplicate resolver must not refresh updatedAt and
+  // thereby extend a phantom BUSY timeout window.
+  if (event.type === AGENT_EVENTS.PERMISSION_RESOLVED && currentPhase(session) !== 'waitingForApproval') {
+    return {
+      changed: false,
+      applied: false,
+      evidenceChanged: false,
+      blockedReason: 'permission_resolved requires waitingForApproval'
+    }
+  }
+
   const before = JSON.stringify(session)
   const previousPhase = currentPhase(session)
 
@@ -647,27 +652,41 @@ function applySessionEvent(session, event) {
   }
 
   const deferredCompletion = cleanDeferredCompletion(session.deferredCompletion)
-  const resolvingDeferred = Boolean(deferredCompletion && PENDING_RESOLUTION_EVENTS.has(event.type))
+  const resolvingDeferred = Boolean(deferredCompletion && (
+    isMatchingPendingResolution(session, event.type) ||
+    event.type === AGENT_EVENTS.QUESTION_ANSWERED
+  ))
   const phaseEvent = resolvingDeferred
     ? eventFromDeferredCompletion(deferredCompletion, event, now)
     : event
-  let nextPhase = resolvingDeferred ? deferredCompletion.phase : phaseForEvent(event)
-  if (!nextPhase &&
-    !resolvingDeferred &&
-    PENDING_INTERACTION_PHASES.has(currentPhase(session)) &&
-    WAIT_RESUME_EVENTS.has(event.type)) {
-    nextPhase = 'running'
-  }
+  const endedHookResolution = !resolvingDeferred && Boolean(session.endedAt) &&
+    !TERMINAL_PHASES.has(previousPhase) &&
+    isHookManagedSession(session, event) &&
+    (event.type === AGENT_EVENTS.QUESTION_ANSWERED ||
+      (event.type === AGENT_EVENTS.PERMISSION_RESOLVED && previousPhase === 'waitingForApproval'))
+  let nextPhase = resolvingDeferred || endedHookResolution
+    ? SESSION_PHASES.COMPLETED
+    : phaseForEvent(event)
   const decision = phaseDecision(session, phaseEvent, nextPhase, now)
   let applied = decision.apply
   let deferredPhase = false
   if (!resolvingDeferred && applied && shouldDeferCompletion(session, event, nextPhase)) {
     rememberDeferredCompletion(session, event, nextPhase, now)
+    if (event.type === AGENT_EVENTS.SESSION_END) session.endedAt = event.endedAt || now
     applied = false
     deferredPhase = true
     decision.blockedReason = 'deferred until pending interaction resolves'
   }
   if (applied) setPhase(session, nextPhase, phaseEvent, now)
+  if (!applied && PENDING_INTERACTION_PHASES.has(previousPhase) &&
+    eventResetsSessionEnd(event) &&
+    event.type !== AGENT_EVENTS.SESSION_START &&
+    event.type !== AGENT_EVENTS.PROMPT_SUBMIT) {
+    // Preserve the pending phase but still apply sessionCompleted's
+    // explicit isSessionEnd:false field.
+    session.endedAt = null
+    if (session.deferredCompletion) session.deferredCompletion = null
+  }
 
   const evidenceChanged = appendStateEvidence(
     session,
@@ -735,7 +754,6 @@ module.exports = {
   currentPhase,
   sourcePriority,
   normalizeSource,
-  PROTECTED_PHASE_MS,
   MAX_STATE_EVIDENCE,
   EVIDENCE_DEDUPE_MS
 }

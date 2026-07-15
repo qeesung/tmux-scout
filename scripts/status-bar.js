@@ -58,20 +58,22 @@ function summarizeSessions(active) {
 
   for (const s of active) {
     const phase = s && (s.phase || phaseFromLegacyStatus(s.status, s.needsAttention) || 'idle')
-    const isWait = phase === 'waitingForApproval' ||
-      phase === 'waitingForAnswer' ||
-      Boolean(s && (s.pendingInteraction || s.needsAttention))
-    if (isWait) {
+    if (phase === 'waitingForApproval' || phase === 'waitingForAnswer') {
       counts.wait++
-      const code = waitCode(s)
+      // Render only from canonical phase. Pending details refine an
+      // approval into PLAN, but stale fields must never change the phase's
+      // top-level class (for example running -> WAIT or completed -> BUSY).
+      const code = phase === 'waitingForAnswer'
+        ? 'ANS'
+        : waitCode(s) === 'PLAN' ? 'PLAN' : 'APP'
       if (code === 'APP') counts.approval++
       else if (code === 'ANS') counts.question++
       else if (code === 'PLAN') counts.plan++
-    } else if (phase === 'running' || s.status === 'working') {
+    } else if (phase === 'running') {
       counts.busy++
-    } else if (phase === 'completed' || s.status === 'completed') {
+    } else if (phase === 'completed') {
       counts.done++
-    } else if (phase === 'idle' || s.status === 'idle') {
+    } else if (phase === 'idle') {
       counts.idle++
     }
   }

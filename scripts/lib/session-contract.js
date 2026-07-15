@@ -61,7 +61,6 @@ const SESSION_CONTRACT_VERSION = 1
  * @property {string=} toolCallId
  * @property {string=} toolUseId
  * @property {boolean=} force
- * @property {boolean=} preserveActiveTool
  *
  * @typedef {Object} SessionSnapshot
  * @property {string} sessionId
@@ -143,7 +142,6 @@ const AGENT_EVENT_SCHEMA = Object.freeze({
     tmuxPane: FIELD_TYPES.STRING,
     pid: FIELD_TYPES.NUMBER,
     force: FIELD_TYPES.BOOLEAN,
-    preserveActiveTool: FIELD_TYPES.BOOLEAN,
     updates: FIELD_TYPES.OBJECT
   })
 })
@@ -260,7 +258,9 @@ const NON_TERMINAL_END_PHASES = new Set([
 ])
 
 const ACTIVE_TOOL_PHASES = new Set([
-  SESSION_PHASES.RUNNING
+  SESSION_PHASES.RUNNING,
+  SESSION_PHASES.WAITING_FOR_APPROVAL,
+  SESSION_PHASES.WAITING_FOR_ANSWER
 ])
 
 const PENDING_INTERACTION_PHASES = new Set([
@@ -269,12 +269,21 @@ const PENDING_INTERACTION_PHASES = new Set([
 ])
 
 const AGENT_EVENT_PHASES = Object.freeze({
-  [AGENT_EVENTS.SESSION_START]: SESSION_PHASES.IDLE,
+  // sessionStarted always enters running. Unconfirmed hook
+  // shells are hidden by picker visibility; IDLE is reserved for pane discovery.
+  [AGENT_EVENTS.SESSION_START]: SESSION_PHASES.RUNNING,
   [AGENT_EVENTS.PROMPT_SUBMIT]: SESSION_PHASES.RUNNING,
   [AGENT_EVENTS.TOOL_USE]: SESSION_PHASES.RUNNING,
-  [AGENT_EVENTS.POST_TOOL_USE]: SESSION_PHASES.RUNNING,
-  [AGENT_EVENTS.POST_TOOL_USE_FAILURE]: SESSION_PHASES.RUNNING,
+  // toolUseCompleted is phase-neutral. In particular, it may clear the
+  // active tool while an unrelated approval/question remains sticky.
+  [AGENT_EVENTS.POST_TOOL_USE]: undefined,
+  [AGENT_EVENTS.POST_TOOL_USE_FAILURE]: undefined,
   [AGENT_EVENTS.PERMISSION_BYPASSED]: SESSION_PHASES.RUNNING,
+  // These tmux event names are adapters' persisted form of
+  // activityUpdated. SessionState makes activity RUNNING unless a WAIT is
+  // currently sticky.
+  [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE]: SESSION_PHASES.RUNNING,
+  [AGENT_EVENTS.NOTIFICATION]: SESSION_PHASES.RUNNING,
   [AGENT_EVENTS.PERMISSION_RESOLVED]: SESSION_PHASES.RUNNING,
   [AGENT_EVENTS.QUESTION_ANSWERED]: SESSION_PHASES.RUNNING,
   [AGENT_EVENTS.PERMISSION_REQUEST]: SESSION_PHASES.WAITING_FOR_APPROVAL,
@@ -286,6 +295,7 @@ const AGENT_EVENT_PHASES = Object.freeze({
   [AGENT_EVENTS.SESSION_DELETE]: undefined,
   [AGENT_EVENTS.DISCOVERED]: SESSION_PHASES.IDLE,
   [AGENT_EVENTS.INTERRUPTED]: SESSION_PHASES.INTERRUPTED,
+  [AGENT_EVENTS.PROCESS_DETACHED]: undefined,
   [AGENT_EVENTS.PROCESS_EXIT_DETECTED]: SESSION_PHASES.INTERRUPTED,
   [AGENT_EVENTS.STALE]: SESSION_PHASES.STALE
 })
@@ -358,6 +368,11 @@ const PICKER_TERMINAL_DISPLAY_PHASES = new Set([
 //   'pane'    — bound to a tmux pane; render.js decides via pane/PID liveness
 function isVisibleInPicker(session, options = {}) {
   if (!session || typeof session !== 'object') return 'hidden'
+  if (session.parentSessionId) return 'hidden'
+  // Pane discovery is liveness/identity transport only. There is no semantic
+  // "process exists => IDLE" transition, and process presence cannot
+  // distinguish an idle prompt from a model that is actively thinking.
+  if (session.stateSource === 'pane-discovery') return 'hidden'
   const now = Number.isFinite(options.now) ? options.now : Date.now()
   const terminalDisplayMs = Number.isFinite(options.terminalDisplayMs)
     ? options.terminalDisplayMs
@@ -365,6 +380,23 @@ function isVisibleInPicker(session, options = {}) {
   const phase = session.phase ||
     phaseFromLegacyStatus(session.status, session.needsAttention) ||
     SESSION_PHASES.IDLE
+
+  // Hide every local hook-managed shell until a real user prompt is
+  // known. WAIT itself is sufficient user-facing evidence. Kimi is the sole
+  // CLI exception; pull adapters are also exempt.
+  const isHookSnapshot = Boolean(session.lastHookEventName) || String(session.stateSource || '').endsWith('-hooks')
+  const promptOptionalAgent = session.agentType === 'kimi' ||
+    session.agentType === 'aime' ||
+    session.agentType === 'magibook'
+  if (isHookSnapshot && !promptOptionalAgent && !PENDING_INTERACTION_PHASES.has(phase) && !session.lastUserPrompt) {
+    return 'hidden'
+  }
+
+  // Check WAIT before isSessionEnded. A concrete approval/question is
+  // therefore still visible even if it arrives after a session-end marker.
+  if (PENDING_INTERACTION_PHASES.has(phase)) {
+    return session.tmuxPane ? 'pane' : 'visible'
+  }
 
   if (PICKER_TERMINAL_DISPLAY_PHASES.has(phase)) {
     const ts = session.endedAt || session.lastUpdated || 0

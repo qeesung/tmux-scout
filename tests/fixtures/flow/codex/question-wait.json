@@ -23,7 +23,7 @@
     {
       "payload": {
         "hook_event_name": "Stop",
-        "last_assistant_message": "Which implementation should I use?\n1. Keep the current API\n2. Add a new adapter"
+        "last_assistant_message": "1. 你更希望采用哪种实现？\n- 保持当前 API\n- 新增适配器"
       }
     }
   ],
@@ -39,7 +39,6 @@
     "lastEvent.type": "question_asked"
   },
   "expectEvidenceTypes": [
-    "session_start",
     "prompt_submit",
     "question_asked"
   ]

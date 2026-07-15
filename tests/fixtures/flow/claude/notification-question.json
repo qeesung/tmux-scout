@@ -1,5 +1,5 @@
 {
-  "name": "claude notification question wait",
+  "name": "claude question prose notification remains phase-neutral",
   "agent": "claude",
   "sessionId": "fixture-claude-notif-question",
   "payloadDefaults": {
@@ -29,13 +29,12 @@
   "expect": {
     "agentType": "claude",
     "status": "working",
-    "phase": "waitingForAnswer",
-    "needsAttention": "waiting for answer",
-    "pendingInteraction.type": "question",
+    "phase": "running",
+    "needsAttention": null,
+    "pendingInteraction": null,
     "activeTool": null
   },
   "expectEvidenceTypes": [
-    "prompt_submit",
-    "question_asked"
+    "prompt_submit"
   ]
 }

@@ -1,5 +1,5 @@
 {
-  "name": "claude notification idle completes the turn",
+  "name": "claude notification remains phase-neutral",
   "agent": "claude",
   "sessionId": "fixture-claude-notif-idle",
   "payloadDefaults": {
@@ -28,8 +28,8 @@
   ],
   "expect": {
     "agentType": "claude",
-    "status": "completed",
-    "phase": "completed",
+    "status": "working",
+    "phase": "running",
     "needsAttention": null,
     "pendingInteraction": null,
     "activeTool": null

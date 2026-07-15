@@ -12,12 +12,7 @@ const { readProcessTable, findAgentProcessFromPane } = require('../lib/process-t
 const { isHiddenCodexSession } = require('../lib/codex-session-classifier')
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { AGENTS, agentConfig } = require('../lib/agents')
-const {
-  findLatestCodexInterrupt,
-  findLatestCodexPlanWait,
-  findLatestCodexOpenTurnActivity
-} = require('../lib/codex-transcript-detector')
-const { backgroundShellDetails, isBackgroundShellRunningText } = require('../lib/background-activity')
+const { findLatestCodexTurnEnd } = require('../lib/codex-transcript-detector')
 const { deleteSession, pruneSessions } = require('../lib/session-registry')
 
 let statusFile = process.argv[2] || ''
@@ -29,23 +24,9 @@ const CLAUDE_INTERRUPT_MARKER = '[Request interrupted by user]'
 // matching on the shared prefix + closing ']' covers it and any future '...for X'.
 const CLAUDE_INTERRUPT_MARKER_PREFIX = '[Request interrupted by user'
 const CODEX_TRANSCRIPT_SETTLE_GATE_MS = 3000
+const CODEX_TRANSCRIPT_SCAN_VERSION = 2
 const CODEX_STUCK_INTERRUPT_THRESHOLD_MS = 180000
-const CODEX_PLAN_WAIT_COMPLETED_RECOVERY_MS = 10 * 60 * 1000
-const BACKGROUND_ACTIVITY_RECOVERY_MS = 30 * 60 * 1000
-const BACKGROUND_ACTIVITY_AGENTS = new Set(['coco', 'trae', 'traex'])
-// An agent blocked on a permission/question prompt writes NOTHING to its
-// transcript while waiting. Once the transcript advances past the moment the wait
-// began (plus a small settle margin), the user must have acted in the terminal —
-// so we resolve the wait even if the resolving hook (PostToolUse / SubagentStart /
-// etc.) was missed or arrived in an order we don't treat as a resolver. Applies
-// to any agent that exposes a transcript (Claude, Codex, Copilot, …). This is the
-// hook-side transcript backstop for a resolver hook we never observed.
-const WAIT_RESOLVE_SETTLE_MS = 5000
-// Time-based safety net: a running session that goes fully silent (no hook, no
-// transcript write, no active tool) for this long almost certainly finished its
-// turn but missed its Stop hook, so we complete it. A time-based reconcile safety
-// net — but maps to `completed` (DONE), not `interrupted`.
-const IDLE_COMPLETE_THRESHOLD_MS = 180000
+const CLAUDE_IDLE_INTERRUPT_THRESHOLD_MS = 120000
 
 function createStats(options = {}) {
   return {
@@ -60,14 +41,12 @@ function createStats(options = {}) {
       pidBindings: 0,
       paneDiscoveries: 0,
       discoveryUpdates: 0,
-      discoveryReplacements: 0,
-      backgroundActivity: 0
+      discoveryReplacements: 0
     },
     codex: {
       discovered: 0,
       updated: 0,
-      turnStarts: 0,
-      planWaits: 0,
+      completed: 0,
       interrupted: 0,
       idleInterrupted: 0,
       stale: 0,
@@ -80,7 +59,6 @@ function createStats(options = {}) {
     claudeTranscript: {
       interrupted: 0,
       idleInterrupted: 0,
-      waitResolved: 0,
       filesRead: 0,
       skippedUnchanged: 0,
       parseErrors: 0
@@ -588,7 +566,7 @@ function reconcileSessions(status, panes, stats, options = {}) {
 
 // --- Codex transcript helpers ---
 
-function codexInterruptForSession(session) {
+function codexTurnEndForSession(session) {
   const transcriptPath = session && session.transcriptPath
   if (!transcriptPath) return null
 
@@ -596,44 +574,13 @@ function codexInterruptForSession(session) {
   const minTimestampMs = Math.max(0, (session.lastUpdated || session.startedAt || 0) - 1000)
 
   if (expectedTurnId) {
-    const exactHit = findLatestCodexInterrupt(transcriptPath, { expectTurnId: expectedTurnId })
-    if (exactHit) return exactHit
+    // Never degrade an exact turn lookup into timestamp matching. A
+    // different or missing turn_id is not evidence that the current turn
+    // ended, even if its timestamp is recent.
+    return findLatestCodexTurnEnd(transcriptPath, { expectTurnId: expectedTurnId })
   }
 
-  const timestampHit = findLatestCodexInterrupt(transcriptPath, { minTimestampMs })
-  if (!timestampHit) return null
-  if (expectedTurnId && timestampHit.turnId && timestampHit.turnId !== expectedTurnId) return null
-  return timestampHit
-}
-
-function codexPlanWaitForSession(session) {
-  const transcriptPath = session && session.transcriptPath
-  if (!transcriptPath) return null
-
-  const expectedTurnId = session && session.lastTurnId
-  const minTimestampMs = Math.max(0, (session.lastUpdated || session.startedAt || 0) - 1000)
-
-  if (expectedTurnId) {
-    const exactHit = findLatestCodexPlanWait(transcriptPath, { expectTurnId: expectedTurnId })
-    if (exactHit) return exactHit
-  }
-
-  const timestampHit = findLatestCodexPlanWait(transcriptPath, { minTimestampMs })
-  if (!timestampHit) return null
-  if (expectedTurnId && timestampHit.turnId && timestampHit.turnId !== expectedTurnId) return null
-  return timestampHit
-}
-
-function codexOpenTurnForSession(session) {
-  const transcriptPath = session && session.transcriptPath
-  if (!transcriptPath) return null
-
-  const previousTurnId = session && session.lastTurnId
-  const minTimestampMs = Math.max(0, (session.lastUpdated || session.startedAt || 0) - 1000)
-  const hit = findLatestCodexOpenTurnActivity(transcriptPath, { minTimestampMs })
-  if (!hit) return null
-  if (previousTurnId && hit.turnId === previousTurnId) return null
-  return hit
+  return findLatestCodexTurnEnd(transcriptPath, { minTimestampMs })
 }
 
 function codexTranscriptState(options) {
@@ -655,28 +602,6 @@ function optionDisabled(options, key) {
 function thresholdMs(options, key, fallback) {
   if (options && Number.isFinite(options[key])) return Math.max(0, options[key])
   return fallback
-}
-
-function activeSubagentCount(session) {
-  return Array.isArray(session && session.activeSubagents)
-    ? session.activeSubagents.filter(Boolean).length
-    : 0
-}
-
-function lastSessionActivityAt(session) {
-  return Math.max(
-    Number.isFinite(session.lastHookAt) ? session.lastHookAt : 0,
-    Number.isFinite(session.lastUpdated) ? session.lastUpdated : 0,
-    session.lastEvent && Number.isFinite(session.lastEvent.timestamp) ? session.lastEvent.timestamp : 0,
-    session.pendingToolUse && Number.isFinite(session.pendingToolUse.timestamp) ? session.pendingToolUse.timestamp : 0
-  )
-}
-
-function compactPlanWaitDetails(hit) {
-  const text = String(hit && hit.planText || '')
-  const line = text.split('\n').map(part => part.trim()).find(Boolean)
-  const summary = (line || 'Codex plan awaiting confirmation').replace(/^#+\s*/, '')
-  return summary.length > 180 ? summary.slice(0, 179) + '~' : summary
 }
 
 function latestTurnKey(session) {
@@ -711,6 +636,7 @@ function shouldSkipCodexTranscriptScan(sessionId, session, options, stats, now) 
   const cache = state[sessionId]
   const turnKey = latestTurnKey(session)
   if (cache &&
+    cache.scanVersion === CODEX_TRANSCRIPT_SCAN_VERSION &&
     cache.transcriptPath === session.transcriptPath &&
     cache.latestTurnId === turnKey &&
     cache.lastScannedSize === stat.size &&
@@ -729,6 +655,7 @@ function updateCodexTranscriptScanState(sessionId, session, options, stat, now) 
   const nextStat = stat || statTranscriptFile(session.transcriptPath)
   if (!nextStat) return
   state[sessionId] = {
+    scanVersion: CODEX_TRANSCRIPT_SCAN_VERSION,
     transcriptPath: session.transcriptPath,
     latestTurnId: latestTurnKey(session),
     lastScannedSize: nextStat.size,
@@ -745,6 +672,7 @@ function pruneCodexTranscriptScanState(status, options) {
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (isHiddenCodexSession(session)) continue
     if (!session || session.agentType !== 'codex' || session.endedAt || !session.transcriptPath) continue
+    if (session.isRemote || session.parentSessionId) continue
     if (!isActiveCodexTranscriptPhase(currentPhase(session))) continue
     keep.add(sessionId)
   }
@@ -754,118 +682,18 @@ function pruneCodexTranscriptScanState(status, options) {
 }
 
 function isActiveCodexTranscriptPhase(phase) {
-  return phase === 'running' || phase === 'waitingForApproval' || phase === 'waitingForAnswer'
+  return phase === 'running'
 }
 
-function isCodexPlanWaitCandidatePhase(phase, session, now, options) {
-  if (phase === 'running') return true
-  if (phase !== 'completed') return false
-
-  const maxAgeMs = thresholdMs(options, 'codexPlanWaitCompletedRecoveryMs', CODEX_PLAN_WAIT_COMPLETED_RECOVERY_MS)
-  const lastActivityAt = lastSessionActivityAt(session)
-  return !lastActivityAt || now - lastActivityAt <= maxAgeMs
-}
-
-function isCodexCompletedRecoveryCandidate(session, now, options) {
-  if (currentPhase(session) !== 'completed') return false
-  const maxAgeMs = thresholdMs(options, 'codexPlanWaitCompletedRecoveryMs', CODEX_PLAN_WAIT_COMPLETED_RECOVERY_MS)
-  const lastActivityAt = lastSessionActivityAt(session)
-  return !lastActivityAt || now - lastActivityAt <= maxAgeMs
-}
-
-function sweepCodexOpenTurns(status, stats, options = {}) {
-  const now = Date.now()
-  let changed = false
-  const turnScanOptions = Object.assign({}, options, { codexTranscriptSettleGateMs: 0 })
-
-  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (isHiddenCodexSession(session)) continue
-    if (!session || session.agentType !== 'codex' || session.endedAt) continue
-    if (!isCodexCompletedRecoveryCandidate(session, now, options)) continue
-    if (!session.transcriptPath) continue
-
-    const scan = shouldSkipCodexTranscriptScan(sessionId, session, turnScanOptions, null, now)
-    if (scan.skip) continue
-
-    const hit = codexOpenTurnForSession(session)
-    if (!hit) continue
-
-    const updated = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.PROMPT_SUBMIT,
-      source: 'transcript',
-      timestamp: hit.timestampMs || now,
-      reason: 'Codex transcript started a new turn',
-      details: 'turn started from transcript',
-      rawEventName: hit.rawEventName || 'turnStarted',
-      turnId: hit.turnId,
-      transcriptPath: session.transcriptPath,
-      activeTool: null,
-      force: true
-    }, stats)
-    if (updated && stats && stats.codex) stats.codex.turnStarts++
-    changed = updated || changed
-  }
-
-  if (changed) {
-    status.lastUpdated = now
-    persistStatus(status)
-  }
-}
-
-function sweepCodexPlanWaits(status, stats, options = {}) {
-  const now = Date.now()
-  let changed = false
-  const planScanOptions = Object.assign({}, options, { codexTranscriptSettleGateMs: 0 })
-
-  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (isHiddenCodexSession(session)) continue
-    if (!session || session.agentType !== 'codex' || session.endedAt) continue
-    if (!isCodexPlanWaitCandidatePhase(currentPhase(session), session, now, options)) continue
-    if (!session.transcriptPath) continue
-
-    const scan = shouldSkipCodexTranscriptScan(sessionId, session, planScanOptions, null, now)
-    if (scan.skip) continue
-
-    const hit = codexPlanWaitForSession(session)
-    if (!hit) continue
-
-    const details = compactPlanWaitDetails(hit)
-    const updated = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.PERMISSION_REQUEST,
-      source: 'transcript',
-      timestamp: hit.completedAtMs || now,
-      reason: 'waiting for plan approval',
-      attentionReason: 'waiting for plan approval',
-      details,
-      rawEventName: hit.rawEventName || 'item_completed:Plan/task_complete',
-      requestId: hit.planId || hit.turnId,
-      turnId: hit.turnId,
-      transcriptPath: session.transcriptPath,
-      pendingToolUse: {
-        tool: 'ExitPlanMode',
-        details: `ExitPlanMode: ${details}`,
-        timestamp: hit.completedAtMs || now
-      },
-      activeTool: null,
-      force: true
-    }, stats)
-    if (updated && stats && stats.codex) stats.codex.planWaits++
-    changed = updated || changed
-  }
-
-  if (changed) {
-    status.lastUpdated = now
-    persistStatus(status)
-  }
-}
-
-function sweepInterruptedCodexTranscripts(status, stats, options = {}) {
+function sweepCompletedCodexTranscripts(status, stats, options = {}) {
   const now = Date.now()
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (isHiddenCodexSession(session)) continue
     if (!session || session.agentType !== 'codex' || session.endedAt) continue
+    if (session.isRemote) continue
+    if (session.parentSessionId) continue
     if (!isActiveCodexTranscriptPhase(currentPhase(session))) continue
     if (!session.transcriptPath) continue
 
@@ -873,22 +701,29 @@ function sweepInterruptedCodexTranscripts(status, stats, options = {}) {
     if (scan.skip) continue
 
     if (stats && stats.codex) stats.codex.filesRead++
-    const hit = codexInterruptForSession(session)
+    const hit = codexTurnEndForSession(session)
     updateCodexTranscriptScanState(sessionId, session, options, scan.stat, now)
     if (!hit) continue
 
+    const interrupted = hit.completionKind === 'interrupted'
+
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.INTERRUPTED,
+      type: AGENT_EVENTS.TURN_COMPLETE,
       source: 'transcript',
-      timestamp: hit.abortedAtMs || now,
-      reason: 'Codex transcript recorded turn_aborted/interrupted',
-      details: 'interrupted',
-      rawEventName: hit.rawEventName || 'turn_aborted',
+      timestamp: hit.endedAtMs || now,
+      reason: interrupted
+        ? 'Codex transcript recorded turn_aborted/interrupted'
+        : 'Codex transcript recorded task_complete',
+      details: interrupted ? 'interrupted' : 'completed',
+      rawEventName: hit.rawEventName || (interrupted ? 'turn_aborted' : 'task_complete'),
       turnId: hit.turnId,
       transcriptPath: session.transcriptPath,
       force: false
     }, stats)
-    if (updated && stats && stats.codex) stats.codex.interrupted++
+    if (updated && stats && stats.codex) {
+      if (interrupted) stats.codex.interrupted++
+      else stats.codex.completed++
+    }
     changed = updated || changed
   }
 
@@ -907,21 +742,19 @@ function sweepStuckCodexSessions(status, stats, options = {}) {
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (isHiddenCodexSession(session)) continue
     if (!session || session.agentType !== 'codex' || session.endedAt) continue
+    if (session.isRemote) continue
+    if (session.parentSessionId) continue
     if (currentPhase(session) !== 'running') continue
     if (!session.activeTool) continue
-    if (session.pendingToolUse || session.pendingInteraction || activeSubagentCount(session) > 0) continue
 
-    const lastActivityAt = lastSessionActivityAt(session)
-    if (!lastActivityAt || now - lastActivityAt < maxIdleMs) continue
-
-    const stat = session.transcriptPath ? statTranscriptFile(session.transcriptPath) : null
-    if (stat && Number.isFinite(stat.mtimeMs) && now - stat.mtimeMs < maxIdleMs) continue
+    const updatedAt = Number.isFinite(session.lastUpdated) ? session.lastUpdated : 0
+    if (!updatedAt || now - updatedAt < maxIdleMs) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.INTERRUPTED,
+      type: AGENT_EVENTS.TURN_COMPLETE,
       source: 'transcript',
       timestamp: now,
-      reason: `Codex active tool ${session.activeTool} idle for ${Math.floor((now - lastActivityAt) / 1000)}s`,
+      reason: `Codex active tool ${session.activeTool} idle for ${Math.floor((now - updatedAt) / 1000)}s`,
       details: 'codex active tool idle without a stop hook',
       rawEventName: 'codex_stuck_sweep',
       transcriptPath: session.transcriptPath,
@@ -942,9 +775,7 @@ function sweepStuckCodexSessions(status, stats, options = {}) {
 
 function syncCodexSessions(status, panes, options = {}, stats) {
   if (options.codexMode === 'none' || options.codexTranscript === false) return
-  sweepCodexOpenTurns(status, stats, options)
-  sweepCodexPlanWaits(status, stats, options)
-  sweepInterruptedCodexTranscripts(status, stats, options)
+  sweepCompletedCodexTranscripts(status, stats, options)
   sweepStuckCodexSessions(status, stats, options)
   pruneCodexTranscriptScanState(status, options)
 }
@@ -954,6 +785,7 @@ function pruneRegistrySessions(status, stats, options = {}) {
   const result = pruneSessions(status, { sessionsDir }, {
     now: Number.isFinite(options.registryNow) ? options.registryNow : undefined,
     retentionMs: options.sessionRetentionMs,
+    staleSessionMs: options.staleSessionMs,
     terminalDisplayMs: options.terminalDisplayMs,
     maxSessions: options.maxSessions
   })
@@ -1143,7 +975,7 @@ function sweepInterruptedClaudeTranscripts(status, stats, options = {}) {
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (!session || session.agentType !== 'claude' || session.endedAt) continue
+    if (!session || session.agentType !== 'claude' || session.endedAt || session.isRemote) continue
     if (currentPhase(session) !== 'running') continue
     if (!session.transcriptPath) continue
 
@@ -1155,7 +987,7 @@ function sweepInterruptedClaudeTranscripts(status, stats, options = {}) {
     if (!hit) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.INTERRUPTED,
+      type: AGENT_EVENTS.TURN_COMPLETE,
       source: 'transcript',
       timestamp: now,
       reason: 'Claude transcript recorded request interruption',
@@ -1173,161 +1005,32 @@ function sweepInterruptedClaudeTranscripts(status, stats, options = {}) {
   pruneClaudeTranscriptScanState(status, options)
 }
 
-// Backstop for a WAIT whose resolving hook was missed or arrived in an order we
-// don't treat as a resolver (the reducer's WAIT_RESUME_EVENTS covers the common
-// subagent case in-band; this catches the rest). Any agent with a transcript that
-// has advanced past the moment the wait began has clearly resumed after the user
-// acted, so we resolve the pending interaction. Safe because a genuinely pending
-// wait writes nothing — its transcript never advances — so this never force-clears
-// a wait the user has not answered. Disable via `waitResolve: false`.
-function sweepResolvedPendingInteractions(status, stats, options = {}) {
-  if (optionDisabled(options, 'waitResolve')) return
-  const now = Date.now()
-  const settleMs = thresholdMs(options, 'waitResolveSettleMs', WAIT_RESOLVE_SETTLE_MS)
-  let changed = false
-
-  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (!session || session.endedAt) continue
-    if (isHiddenCodexSession(session)) continue
-    const phase = currentPhase(session)
-    if (phase !== 'waitingForApproval' && phase !== 'waitingForAnswer') continue
-    if (!session.transcriptPath) continue
-
-    const pending = session.pendingInteraction
-    const waitStartedAt = pending && Number.isFinite(pending.startedAt)
-      ? pending.startedAt
-      : (Number.isFinite(session.lastUpdated) ? session.lastUpdated : null)
-    if (!Number.isFinite(waitStartedAt)) continue
-
-    const stat = statTranscriptFile(session.transcriptPath)
-    if (!stat || !Number.isFinite(stat.mtimeMs)) continue
-    if (stat.mtimeMs <= waitStartedAt + settleMs) continue
-
-    const resolveType = pending && pending.type === 'question'
-      ? AGENT_EVENTS.QUESTION_ANSWERED
-      : AGENT_EVENTS.PERMISSION_RESOLVED
-    const updated = applySessionUpdate(status, sessionId, session, {
-      type: resolveType,
-      source: 'transcript',
-      timestamp: now,
-      reason: 'transcript advanced past the pending interaction (user acted)',
-      details: 'wait resolved from transcript progress',
-      rawEventName: 'wait_resolved_sweep',
-      transcriptPath: session.transcriptPath,
-      force: true
-    }, stats)
-    if (updated && stats && stats.claudeTranscript) {
-      stats.claudeTranscript.waitResolved = (stats.claudeTranscript.waitResolved || 0) + 1
-    }
-    changed = updated || changed
-  }
-
-  if (changed) {
-    status.lastUpdated = now
-    persistStatus(status)
-  }
-}
-
-function isBackgroundActivityRecoveryCandidate(session, now, options) {
-  if (!session || session.endedAt) return false
-  if (!BACKGROUND_ACTIVITY_AGENTS.has(session.agentType)) return false
-  if (currentPhase(session) !== 'completed') return false
-  const maxAgeMs = thresholdMs(options, 'backgroundActivityRecoveryMs', BACKGROUND_ACTIVITY_RECOVERY_MS)
-  const lastActivityAt = lastSessionActivityAt(session)
-  if (lastActivityAt && now - lastActivityAt > maxAgeMs) return false
-  return isBackgroundShellRunningText(session)
-}
-
-function sweepBackgroundActivitySessions(status, stats, options = {}) {
-  if (optionDisabled(options, 'backgroundActivityRecovery')) return
-  const now = Date.now()
-  let changed = false
-
-  for (const [sessionId, session] of Object.entries(status.sessions || {})) {
-    if (!isBackgroundActivityRecoveryCandidate(session, now, options)) continue
-
-    const details = backgroundShellDetails(session)
-    const turnStarted = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.PROMPT_SUBMIT,
-      source: 'hook',
-      stateSource: session.stateSource,
-      timestamp: now,
-      reason: 'background shell still running after idle notification',
-      details: 'background shell still running',
-      rawEventName: 'background_shell_turn_active',
-      force: true
-    }, stats)
-
-    const toolStarted = applySessionUpdate(status, sessionId, session, {
-      type: AGENT_EVENTS.TOOL_USE,
-      source: 'hook',
-      stateSource: session.stateSource,
-      timestamp: now + 1,
-      reason: 'background shell still running',
-      details,
-      rawEventName: 'background_shell_running_recovery',
-      pendingToolUse: { tool: 'Bash', details, timestamp: now + 1 },
-      activeTool: 'Bash',
-      force: true
-    }, stats)
-
-    if ((turnStarted || toolStarted) && stats && stats.reconcile) {
-      stats.reconcile.backgroundActivity = (stats.reconcile.backgroundActivity || 0) + 1
-    }
-    changed = turnStarted || toolStarted || changed
-  }
-
-  if (changed) {
-    status.lastUpdated = now
-    persistStatus(status)
-  }
-}
-
-// Default-on safety net across all agents: a running session that has gone
-// fully silent (no active tool, no pending interaction, no subagents) past the
-// idle threshold most likely finished its turn but missed its Stop hook, so we
-// complete it. Codex's stuck sweep (activeTool PRESENT -> interrupted) is a
-// different signature and stays separate. Disable via `idleComplete: false`.
+// Claude-only interrupt fallback. The condition is exact:
+// local Claude + running + no activeTool + 120s since updatedAt. Transcript
+// mtime, prose, pending display fields and all other agents are irrelevant.
 function sweepIdleRunningSessions(status, stats, options = {}) {
   if (optionDisabled(options, 'idleComplete')) return
-  if (optionDisabled(options, 'stuckSweep') || optionDisabled(options, 'idleInterrupt')) return
   const now = Date.now()
-  const maxIdleMs = thresholdMs(options, 'idleCompleteMs', IDLE_COMPLETE_THRESHOLD_MS)
+  const maxIdleMs = thresholdMs(options, 'idleCompleteMs', CLAUDE_IDLE_INTERRUPT_THRESHOLD_MS)
   let changed = false
 
   for (const [sessionId, session] of Object.entries(status.sessions || {})) {
     if (!session || session.endedAt) continue
-    if (isHiddenCodexSession(session)) continue
-    // Flux treats Codex completion as hook truth. A silent Codex transcript can
-    // mean the model is still thinking or a hook was missed; do not synthesize
-    // DONE from idle time for Codex, because completed is sticky in the picker.
-    if (session.agentType === 'codex') continue
+    if (session.agentType !== 'claude') continue
     if (currentPhase(session) !== 'running') continue
-    if (session.activeTool || session.pendingToolUse || session.pendingInteraction || activeSubagentCount(session) > 0) continue
+    if (session.activeTool) continue
+    if (session.isRemote) continue
 
-    // Only complete a session we have positive evidence ended: without a
-    // transcript an agent could be legitimately thinking/streaming to the
-    // terminal, and a wrong completion is sticky (completed only reopens on a
-    // new turn, so later same-turn tool events are dropped and it stays DONE).
-    if (!session.transcriptPath) continue
-
-    const lastActivityAt = lastSessionActivityAt(session)
-    if (!lastActivityAt || now - lastActivityAt < maxIdleMs) continue
-
-    // A live turn keeps writing its transcript (Claude streams thinking to it),
-    // so require the transcript itself to be stale before assuming the turn
-    // ended. If we can't stat it, we have no evidence — leave it running.
-    const stat = statTranscriptFile(session.transcriptPath)
-    if (!stat || !Number.isFinite(stat.mtimeMs)) continue
-    if (now - stat.mtimeMs < maxIdleMs) continue
+    const updatedAt = Number.isFinite(session.lastUpdated) ? session.lastUpdated : 0
+    if (!updatedAt || now - updatedAt < maxIdleMs) continue
 
     const updated = applySessionUpdate(status, sessionId, session, {
       type: AGENT_EVENTS.TURN_COMPLETE,
       source: 'stale',
       timestamp: now,
-      reason: `${session.agentType || 'agent'} idle for ${Math.floor((now - lastActivityAt) / 1000)}s without an active tool`,
-      details: 'idle without active tool; assuming turn complete',
-      rawEventName: 'idle_complete_sweep',
+      reason: `Claude idle for ${Math.floor((now - updatedAt) / 1000)}s without an active tool`,
+      details: 'Claude idle interrupt fallback',
+      rawEventName: 'claude_idle_interrupt_sweep',
       transcriptPath: session.transcriptPath,
       force: true
     }, stats)
@@ -1383,8 +1086,6 @@ function run(file, options = {}) {
     if (options.reconcile !== false) reconcileSessions(status, panes, stats, options)
     syncCodexSessions(status, panes, options, stats)
     if (options.claudeTranscript !== false) sweepInterruptedClaudeTranscripts(status, stats, options)
-    sweepBackgroundActivitySessions(status, stats, options)
-    sweepResolvedPendingInteractions(status, stats, options)
     sweepIdleRunningSessions(status, stats, options)
     pruneRegistrySessions(status, stats, options)
   } finally {
@@ -1406,7 +1107,6 @@ module.exports = {
   createStats,
   sweepVanishedPanes,
   sweepDeadProcesses,
-  sweepBackgroundActivitySessions,
   pruneRegistrySessions,
   discoverPaneSessions,
   discoverySessionId,

@@ -37,25 +37,40 @@ An agent integration usually touches four layers:
 
 Hook adapters should emit canonical event types from `scripts/lib/agent-events.js`.
 The reducer maps these into the session contract documented in
-`docs/session-contract.md`.
+`docs/session-contract.md`. Protocol-specific payload mappings and transition
+semantics are authoritative: do not add a cross-agent heuristic just because
+two payloads happen to contain similar text.
 
 Use these common mappings:
 
 | Agent behavior | Canonical event | Expected phase |
 |---|---|---|
-| New agent session | `session_start` | `idle` |
+| Confirmed agent session | `session_start` | `running` |
 | User submits prompt | `prompt_submit` | `running` |
-| Tool starts | `tool_use` | `running` |
-| Tool finishes | `post_tool_use` / `post_tool_use_failure` | `running` unless it resolves a deferred completion |
+| Tool starts | `tool_use` | keeps WAIT sticky; otherwise establishes/keeps `running` |
+| Tool finishes | `post_tool_use` / `post_tool_use_failure` | phase-neutral; clears tool residue |
+| Adapter activity update | `assistant_message_update` / adapter-scoped `notification` | `running`, except WAIT remains sticky |
 | Permission requested | `permission_request` | `waitingForApproval` |
 | User answer requested | `question_asked` | `waitingForAnswer` |
 | Plan confirmation requested | `permission_request` with plan reason/type | `waitingForApproval` |
-| Agent finishes turn | `stop` / `turn_complete` / `session_end` | `completed` |
+| Agent finishes ordinary turn | `stop` / `turn_complete` | `completed`, unless WAIT is still unresolved |
+| Agent session is torn down | `session_end` | `completed` after the adapter clears pending interaction |
+| Agent session is deleted | `session_delete` | removed from the registry |
 | User interrupts | `interrupted` | `interrupted` |
 | Process or pane dies | `pane_state` / reconcile event | `crashed` or `stale` |
 
-When the agent gives a stable request id or turn id, pass it through. It lets the
-reducer clear the right pending interaction when the next lifecycle event arrives.
+`session_start` does not mean IDLE. It enters `running`; tmux-scout keeps an
+unconfirmed hook shell hidden until there is a real prompt or WAIT. Pane discovery
+may retain an internal `idle` liveness placeholder, but that placeholder is never
+rendered as an agent state.
+
+The picker and status bar manage only sessions bound to a live `tmuxPane`.
+Hooks from Codex App, an IDE, or a plain terminal may share the same lifecycle
+semantics, but without a tmux pane they are not rendered or counted.
+
+When the agent gives a stable request id, tool-call id, or turn id, pass it
+through. Adapter-specific resolution rules use those ids to avoid clearing a
+parallel, unrelated WAIT.
 
 ## Waiting Interactions
 
@@ -70,46 +85,47 @@ Waiting state is represented as `pendingInteraction` plus the legacy
 - `source` / `stateSource` / `rawEventName`: evidence for debugging
 
 Codex `request_user_input` should be mapped as `question_asked` on `PreToolUse`
-and `question_answered` on `PostToolUse`. Do not rely on final assistant text as
-the primary question signal; use text heuristics only as a fallback when the
-payload has no structured wait event.
+only when its structured input parses successfully, and as `question_answered`
+on the matching `PostToolUse`. Codex Stop question parsing accepts only the
+protocol's structured Chinese numbered-question shape; generic prose, punctuation, and payload flags
+must not invent WAIT.
 
 ## Notifications
 
-Some agents only signal "the agent now needs the user" through a `Notification`
-hook rather than a dedicated permission/question event — Claude Code, for
-example, sends `Notification` with text like `Claude needs your permission to
-use Bash`, `...needs your approval for the plan`, or `Claude is waiting for your
-input`. Dropping those leaves a session stuck showing BUSY.
+Notifications are adapter-specific protocol events, never a shared prose
+classifier. Current protocol behavior includes:
 
-`scripts/lib/notification-intent.js` (`classifyNotification`) turns a payload
-into one canonical intent, first by structured `notification_type` and then by
-message text (English + 中文):
+- Claude `Notification`: acknowledged with no SessionState write.
+- Gemini structured `notification_type: ToolPermission`: approval/question WAIT;
+  other Gemini notifications are activity updates.
+- Coco/Traex exact `notification_type: idle_prompt`: turn completion; other
+  supported notifications are activity only.
+- OpenCode and Copilot notifications that are not explicitly mapped: no-op.
 
-| Intent | Driven event | Phase |
-|---|---|---|
-| `permission` | `permission_request` | `waitingForApproval` (W:APP) |
-| `plan` | `permission_request` with plan reason | `waitingForApproval` (W:PLAN) |
-| `question` | `question_asked` | `waitingForAnswer` (W:ANS) |
-| `idle` | `turn_complete` (only if currently running) | `completed` |
-| `info` | none | unchanged |
-
-Reuse the classifier for any new agent whose waiting/idle state arrives as a
-Notification. A running session that goes fully silent (no active tool, no
-pending interaction) past the idle threshold is also completed by the watcher's
-`sweepIdleRunningSessions` safety net, in case the `stop` hook is missed.
+Never infer permission, question, plan, idle, or completion from words in a
+message. There is also no generic silence-to-DONE sweep: missing agent evidence
+must not turn BUSY into DONE.
 
 ## Resolving a WAIT
 
-A WAIT returns to `running` when the agent resumes. The reducer treats subagent
-lifecycle events (`subagent_start` / `subagent_stop` / `subagent_tool_activity`)
-as resolvers so an approval that is followed by a subagent launch does not get
-stuck — the user acted in the terminal, which produces no explicit resolve hook.
-For the case where the resolving hook is missed entirely, `sync.js`
-`sweepResolvedPendingInteractions` is a transcript-based backstop: an agent
-blocked at a prompt writes nothing to its transcript, so once the transcript
-advances past the moment the wait began the wait is resolved. It applies to any
-agent that exposes a `transcriptPath`.
+A WAIT changes only when the corresponding adapter has explicit evidence that
+the interaction ended. Permission resolution is phase-guarded;
+`questionAnswered` is intentionally not phase-guarded. Resolution normally
+returns to `running`, but an ended hook session finalizes as `completed`.
+Examples include a matching question/tool completion, an adapter-defined
+PostTool without a tool name, or a Stop/SessionEnd path that first calls
+`clearStalePendingInteraction`.
+
+Ordinary tool activity, subagent activity, pane contents, transcript mtime,
+silence, and source priority never resolve WAIT. Ordinary turn completion while
+WAIT is unresolved also does not plant a latent DONE. A real SessionEnd parks its
+end bit until resolution; a later ordinary completion explicitly clears that bit,
+matching explicit `isSessionEnd: false` semantics.
+
+For parallel native approvals, preserve the adapter's identity rules. Kimi, for
+example, tracks every high-risk `tool_call_id` and clears WAIT only after the last
+matching call completes. OpenCode distinguishes a real tool completion (with
+`tool_name`) from permission/question resolution (without `tool_name`).
 
 ## Installer Rules
 
@@ -129,10 +145,6 @@ hook/runtime mapping for:
 
 Claude Code, Codex, Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode,
 Cursor Agent, Hermes, Trae CLI, and Traex CLI.
-
-Trae CN is not a separate built-in id or setup flag yet. Treat it as covered
-only when it uses the same local config shape and hook payloads as the Trae or
-Traex integrations; otherwise add it as a new integration with its own tests.
 
 ## Contributor Checklist
 

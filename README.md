@@ -90,7 +90,7 @@ Without an agent flag, `install`, `uninstall`, and `status` operate on all suppo
 - **GitHub Copilot CLI**: Adds command hooks in `~/.copilot/settings.json`
 - **OpenCode**: Writes `~/.config/opencode/plugins/tmux-scout-opencode-plugin.js` and registers it in the OpenCode JSON config
 - **Cursor Agent**: Adds command hooks in `~/.cursor/hooks.json`
-- **Hermes**: Adds command hooks in `~/.hermes/cli-config.yaml` or an existing `~/.hermes/config.yaml`
+- **Hermes**: Adds command hooks in `~/.hermes/config.yaml` and removes obsolete tmux-scout entries from `~/.hermes/cli-config.yaml`
 - **Trae CLI**: Adds command hooks in `~/.trae/traecli.yaml` or an existing legacy config file
 - **Traex CLI**: Adds managed TOML hook blocks and enables `[features].hooks = true` in `~/.trae/traecli.toml`
 
@@ -294,8 +294,6 @@ Internally, hook, pane, transcript, PID, and stale-timeout observations are redu
 For older Codex versions that only support `notify`, tmux-scout still installs and chains the legacy notify hook. In that fallback mode, first-turn discovery may still depend on JSONL polling until Codex emits a completion notification.
 
 Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, Trae CLI, and Traex CLI are tracked through a generic hook adapter. It maps their hook/plugin events onto the same session lifecycle model, so support quality depends on the payloads those CLIs expose for prompts, tool calls, approvals, questions, subagents, and completion.
-
-Trae CN does not have a separate `--trae-cn` setup flag in this release. It is covered only if the local CLI exposes the same Trae/Traex hook payloads and config shape; otherwise it remains a follow-up integration.
 
 ## Development
 

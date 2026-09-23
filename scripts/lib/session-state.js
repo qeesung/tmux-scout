@@ -18,6 +18,7 @@ const SOURCE_PRIORITY = {
   hook: 90,
   pid: 95,
   process: 95,
+  'pane-model': 75,
   transcript: 70,
   jsonl: 65,
   pane: 60,
@@ -106,6 +107,15 @@ function currentPhase(session) {
   if (session.phase) return session.phase
   if (session.lifecycle && session.lifecycle.phase) return session.lifecycle.phase
   return phaseFromLegacyStatus(session.status, session.needsAttention) || 'idle'
+}
+
+// The durable record that this session's process was observed to exit, as
+// opposed to a turn the user cancelled. Anything reasoning about whether a
+// session can still do work has to agree on this, so it lives with the code
+// that writes `terminalKind` rather than being restated per caller.
+function isRecordedProcessExit(session) {
+  return currentPhase(session) === SESSION_PHASES.INTERRUPTED &&
+    session.terminalKind === 'processExit'
 }
 
 function isGenericWaitDetail(value) {
@@ -752,6 +762,7 @@ function applySessionEvent(session, event) {
 module.exports = {
   applySessionEvent,
   currentPhase,
+  isRecordedProcessExit,
   sourcePriority,
   normalizeSource,
   MAX_STATE_EVIDENCE,

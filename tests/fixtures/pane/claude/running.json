@@ -1,0 +1,8 @@
+{
+  "name": "claude is mid-turn with a live spinner and token counter",
+  "agent": "claude",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

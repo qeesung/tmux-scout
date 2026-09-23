@@ -1,0 +1,9 @@
+{
+  "name": "claude plan approval box blocks the turn",
+  "agent": "claude",
+  "expect": {
+    "choice": "awaiting_plan_approval",
+    "phase": "waitingForApproval",
+    "pendingInteractionType": "plan"
+  }
+}

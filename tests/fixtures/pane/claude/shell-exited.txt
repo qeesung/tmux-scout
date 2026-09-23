@@ -1,0 +1,8 @@
+  I updated the retry policy and added a regression test. All 41 tests pass.
+
+※ recap: switched the fetcher to exponential backoff.
+
+  Total cost:            $0.42
+  Total duration (API):  4m 12.3s
+
+bytedance@host example-repo %

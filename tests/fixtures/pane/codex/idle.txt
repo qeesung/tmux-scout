@@ -1,0 +1,12 @@
+    … +53 lines (ctrl + t to view transcript)
+        w.handler(ctx)
+    }
+<< Code review finished >>
+─────────────────────────────────────────────────────────────────────────────────
+• No actionable regressions were found in the current changes. The refactor
+  updates all callers and go test ./... passes.
+─ Worked for 3m 37s ─────────────────────────────────────────────────────────────
+⠁   ⠈         ⠄                   ⢀                ⠐     ⠐              ⠄ ⢀
+»⠁Ask Codex to do anything                ⠁                  ⠈        ⠄    ⠂
+      ⠠ ⠐                                    ⢀        ⠄⠂
+  example-model · example-repo · master · Ready · Context 100% left · Fast off

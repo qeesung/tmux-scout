@@ -1,0 +1,10 @@
+       362        Caller: caller,
+       363        Call:   call,
+       364        Callee: &example.ImportCallee{
+
+✻ Warping… (28s · ↓ 1.4k tokens · esc to interrupt)
+─────────────────────────────── example-branch ───────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────
+  󰉋 example-repo 󰘬 feature/cache  Opus 5 ctx:71%
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents

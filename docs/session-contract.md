@@ -119,6 +119,39 @@ contents never override hook state, WAIT only changes through an adapter-defined
 resolver or explicit new turn, and only `activityUpdated` semantics—not a
 bare tool event—can reopen DONE as BUSY.
 
+### The pane model speaks only this vocabulary
+
+`@scout-state-source = jev` replaces hooks with a model that reads the tmux pane
+every few seconds. It adds no event type and no exemption: `pane-classifier.js`
+translates a reading into the same events the hooks send, so every rule above
+applies to it unchanged.
+
+| The screen shows | Event sent |
+|---|---|
+| a permission or plan dialog | `permission_request` |
+| a question with options | `question_asked` |
+| an idle composer | `turn_complete`, or `interrupted` if a cancel marker is visible |
+| an agent working | `assistant_message_update` |
+| a wait that has closed | `permission_resolved` / `question_answered`, then the state above |
+
+Three constraints are load-bearing and easy to undo by accident:
+
+- A wait event never carries `activeTool`, and carries `pendingToolUse` only
+  when the dialog's details changed — a different command awaiting approval
+  is a different wait. Re-reading an unchanged dialog therefore sends nothing,
+  and a refresh that changes only the title keeps `sameWaitRefresh()` true, so
+  the user's wait clock is not restarted.
+- `question_answered` is applied from *any* phase, terminal ones included, so
+  the classifier sends it only from `waitingForAnswer`.
+- Reopening a finished session uses `assistant_message_update`, never
+  `prompt_submit`: the latter is the only member of `TURN_START_EVENTS` and
+  would reset the turn correlation ids a screen reading cannot speak to.
+
+Because the vocabulary is fixed, the model cannot assert a phase hooks could not
+also have asserted. Process liveness still outranks it: `crashed` and `stale`
+stay reachable only through PID probing, and a session whose process was seen to
+exit is never revived from the chrome still drawn in its pane.
+
 Use the reducer instead of writing lifecycle fields by hand. It keeps
 `phase`, `status`, `needsAttention`, `pendingInteraction`, `pendingToolUse`,
 `stateSource`, `stateConfidence`, and `stateEvidence` consistent.

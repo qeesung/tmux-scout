@@ -1,0 +1,10 @@
+  I can take either approach here, but they have different trade-offs and I
+  would rather not guess.
+
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ Which caching strategy should I use?                                        │
+│                                                                             │
+│ ❯ 1. Write-through — simpler, slower writes                                 │
+│   2. Write-back — faster, risks losing data on crash                        │
+│   3. No cache for now                                                       │
+╰─────────────────────────────────────────────────────────────────────────────╯

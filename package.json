@@ -13,6 +13,10 @@
     "test": "node tests/run.js",
     "ci": "npm run check && npm test",
     "doctor": "node scripts/setup.js doctor",
-    "agent-colors": "node scripts/dev/agent-colors.js"
+    "agent-colors": "node scripts/dev/agent-colors.js",
+    "jev-eval": "node scripts/dev/jev-eval.js"
+  },
+  "optionalDependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
   }
 }

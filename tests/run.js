@@ -26,6 +26,7 @@ const {
   FIELD_TYPES,
   SESSION_CONTRACT_VERSION,
   SESSION_PHASES,
+  SESSION_PHASE_VALUES,
   SESSION_SCHEMAS,
   phaseFromLegacyStatus,
   phaseForAgentEvent,
@@ -36,6 +37,19 @@ const {
   validateSessionSnapshot
 } = require('../scripts/lib/session-contract')
 const { collectFixtureFiles, runFlowFixture, validateFixtureExpectations } = require('../scripts/lib/flow-fixtures')
+const { normalizePaneText, paneFingerprint } = require('../scripts/lib/pane-capture')
+const { loadPaneFixtures } = require('../scripts/lib/pane-fixtures')
+const { answerCacheKey, createAnswerCache } = require('../scripts/lib/pane-answer-cache')
+const { readShadow } = require('../scripts/lib/pane-store')
+const { createPaneMetrics, readMetrics } = require('../scripts/lib/pane-metrics')
+const { extractPromptAndTitle, extractToolLine } = require('../scripts/lib/pane-text-extract')
+const {
+  interpretPaneAnswers,
+  paneEventsFromInterpretation
+} = require('../scripts/lib/pane-classifier')
+const { createPaneObserver } = require('../scripts/lib/pane-observer')
+const { PANE_QUESTION_SET_VERSION } = require('../scripts/lib/pane-questions')
+const { createJevClient } = require('../scripts/lib/jev-client')
 const { findLatestCodexInterrupt, findLatestCodexTurnEnd } = require('../scripts/lib/codex-transcript-detector')
 const { DEFAULT_STALE_SESSION_MS, DEFAULT_TERMINAL_DISPLAY_MS } = require('../scripts/lib/session-registry')
 const { formatSessionDetails } = require('../scripts/picker/session-details')
@@ -56,8 +70,18 @@ function test(name, fn) {
   tests.push({ name, fn })
 }
 
+// Every temp dir this run creates, removed again when it ends. Most tests
+// remove their own, but sync keeps the last status file it was pointed at in
+// module state, and a later test writing through it recreates a removed one.
+const createdTempDirs = []
+process.on('exit', () => {
+  for (const dir of createdTempDirs) fs.rmSync(dir, { recursive: true, force: true })
+})
+
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'tmux-scout-test-'))
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tmux-scout-test-'))
+  createdTempDirs.push(dir)
+  return dir
 }
 
 function runHook(scriptRelativePath, payload, homeDir) {
@@ -1987,6 +2011,3203 @@ test('agent flow fixtures replay through real hook entrypoints', () => {
       result.cleanup()
     }
   }
+})
+
+test('normalizePaneText strips animation but keeps the state signal', () => {
+  const codex = [
+    '─ Worked for 3m 37s ──────────────────────────────',
+    '⠁   ⠈      ⠄        ⢀       ⠐',
+    '»⠁Ask Codex to do anything      ⠈',
+    '  model · repo · master · Ready · Context 100% left'
+  ].join('\n')
+  const text = normalizePaneText(codex)
+
+  // The decision-bearing words survive.
+  assert.ok(text.includes('Ask Codex to do anything'))
+  assert.ok(text.includes('Ready'))
+  assert.ok(text.includes('Worked for'))
+  // The frame-variable parts do not.
+  assert.ok(!/[⠀-⣿]/.test(text), 'braille particles should be stripped')
+  assert.ok(text.includes('<dur>'), 'elapsed time should be a placeholder')
+  assert.ok(text.includes('<pct>'), 'context percentage should be a placeholder')
+  assert.ok(!text.includes('3m 37s'))
+  // Blank and padding-only lines are dropped.
+  assert.ok(!text.split('\n').some(line => line !== line.trim()))
+})
+
+test('normalizePaneText collapses a stripped particle to the same spacing', () => {
+  // The particle lands inside the placeholder text, so removing it would leave
+  // "»Ask" where an unanimated frame has "» Ask".
+  assert.strictEqual(
+    normalizePaneText('»⠁Ask Codex to do anything'),
+    normalizePaneText('» Ask Codex to do anything')
+  )
+})
+
+test('normalizePaneText keeps markdown bullets and table borders intact', () => {
+  const text = normalizePaneText(['- first item', '| col | col |'].join('\n'))
+  assert.ok(text.includes('- first item'), 'ASCII bullets must not be read as spinners')
+  assert.ok(text.includes('| col | col |'))
+})
+
+test('pane fixtures with a second frame produce a stable fingerprint', () => {
+  const fixtures = loadPaneFixtures()
+  assert.ok(fixtures.length >= 5, 'expected pane fixtures to be present')
+
+  let compared = 0
+  for (const fixture of fixtures) {
+    if (!fixture.frame2) continue
+    compared++
+    const a = paneFingerprint(normalizePaneText(fixture.text))
+    const b = paneFingerprint(normalizePaneText(fixture.frame2))
+    // This is the assertion the cost model rests on: an unchanged screen must
+    // not look changed, or every tick pays to re-classify a static session.
+    assert.strictEqual(a, b, `${fixture.id}: fingerprint flapped between frames`)
+  }
+  assert.ok(compared >= 2, 'expected at least two multi-frame fixtures')
+})
+
+test('pane fixtures declare an agent and an expected classification', () => {
+  for (const fixture of loadPaneFixtures()) {
+    assert.ok(fixture.agent, `${fixture.id}: missing agent`)
+    assert.ok(fixture.expect.choice, `${fixture.id}: missing expect.choice`)
+    assert.ok(
+      // null is a legitimate expectation: a shell prompt is a reading the
+      // classifier deliberately declines to turn into a phase.
+      fixture.expect.phase === null || SESSION_PHASE_VALUES.includes(fixture.expect.phase),
+      `${fixture.id}: expect.phase must be a canonical phase or null`
+    )
+    assert.ok(normalizePaneText(fixture.text).length > 0, `${fixture.id}: empty after normalization`)
+  }
+})
+
+test('normalizePaneText materially shrinks a padded TUI pane', () => {
+  const fixture = loadPaneFixtures().find(item => item.id.endsWith('codex/idle'))
+  assert.ok(fixture, 'codex/idle fixture missing')
+  const ratio = normalizePaneText(fixture.text).length / fixture.text.length
+  assert.ok(ratio < 0.8, `expected normalization to shrink the pane, got ratio ${ratio.toFixed(2)}`)
+})
+
+function sampleAnswers(choice = 'idle_ready') {
+  return { screen_state: { type: 'choice', choice, confidence: 0.9 } }
+}
+
+test('answerCacheKey separates agents, question sets and screens', () => {
+  const base = answerCacheKey('claude', 1, 'abc123')
+  assert.notStrictEqual(base, answerCacheKey('codex', 1, 'abc123'))
+  assert.notStrictEqual(base, answerCacheKey('claude', 2, 'abc123'))
+  assert.notStrictEqual(base, answerCacheKey('claude', 1, 'def456'))
+  assert.strictEqual(answerCacheKey('claude', 1, ''), null)
+  assert.strictEqual(answerCacheKey('', 1, 'abc123'), null)
+})
+
+test('answer cache returns the same screen without a second lookup miss', () => {
+  const cache = createAnswerCache()
+  const key = answerCacheKey('claude', 1, 'abc123')
+
+  assert.strictEqual(cache.get(key), null)
+  cache.set(key, { answers: sampleAnswers(), usage: { input_tokens: 1700 } })
+
+  const hit = cache.get(key)
+  assert.ok(hit)
+  assert.strictEqual(hit.answers.screen_state.choice, 'idle_ready')
+  assert.strictEqual(cache.stats().hits, 1)
+  assert.strictEqual(cache.stats().misses, 1)
+})
+
+test('answer cache misses when the question set version changes', () => {
+  const cache = createAnswerCache()
+  cache.set(answerCacheKey('claude', 1, 'abc123'), { answers: sampleAnswers() })
+  // Rewording criteria invalidates every stored answer, and the confidence
+  // scale shifts with the label count, so v2 must not read v1's answers.
+  assert.strictEqual(cache.get(answerCacheKey('claude', 2, 'abc123')), null)
+})
+
+test('answer cache evicts least recently used entries', () => {
+  const cache = createAnswerCache({ maxEntries: 2 })
+  const a = answerCacheKey('claude', 1, 'a')
+  const b = answerCacheKey('claude', 1, 'b')
+  const c = answerCacheKey('claude', 1, 'c')
+
+  cache.set(a, { answers: sampleAnswers() })
+  cache.set(b, { answers: sampleAnswers() })
+  cache.get(a)                                  // a is now the most recent
+  cache.set(c, { answers: sampleAnswers() })    // evicts b, not a
+
+  assert.ok(cache.get(a), 'recently read entry should survive')
+  assert.strictEqual(cache.get(b), null, 'least recently used entry should be evicted')
+  assert.ok(cache.get(c))
+  assert.strictEqual(cache.size, 2)
+  assert.strictEqual(cache.stats().evicted, 1)
+})
+
+test('answer cache expires entries past the ttl', () => {
+  let clock = 1000
+  const cache = createAnswerCache({ ttlMs: 500, now: () => clock })
+  const key = answerCacheKey('claude', 1, 'abc123')
+
+  cache.set(key, { answers: sampleAnswers() })
+  clock += 499
+  assert.ok(cache.get(key), 'entry should still be live inside the ttl')
+  clock += 2
+  assert.strictEqual(cache.get(key), null)
+  assert.strictEqual(cache.stats().expired, 1)
+})
+
+test('answer cache stores low-confidence answers but never failures', () => {
+  const cache = createAnswerCache()
+  const lowConfidence = answerCacheKey('claude', 1, 'low')
+  const failed = answerCacheKey('claude', 1, 'failed')
+
+  // Re-asking about identical pixels yields the same low confidence, so paying
+  // twice buys nothing. Gating happens at interpretation time, not here.
+  assert.strictEqual(cache.set(lowConfidence, { answers: { screen_state: { type: 'choice', choice: 'unknown', confidence: 0.1 } } }), true)
+  assert.ok(cache.get(lowConfidence))
+
+  // A timeout or a 429 says nothing about the screen; it must stay retryable.
+  assert.strictEqual(cache.set(failed, { ok: false, errorKind: 'timeout' }), false)
+  assert.strictEqual(cache.get(failed), null)
+})
+
+test('answer cache warm-starts from entries persisted by pane-store', () => {
+  let clock = 10000
+  const cache = createAnswerCache({ ttlMs: 5000, now: () => clock })
+  const key = answerCacheKey('claude', 1, 'abc123')
+
+  assert.strictEqual(cache.seed({ [key]: { answers: sampleAnswers('working'), at: clock - 1000 } }), 1)
+  const hit = cache.get(key)
+  assert.ok(hit, 'seeded entry should be readable after a watcher restart')
+  assert.strictEqual(hit.answers.screen_state.choice, 'working')
+  assert.strictEqual(cache.stats().seeded, 1)
+
+  assert.strictEqual(cache.seed({ [key]: { answers: sampleAnswers(), at: clock } }), 0, 'seeding twice should be a no-op')
+})
+
+test('answer cache refuses to warm-start from an entry older than the ttl', () => {
+  let clock = 10000
+  const cache = createAnswerCache({ ttlMs: 5000, now: () => clock })
+  const key = answerCacheKey('claude', 1, 'abc123')
+  assert.strictEqual(cache.seed({ [key]: { answers: sampleAnswers(), at: clock - 9000 } }), 0)
+  assert.strictEqual(cache.seed({ [key]: { at: clock } }), 0, 'an entry without answers is not seedable')
+  assert.strictEqual(cache.seed(null), 0)
+})
+
+// The cache is keyed by screen content, not by session, so what pane-store
+// hands back on a restart is exactly what snapshot() wrote out.
+test('answer cache round-trips through a snapshot', () => {
+  const cache = createAnswerCache()
+  const key = answerCacheKey('codex', 2, 'ff00ff')
+  cache.set(key, { answers: sampleAnswers('awaiting_approval'), model: 'jev-1.13.0' })
+
+  const restored = createAnswerCache()
+  assert.strictEqual(restored.seed(cache.snapshot()), 1)
+  assert.strictEqual(restored.get(key).answers.screen_state.choice, 'awaiting_approval')
+})
+
+// Shape taken from a live Claude pane: the submitted prompt is echoed at
+// column zero with the same glyph the composer uses, and the empty composer
+// sits between two horizontal rules near the bottom.
+const CLAUDE_PANE = [
+  '❯ summarize what changed this week',
+  '',
+  '  I looked through the diff and found three themes.',
+  '',
+  '✻ Worked for 3m 27s · done 10:36 AM                     Jump to bottom',
+  '',
+  '──────────────────────────────────────────────────────────────────────',
+  '❯                                                                     ',
+  '──────────────────────────────────────────────────────────────────────',
+  '  󰉋 repos/example  Opus 5 (1M context) ctx:90%',
+  '  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)'
+].join('\n')
+
+test('extractPromptAndTitle reads the submitted prompt, not the empty composer', () => {
+  const result = extractPromptAndTitle(CLAUDE_PANE, 'claude')
+  assert.strictEqual(result.confidence, 'exact')
+  assert.strictEqual(result.lastUserPrompt, 'summarize what changed this week')
+  assert.strictEqual(result.sessionTitle, 'summarize what changed this week')
+})
+
+test('extractPromptAndTitle ignores text the user is still typing', () => {
+  // The composer and a submitted prompt render identically, so an unsubmitted
+  // draft must not become the session title.
+  const typing = CLAUDE_PANE.replace('❯                    ', '❯ half-written thou')
+  assert.strictEqual(extractPromptAndTitle(typing, 'claude').lastUserPrompt, 'summarize what changed this week')
+})
+
+test('extractPromptAndTitle ignores a greyed placeholder composer', () => {
+  const codex = [
+    '» an earlier real instruction',
+    '  ... agent output ...',
+    '─ Worked for 5m 14s ──────────────────────────────',
+    '» Ask Codex to do anything',
+    '  model · repo · master · Ready · Context 54% left'
+  ].join('\n')
+  assert.strictEqual(extractPromptAndTitle(codex, 'codex').lastUserPrompt, 'an earlier real instruction')
+})
+
+test('extractPromptAndTitle ignores quoted output that is not at column zero', () => {
+  const quoted = [
+    '  The docs say:',
+    '    > this is quoted output, not a prompt',
+    '──────────────────────────────────',
+    '❯ ',
+    '──────────────────────────────────'
+  ].join('\n')
+  assert.strictEqual(extractPromptAndTitle(quoted, 'claude').confidence, 'none')
+})
+
+test('extractPromptAndTitle reports none rather than guessing', () => {
+  // Claude draws on the alternate screen, so once output pushes the echo off
+  // the top there is nothing left to read. Callers must fall back, and because
+  // the field comes back undefined the reducer keeps any earlier value.
+  const scrolled = ['  output only', '────────────', '❯ ', '────────────'].join('\n')
+  const result = extractPromptAndTitle(scrolled, 'claude')
+  assert.strictEqual(result.confidence, 'none')
+  assert.strictEqual(result.lastUserPrompt, undefined)
+  assert.strictEqual(result.sessionTitle, undefined)
+  assert.strictEqual(extractPromptAndTitle('', 'claude').confidence, 'none')
+})
+
+test('extractPromptAndTitle truncates a long title but keeps the full prompt', () => {
+  const long = 'x'.repeat(250)
+  const pane = [`❯ ${long}`, '──────', '❯ ', '──────'].join('\n')
+  const result = extractPromptAndTitle(pane, 'claude')
+  assert.strictEqual(result.lastUserPrompt.length, 250)
+  assert.strictEqual(result.sessionTitle.length, 100)
+})
+
+test('extractToolLine reads the most recent codex tool invocation', () => {
+  const pane = ['    Read bootstrap-prod.yml', '    Search TTPProxyToken', '  done'].join('\n')
+  assert.deepStrictEqual(extractToolLine(pane, 'codex'), {
+    tool: 'Search',
+    details: 'Search: TTPProxyToken'
+  })
+  assert.deepStrictEqual(extractToolLine('  nothing here', 'codex'), {})
+})
+
+function paneAnswers(overrides = {}) {
+  const base = {
+    screen_state: { type: 'choice', choice: 'working', confidence: 0.9 },
+    blocked_on_user: { type: 'noul', noul: 0.02 },
+    is_running: { type: 'noul', noul: 0.95 },
+    interrupt_marker_visible: { type: 'noul', noul: 0.01 },
+    active_tool: { type: 'choice', choice: 'none', confidence: 0.9 }
+  }
+  const answers = Object.assign({}, base)
+  for (const [key, value] of Object.entries(overrides)) {
+    answers[key] = Object.assign({}, base[key], value)
+  }
+  return answers
+}
+
+test('interpretPaneAnswers maps each verdict onto its phase', () => {
+  const cases = [
+    ['awaiting_approval', { blocked_on_user: { noul: 0.95 } }, 'waitingForApproval', 'approval'],
+    ['awaiting_plan_approval', { blocked_on_user: { noul: 0.95 } }, 'waitingForApproval', 'plan'],
+    ['awaiting_answer', { blocked_on_user: { noul: 0.95 } }, 'waitingForAnswer', 'question'],
+    ['working', {}, 'running', null],
+    ['idle_ready', { is_running: { noul: 0.02 } }, 'completed', null]
+  ]
+  for (const [choice, overrides, phase, interactionType] of cases) {
+    const result = interpretPaneAnswers(
+      paneAnswers(Object.assign({ screen_state: { choice } }, overrides)),
+      { currentPhase: 'running' }
+    )
+    assert.strictEqual(result.gate, 'accept', `${choice} should be accepted`)
+    assert.strictEqual(result.phase, phase, `${choice} should map to ${phase}`)
+    assert.strictEqual(result.interactionType, interactionType)
+  }
+})
+
+test('interpretPaneAnswers stays silent on a shell prompt', () => {
+  // Process liveness owns "the agent is gone"; leftover pixels do not.
+  const result = interpretPaneAnswers(
+    paneAnswers({ screen_state: { choice: 'shell_prompt' } }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(result.gate, 'accept')
+  assert.strictEqual(result.phase, null)
+})
+
+test('interpretPaneAnswers rejects low confidence and unreadable screens', () => {
+  const lowConfidence = interpretPaneAnswers(
+    paneAnswers({ screen_state: { choice: 'awaiting_approval', confidence: 0.3 } }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(lowConfidence.gate, 'reject')
+  assert.strictEqual(lowConfidence.phase, null)
+
+  const unknown = interpretPaneAnswers(paneAnswers({ screen_state: { choice: 'unknown' } }), {})
+  assert.strictEqual(unknown.gate, 'reject')
+
+  const missing = interpretPaneAnswers({}, {})
+  assert.strictEqual(missing.gate, 'reject')
+})
+
+test('interpretPaneAnswers rejects a wait its cross-check contradicts', () => {
+  // Inventing a WAIT asks the user for attention they do not owe.
+  const result = interpretPaneAnswers(
+    paneAnswers({ screen_state: { choice: 'awaiting_approval' }, blocked_on_user: { noul: 0.05 } }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(result.gate, 'reject')
+  assert.ok(/blocked_on_user disagrees/.test(result.blockedReason))
+})
+
+test('interpretPaneAnswers separates a cancelled turn from a finished one', () => {
+  const result = interpretPaneAnswers(
+    paneAnswers({
+      screen_state: { choice: 'idle_ready' },
+      is_running: { noul: 0.02 },
+      interrupt_marker_visible: { noul: 0.92 }
+    }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(result.phase, 'interrupted')
+})
+
+test('interpretPaneAnswers withholds an activeTool it cannot vouch for', () => {
+  const trusted = interpretPaneAnswers(
+    paneAnswers({ active_tool: { choice: 'shell', confidence: 0.8 } }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(trusted.activeTool, 'shell')
+
+  // Still running, but nothing visibly executing: claiming a tool would change
+  // what the Claude idle sweep does, not just what the picker shows.
+  const unsure = interpretPaneAnswers(
+    paneAnswers({ active_tool: { choice: 'shell', confidence: 0.8 }, is_running: { noul: 0.05 } }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(unsure.phase, 'running')
+  assert.strictEqual(unsure.activeTool, null)
+
+  const lowConfidenceTool = interpretPaneAnswers(
+    paneAnswers({ active_tool: { choice: 'shell', confidence: 0.2 } }),
+    { currentPhase: 'running' }
+  )
+  assert.strictEqual(lowConfidenceTool.activeTool, null)
+})
+
+test('interpretPaneAnswers leaves a WAIT only on sufficient evidence', () => {
+  const working = confidence => paneAnswers({ screen_state: { choice: 'working', confidence } })
+  const wait = { currentPhase: 'waitingForApproval' }
+  const with_ = extra => Object.assign({}, wait, extra)
+
+  assert.strictEqual(interpretPaneAnswers(working(0.9), with_({ exitStreak: 1 })).resolvesWait, false,
+    'a single reading is not enough to conclude the user acted')
+  assert.strictEqual(interpretPaneAnswers(working(0.9), with_({ exitStreak: 2 })).resolvesWait, true)
+
+  // Below the strict bar, a streak is worth nothing — only duration is.
+  assert.strictEqual(interpretPaneAnswers(working(0.6), with_({ exitStreak: 9 })).resolvesWait, false)
+  assert.strictEqual(interpretPaneAnswers(working(0.6), with_({ exitSustainedMs: 9999 })).resolvesWait, false)
+  assert.strictEqual(interpretPaneAnswers(working(0.6), with_({ exitSustainedMs: 10000 })).resolvesWait, true)
+
+  const blocked = paneAnswers({ screen_state: { choice: 'working', confidence: 0.95 }, blocked_on_user: { noul: 0.8 } })
+  assert.strictEqual(interpretPaneAnswers(blocked, with_({ exitStreak: 5, exitSustainedMs: 60000 })).exitGrade, null,
+    'a cross-check that still sees a block grades nothing')
+  assert.strictEqual(interpretPaneAnswers(blocked, with_({ exitStreak: 5, exitSustainedMs: 60000 })).resolvesWait, false)
+
+  assert.strictEqual(interpretPaneAnswers(working(0.95), { currentPhase: 'running', exitStreak: 5 }).resolvesWait, false,
+    'there is nothing to resolve outside a wait')
+})
+// The screen said X; the session holds Y. These are the events that carry the
+// first into the second. No new event type exists for this — the classifier is
+// restricted to the vocabulary hooks already speak, which is what lets the
+// reducer stay completely unchanged.
+function paneEvents(verdictAnswers, session, extras = {}) {
+  const interp = interpretPaneAnswers(
+    verdictAnswers,
+    Object.assign({ currentPhase: currentPhase(session) }, extras.context)
+  )
+  return paneEventsFromInterpretation(interp, Object.assign({ session, now: 1000 }, extras.options))
+}
+
+// A wait verdict is refused unless the independent blocked_on_user question
+// agrees, so asking for one here has to move both.
+const WAIT_VERDICTS = new Set(['awaiting_approval', 'awaiting_plan_approval', 'awaiting_answer'])
+
+function confidently(choice, overrides = {}) {
+  const base = { screen_state: { choice, confidence: 0.95 } }
+  if (WAIT_VERDICTS.has(choice)) base.blocked_on_user = { noul: 0.95 }
+  return paneAnswers(Object.assign(base, overrides))
+}
+
+// Evidence that clears the strict bar for leaving a wait: this reading and the
+// one before it both graded strict. The verdict argument documents which
+// reading is meant.
+const LEAVING_WAIT = { context: { exitStreak: 2 } }
+
+function leaving(verdict) {
+  void verdict
+  return LEAVING_WAIT
+}
+
+test('the transition table maps every reading onto events hooks already speak', () => {
+  const cases = [
+    // from            verdict                   expected event types
+    ['running', 'working', []],
+    ['idle', 'working', [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE]],
+    ['completed', 'working', [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE]],
+    ['interrupted', 'working', [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE]],
+    ['running', 'awaiting_approval', [AGENT_EVENTS.PERMISSION_REQUEST]],
+    ['running', 'awaiting_plan_approval', [AGENT_EVENTS.PERMISSION_REQUEST]],
+    ['running', 'awaiting_answer', [AGENT_EVENTS.QUESTION_ASKED]],
+    ['running', 'idle_ready', [AGENT_EVENTS.TURN_COMPLETE]],
+    ['completed', 'idle_ready', []],
+    // WAIT to WAIT needs no resolver: both targets are explicit waits.
+    ['waitingForApproval', 'awaiting_answer', [AGENT_EVENTS.QUESTION_ASKED]],
+    ['waitingForAnswer', 'awaiting_approval', [AGENT_EVENTS.PERMISSION_REQUEST]],
+    // Neither of these is a phase the screen is allowed to assert.
+    ['running', 'shell_prompt', []],
+    ['running', 'unknown', []]
+  ]
+
+  for (const [from, verdict, expected] of cases) {
+    const session = { sessionId: 's1', agentType: 'claude', phase: from, status: 'working' }
+    const events = paneEvents(confidently(verdict), session, leaving(verdict))
+    assert.deepStrictEqual(
+      events.map(event => event.type),
+      expected,
+      `${from} + ${verdict}`
+    )
+    for (const event of events) assert.strictEqual(event.stateSource, 'pane-model')
+  }
+})
+
+test('leaving a wait takes a resolver first, then the state it moved to', () => {
+  const approval = () => ({
+    sessionId: 's1', agentType: 'claude', phase: 'waitingForApproval', status: 'working',
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval' }, stateEvidence: []
+  })
+
+  // The resolver alone lands on running, so a working reading needs nothing more.
+  assert.deepStrictEqual(
+    paneEvents(confidently('working'), approval(), leaving('working')).map(event => event.type),
+    [AGENT_EVENTS.PERMISSION_RESOLVED]
+  )
+  // Completing needs both: the user acted, and the turn then finished.
+  assert.deepStrictEqual(
+    paneEvents(confidently('idle_ready'), approval(), leaving('idle_ready')).map(event => event.type),
+    [AGENT_EVENTS.PERMISSION_RESOLVED, AGENT_EVENTS.TURN_COMPLETE]
+  )
+
+  const session = approval()
+  for (const event of paneEvents(confidently('idle_ready'), session, leaving('idle_ready'))) {
+    applySessionEvent(session, event)
+  }
+  assert.strictEqual(currentPhase(session), 'completed')
+  assert.strictEqual(session.pendingInteraction, null)
+})
+
+test('a wait the screen still shows is never released on weak evidence', () => {
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'waitingForApproval', status: 'working',
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval' }
+  }
+  // One reading is not a streak.
+  assert.deepStrictEqual(paneEvents(confidently('working'), session, { context: { exitStreak: 1 } }), [])
+  // Ordinary confidence does not clear the higher bar for leaving a wait.
+  assert.deepStrictEqual(
+    paneEvents(paneAnswers({ screen_state: { choice: 'working', confidence: 0.6 } }), session, leaving('working')),
+    []
+  )
+  // The cross-check still sees a block.
+  assert.deepStrictEqual(
+    paneEvents(confidently('working', { blocked_on_user: { noul: 0.8 } }), session, leaving('working')),
+    []
+  )
+})
+
+test('re-reading an unchanged wait emits nothing, and a changed one keeps the clock', () => {
+  // Trap: sameWaitRefresh() requires both pendingToolUse and activeTool to be
+  // absent from the event. Sending activeTool (even as null) would make every
+  // re-read a brand new wait, dropping pendingToolUse and resetting how long
+  // the user has been staring at the dialog.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'running', status: 'working', stateEvidence: []
+  }
+  for (const event of paneEvents(confidently('awaiting_approval'), session)) {
+    assert.strictEqual(event.activeTool, undefined, 'a wait event must not carry activeTool')
+    assert.strictEqual(event.pendingToolUse, undefined)
+    applySessionEvent(session, event)
+  }
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  const startedAt = session.pendingInteraction.startedAt
+
+  // The same dialog, still on screen: nothing to say.
+  assert.deepStrictEqual(paneEvents(confidently('awaiting_approval'), session), [])
+
+  // The same dialog, but the title finally became readable. The event that
+  // carries it must refresh the wait rather than restart it.
+  const [refresh] = paneEvents(confidently('awaiting_approval'), session, {
+    options: { extracted: { sessionTitle: 'review the migration' } }
+  })
+  applySessionEvent(session, refresh)
+  assert.strictEqual(session.sessionTitle, 'review the migration')
+  assert.strictEqual(session.pendingInteraction.startedAt, startedAt, 'the wait clock must not restart')
+
+  // A tool confirmation becoming a plan confirmation is a genuinely different
+  // dialog, and it still routes through the permission_request hooks already send.
+  const [toPlan] = paneEvents(confidently('awaiting_plan_approval'), session)
+  assert.strictEqual(toPlan.type, AGENT_EVENTS.PERMISSION_REQUEST)
+  assert.strictEqual(toPlan.attentionReason, 'waiting for plan approval')
+  applySessionEvent(session, toPlan)
+  assert.strictEqual(session.pendingInteraction.type, 'plan')
+  assert.strictEqual(session.needsAttention, 'waiting for plan approval')
+})
+
+test('the classifier never sends question_answered outside an answer wait', () => {
+  // Trap: the reducer applies question_answered unconditionally from any phase,
+  // crashed and stale included, so the phase check has to happen here.
+  for (const phase of ['crashed', 'stale', 'completed', 'running', 'waitingForApproval']) {
+    const session = { sessionId: 's1', agentType: 'claude', phase, status: phase }
+    for (const verdict of ['working', 'idle_ready', 'awaiting_approval', 'shell_prompt']) {
+      const types = paneEvents(confidently(verdict), session, leaving(verdict)).map(event => event.type)
+      assert.ok(
+        !types.includes(AGENT_EVENTS.QUESTION_ANSWERED),
+        `${phase} + ${verdict} must not resolve an answer wait`
+      )
+    }
+  }
+})
+
+test('a terminal session cannot be revived by the screen', () => {
+  // crashed and stale come from PID probing and are revivable only by a hook.
+  // The reading is refused outright, and its display updates must not sneak an
+  // ended session back to life either — event.updates run before the guards.
+  for (const phase of ['crashed', 'stale']) {
+    const session = {
+      sessionId: 's1', agentType: 'claude', phase, status: phase, endedAt: 500, stateEvidence: []
+    }
+    for (const event of paneEvents(confidently('working'), session, leaving('working'))) {
+      applySessionEvent(session, event)
+    }
+    assert.strictEqual(currentPhase(session), phase, `${phase} must stay terminal`)
+    assert.strictEqual(session.endedAt, 500)
+  }
+})
+
+test('reopening a finished session drops its stale turn correlation', () => {
+  // Trap: prompt_submit is the only member of TURN_START_EVENTS, so it resets
+  // currentTurnId/turnStartedAt. assistant_message_update reopens the turn just
+  // as well without claiming a new one started.
+  const session = {
+    sessionId: 's1', agentType: 'codex', phase: 'completed', status: 'completed',
+    transcriptPath: '/tmp/codex.jsonl',
+    currentTurnId: 'turn-1', lastTurnId: 'turn-1', stateEvidence: []
+  }
+  const [event] = paneEvents(confidently('working'), session)
+  assert.strictEqual(event.type, AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE)
+  // Synthesizing one would be worse than leaving it: codexTurnEndForSession()
+  // looks lastTurnId up exactly and refuses timestamp fallback, so a made-up id
+  // would permanently hide the real turn's task_complete.
+  assert.strictEqual(event.turnId, undefined)
+
+  const status = { version: 1, sessions: { s1: session } }
+  sync.applyPaneEvents(status, [{ sessionId: 's1', event }], sync.createStats())
+
+  assert.strictEqual(currentPhase(session), 'running')
+  // The id belongs to the turn that ENDED. Kept, the Codex transcript sweep
+  // finds that turn's task_complete by exact id and completes the turn that
+  // just started. Cleared, the lookup degrades to timestamp matching, which
+  // cannot match a completion older than this reopen.
+  assert.strictEqual(session.lastTurnId, null)
+  assert.strictEqual(session.currentTurnId, null)
+})
+
+test('a pane refresh within a live turn keeps its correlation', () => {
+  // Only a reopen invalidates the id. A session already running still owns its
+  // turn, and clearing it there would throw away a correlation that is correct.
+  const session = {
+    sessionId: 's1', agentType: 'codex', phase: 'running', status: 'working',
+    currentTurnId: 'turn-9', lastTurnId: 'turn-9', activeTool: null, stateEvidence: []
+  }
+  const events = paneEvents(confidently('working', { active_tool: { choice: 'shell', confidence: 0.9 } }), session)
+    .map(event => ({ sessionId: 's1', event }))
+  assert.strictEqual(events.length, 1, 'a display field moved, so there is something to send')
+  sync.applyPaneEvents({ version: 1, sessions: { s1: session } }, events, sync.createStats())
+
+  assert.strictEqual(session.activeTool, 'shell')
+  assert.strictEqual(session.lastTurnId, 'turn-9')
+})
+
+test('a reading the guards refuse never clears the ended flag', () => {
+  // event.updates land before the guards, which is why nothing is smuggled
+  // through them: the correction runs only once the reducer accepted the event.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'stale', status: 'stale', endedAt: 500, stateEvidence: []
+  }
+  const events = paneEvents(confidently('working'), session, leaving('working'))
+    .map(event => ({ sessionId: 's1', event }))
+  sync.applyPaneEvents({ version: 1, sessions: { s1: session } }, events, sync.createStats())
+
+  assert.strictEqual(currentPhase(session), 'stale')
+  assert.strictEqual(session.endedAt, 500)
+})
+
+test('a classification the gate rejects leaves the placeholder hidden', () => {
+  // isVisibleInPicker() hides a pane-discovery shell until something confirms
+  // it. Nothing was added there for the pane model: an accepted reading rewrites
+  // stateSource to pane-model on its way through setPhase, and a rejected one
+  // emits no event at all, so the shell keeps hiding itself.
+  const shell = {
+    sessionId: 's1', agentType: 'claude', phase: 'running', status: 'working',
+    stateSource: 'pane-discovery', tmuxPane: '%1', stateEvidence: []
+  }
+  const unsure = paneEvents(paneAnswers({ screen_state: { choice: 'working', confidence: 0.3 } }), shell)
+  assert.deepStrictEqual(unsure, [])
+  assert.strictEqual(shell.stateSource, 'pane-discovery')
+  assert.strictEqual(isVisibleInPicker(shell), 'hidden')
+
+  for (const event of paneEvents(confidently('awaiting_approval'), shell)) applySessionEvent(shell, event)
+  assert.strictEqual(shell.stateSource, 'pane-model')
+  assert.notStrictEqual(isVisibleInPicker(shell), 'hidden')
+})
+
+test('a reading that failed to extract a prompt never clears the old one', () => {
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'completed', status: 'completed',
+    lastUserPrompt: 'the prompt from an earlier capture'
+  }
+  const [event] = paneEvents(confidently('working'), session, {
+    options: { extracted: { confidence: 'none' } }
+  })
+  // undefined is skipped by the reducer, so the earlier capture survives. Claude
+  // draws on the alternate screen, which makes the echo readable exactly once.
+  assert.strictEqual(event.updates.lastUserPrompt, undefined)
+  applySessionEvent(session, event)
+  assert.strictEqual(session.lastUserPrompt, 'the prompt from an earlier capture')
+})
+
+test('pane_state is still phase-neutral', () => {
+  const session = { sessionId: 's1', agentType: 'claude', phase: 'completed', status: 'completed' }
+  const result = applySessionEvent(session, {
+    type: AGENT_EVENTS.PANE_STATE,
+    phase: 'running',
+    source: 'pane',
+    timestamp: Date.now()
+  })
+  assert.strictEqual(result.applied, false)
+  assert.strictEqual(currentPhase(session), 'completed')
+})
+
+test('a hook that lands after the screen was read wins over the reading', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, 'status.json')
+    const session = {
+      sessionId: 'raced',
+      agentType: 'claude',
+      phase: 'running',
+      status: 'working',
+      // A prompt hook arrived after the screen was captured: a new turn just
+      // started, so the older idle_ready reading must not complete it.
+      lastHookAt: 5000,
+      stateEvidence: []
+    }
+    fs.writeFileSync(statusFile, JSON.stringify({ version: 1, sessions: { raced: session } }))
+
+    const completion = at => ({
+      sessionId: 'raced',
+      event: {
+        type: AGENT_EVENTS.TURN_COMPLETE,
+        source: 'pane-model',
+        stateSource: 'pane-model',
+        rawEventName: 'pane_idle_ready',
+        timestamp: at
+      }
+    })
+
+    const stats = sync.createStats()
+    const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    sync.applyPaneEvents(status, [completion(4000)], stats)
+
+    assert.strictEqual(currentPhase(status.sessions.raced), 'running')
+    assert.strictEqual(stats.paneModel.superseded, 1)
+    assert.strictEqual(stats.paneModel.applied, 0)
+
+    // A reading taken after the hook is current evidence and still applies.
+    sync.applyPaneEvents(status, [completion(6000)], stats)
+    assert.strictEqual(currentPhase(status.sessions.raced), 'completed')
+    assert.strictEqual(stats.paneModel.applied, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+function paneSyncFixture(sessionOverrides = {}) {
+  const dir = tempDir()
+  const statusFile = path.join(dir, 'status.json')
+  const now = Date.now()
+  fs.writeFileSync(statusFile, JSON.stringify({
+    version: 1,
+    lastUpdated: now,
+    sessions: {
+      paneSession: Object.assign({
+        sessionId: 'paneSession',
+        agentType: 'claude',
+        status: 'working',
+        phase: 'running',
+        startedAt: now - 600000,
+        lastUpdated: now,
+        activeTool: null
+      }, sessionOverrides)
+    }
+  }, null, 2))
+  return { dir, statusFile, now }
+}
+
+test('sync.run applies queued pane classifications', () => {
+  const { dir, statusFile, now } = paneSyncFixture({ phase: 'completed', status: 'completed' })
+  try {
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      paneEvents: [{
+        sessionId: 'paneSession',
+        event: {
+          type: AGENT_EVENTS.PERMISSION_REQUEST,
+          source: 'pane-model',
+          stateSource: 'pane-model',
+          rawEventName: 'pane_awaiting_approval',
+          attentionReason: 'waiting for approval',
+          timestamp: now
+        }
+      }]
+    })
+
+    assert.strictEqual(currentPhase(result.status.sessions.paneSession), 'waitingForApproval')
+    assert.strictEqual(result.stats.paneModel.applied, 1)
+    const persisted = JSON.parse(fs.readFileSync(statusFile, 'utf-8'))
+    assert.strictEqual(currentPhase(persisted.sessions.paneSession), 'waitingForApproval')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('sync.run ignores pane events for sessions it does not know', () => {
+  const { dir, statusFile, now } = paneSyncFixture()
+  try {
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      paneEvents: [{
+        sessionId: 'ghost',
+        event: { type: AGENT_EVENTS.TURN_COMPLETE, source: 'pane-model', timestamp: now }
+      }]
+    })
+    assert.deepStrictEqual(Object.keys(result.status.sessions), ['paneSession'])
+    assert.strictEqual(result.stats.paneModel.applied, 0)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a watched frozen screen is not force-completed by the idle sweep', () => {
+  // The regression this guards: the classifier only emits when its reading
+  // disagrees with the session, so an agent running a long silent command stops
+  // producing events. If the sweep measured the persisted observation instead
+  // of the live one, it would force-complete exactly the case this feature is
+  // meant to keep marked BUSY.
+  const { dir, statusFile, now } = paneSyncFixture({ lastUpdated: Date.now() - 300000 })
+  try {
+    const watched = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      idleCompleteMs: 60000,
+      paneObservedAt: new Map([['paneSession', now]])
+    })
+    assert.strictEqual(currentPhase(watched.status.sessions.paneSession), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the idle sweep still fires for a session nobody is watching', () => {
+  const { dir, statusFile, now } = paneSyncFixture({ lastUpdated: Date.now() - 300000 })
+  try {
+    const unwatched = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      idleCompleteMs: 60000
+    })
+    assert.strictEqual(currentPhase(unwatched.status.sessions.paneSession), 'completed')
+
+    // A stale observation must not shield it either.
+    const { dir: dir2, statusFile: file2 } = paneSyncFixture({ lastUpdated: Date.now() - 300000 })
+    try {
+      const stale = sync.run(file2, {
+        reconcile: false,
+        codexMode: 'none',
+        claudeTranscript: false,
+        idleCompleteMs: 60000,
+        paneObservedAt: new Map([['paneSession', now - 300000]])
+      })
+      assert.strictEqual(currentPhase(stale.status.sessions.paneSession), 'completed')
+    } finally {
+      fs.rmSync(dir2, { recursive: true, force: true })
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('pane modules load and degrade when the TypeSafe SDK is absent', () => {
+  // tmux-scout installs via TPM and nobody runs npm install, so the SDK has to
+  // behave like an optional dependency. A top-level require anywhere in the
+  // pane pipeline would crash every existing user; this test is the guard.
+  // Works whether or not the SDK happens to be installed: on a machine without
+  // it the absent condition already holds, and on a dev machine we simulate it.
+  let sdkPath = null
+  try { sdkPath = require.resolve('@typesafe-ai/sdk') } catch (_) {}
+  const cached = sdkPath ? require.cache[sdkPath] : null
+  if (sdkPath) {
+    require.cache[sdkPath] = { get exports() { throw new Error('Cannot find module @typesafe-ai/sdk') } }
+  }
+
+  const paneModules = [
+    '../scripts/lib/pane-capture',
+    '../scripts/lib/pane-fixtures',
+    '../scripts/lib/pane-answer-cache',
+    '../scripts/lib/pane-text-extract',
+    '../scripts/lib/pane-questions',
+    '../scripts/lib/pane-classifier',
+    '../scripts/lib/pane-observer',
+    '../scripts/lib/jev-client'
+  ]
+  const reloaded = paneModules.map(name => require.resolve(name))
+  for (const resolved of reloaded) delete require.cache[resolved]
+
+  try {
+    for (const name of paneModules) {
+      assert.doesNotThrow(() => require(name), `${name} must load without the SDK`)
+    }
+    const { createJevClient, MIN_NODE_MAJOR } = require('../scripts/lib/jev-client')
+    const client = createJevClient({ apiKey: 'test-key' })
+    assert.strictEqual(client.available, false)
+    // The runtime-version gate short-circuits ahead of the require, so on the
+    // Node 16 and 18 this plugin still supports the reason is the version, not
+    // the missing module. Either way the contract is the same: report, never throw.
+    const nodeMajor = Number.parseInt(String(process.versions.node).split('.')[0], 10)
+    assert.strictEqual(client.reason, nodeMajor < MIN_NODE_MAJOR ? 'node-too-old' : 'no-sdk')
+  } finally {
+    if (sdkPath) {
+      if (cached) require.cache[sdkPath] = cached
+      else delete require.cache[sdkPath]
+    }
+    for (const resolved of reloaded) delete require.cache[resolved]
+  }
+})
+
+test('jev client reports why it is unavailable instead of throwing', async () => {
+  // createJevClient does not go looking for a key — resolveApiKey() is the
+  // caller's job — so this stays true on a machine that has one configured.
+  const noKey = createJevClient({ apiKey: '', sdk: {} })
+  assert.strictEqual(noKey.available, false)
+  assert.strictEqual(noKey.reason, 'no-key')
+  // Even unavailable, classify resolves rather than rejecting: a watcher tick
+  // must never be taken down by an optional feature.
+  const result = await noKey.classify({}, {})
+  assert.strictEqual(result.ok, false)
+  assert.strictEqual(result.errorKind, 'no-key')
+})
+
+test('jev client turns SDK failures into typed outcomes', async () => {
+  const failures = [
+    [Object.assign(new Error('timed out'), { constructor: { name: 'APITimeoutError' } }), 'timeout'],
+    [Object.assign(new Error('rate limited'), { status: 429 }), 'rate-limited'],
+    [Object.assign(new Error('bad key'), { status: 401 }), 'auth']
+  ]
+  for (const [error, expected] of failures) {
+    const client = createJevClient({
+      apiKey: 'test-key',
+      sdk: { TypeSafeClient: class { async systemOne() { throw error } } }
+    })
+    assert.strictEqual(client.available, true)
+    const result = await client.classify({}, {})
+    assert.strictEqual(result.ok, false)
+    assert.strictEqual(result.errorKind, expected)
+  }
+})
+
+test('jev client returns answers and usage on success', async () => {
+  const client = createJevClient({
+    apiKey: 'test-key',
+    sdk: {
+      TypeSafeClient: class {
+        async systemOne() {
+          return { answers: { screen_state: { choice: 'working' } }, usage: { input_tokens: 2551 }, model: 'jev-1.13.0' }
+        }
+      }
+    }
+  })
+  const result = await client.classify({}, {})
+  assert.strictEqual(result.ok, true)
+  assert.strictEqual(result.answers.screen_state.choice, 'working')
+  assert.strictEqual(result.usage.input_tokens, 2551)
+})
+
+// --- pane observer ---
+
+function observerHarness(overrides = {}) {
+  let clock = 1_000_000
+  const calls = []
+  const screens = new Map()
+
+  const capture = paneId => {
+    const text = screens.has(paneId) ? screens.get(paneId) : 'agent line one\nagent line two\nagent line three'
+    if (text === null) return null
+    return { paneId, raw: text, text, fingerprint: `fp:${text.length}:${text.slice(0, 12)}` }
+  }
+
+  const answersByCall = overrides.answers || [sampleAnswers('working')]
+  const client = {
+    available: true,
+    reason: null,
+    async classify(state) {
+      calls.push(state)
+      const next = answersByCall[Math.min(calls.length - 1, answersByCall.length - 1)]
+      if (next instanceof Error) return { ok: false, errorKind: next.message }
+      return { ok: true, answers: next, usage: { input_tokens: 2551 }, model: 'jev-1.13.0' }
+    }
+  }
+
+  // Every observer gets its own store files: shadow mode and cache persistence
+  // both write to ~/.tmux-scout by default, which is the user's real registry.
+  // Removed when the run ends whether or not the test called cleanup().
+  const storeDir = overrides.store || fs.mkdtempSync(path.join(os.tmpdir(), 'scout-pane-'))
+  if (!overrides.store) createdTempDirs.push(storeDir)
+  const observer = createPaneObserver(Object.assign({
+    mode: 'on',
+    client,
+    capture,
+    now: () => clock,
+    shadowFile: path.join(storeDir, 'pane-agreement.jsonl'),
+    cacheFile: path.join(storeDir, 'pane-cache.json'),
+    metricsFile: path.join(storeDir, 'pane-metrics.jsonl'),
+    observedFile: path.join(storeDir, 'pane-observed.json')
+  }, overrides.observer))
+
+  return {
+    observer,
+    storeDir,
+    shadowRows: () => readShadow({ file: path.join(storeDir, 'pane-agreement.jsonl') }),
+    metricRows: () => readMetrics({ file: path.join(storeDir, 'pane-metrics.jsonl') }),
+    cleanup() { fs.rmSync(storeDir, { recursive: true, force: true }) },
+    calls,
+    screens,
+    client,
+    now: () => clock,
+    advance(ms) { clock += ms },
+    // The watcher applies whatever the previous tick produced, then dispatches
+    // against the fresh status — the same ordering as runLoop.
+    async tick(status, panes = new Map()) {
+      const events = observer.drain()
+      observer.dispatch(status, panes)
+      await new Promise(resolve => setImmediate(resolve))
+      return events
+    }
+  }
+}
+
+function paneStatus(session = {}) {
+  return {
+    sessions: {
+      s1: Object.assign({
+        sessionId: 's1',
+        agentType: 'claude',
+        tmuxPane: '%1',
+        phase: 'running',
+        status: 'working',
+        stateEvidence: []
+      }, session)
+    }
+  }
+}
+
+test('the agent allowlist survives being normalized twice', async () => {
+  // watcher.js normalizes the tmux option before handing it over, and
+  // createPaneObserver normalizes whatever it gets. Stringifying a Set yields
+  // "[object Set]", so a non-idempotent normalizer silently empties the
+  // allowlist and every enabled mode makes zero calls.
+  const { toAgentSet } = require('../scripts/lib/pane-observer')
+  const once = toAgentSet('claude,codex,gemini')
+  assert.deepStrictEqual([...toAgentSet(once)], ['claude', 'codex', 'gemini'])
+
+  const h = observerHarness({ observer: { agents: toAgentSet('claude,codex,gemini') } })
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1, 'a pre-normalized allowlist must still match')
+})
+
+test('pane observer only stands the timeout sweeps down for a reading it trusts', async () => {
+  // A rejected reading yields no conclusion, so it must not disable the
+  // fallbacks. Cached rejected answers would otherwise refresh this every tick
+  // and leave a session that really did stall marked BUSY forever.
+  const unusable = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'unknown', confidence: 0.99 }
+  }] })
+  await unusable.tick(paneStatus())
+  await unusable.tick(paneStatus())
+  assert.strictEqual(unusable.observer.observedAt().size, 0)
+
+  const lowConfidence = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'idle_ready', confidence: 0.3 }
+  }] })
+  await lowConfidence.tick(paneStatus())
+  await lowConfidence.tick(paneStatus())
+  assert.strictEqual(lowConfidence.observer.observedAt().size, 0)
+
+  // An accepted reading that merely agrees with the session still counts: that
+  // is the frozen-screen case the fallbacks exist to not misjudge.
+  const trusted = observerHarness({ answers: [sampleAnswers('working')] })
+  await trusted.tick(paneStatus())
+  await trusted.tick(paneStatus())
+  assert.strictEqual(trusted.observer.observedAt().size, 1)
+})
+
+test('pane observer stays completely inert while switched off', async () => {
+  const h = observerHarness({ observer: { mode: 'off' } })
+  const status = paneStatus()
+
+  await h.tick(status)
+  await h.tick(status)
+
+  assert.strictEqual(h.calls.length, 0)
+  assert.strictEqual(h.observer.drain().length, 0)
+  assert.strictEqual(h.observer.observedAt().size, 0)
+})
+
+test('pane observer answers a repeated screen from cache without calling the model', async () => {
+  const h = observerHarness({ answers: [sampleAnswers('idle_ready')] })
+  const status = paneStatus()
+
+  await h.tick(status)
+  assert.strictEqual(h.calls.length, 1)
+
+  // Same screen on every later tick. Cache hits deliberately ignore the
+  // interval, so the reading keeps arriving without ever paying again.
+  for (let i = 0; i < 5; i++) {
+    h.advance(10_000)
+    await h.tick(status)
+  }
+  assert.strictEqual(h.calls.length, 1, 'an unchanged screen must never be re-asked')
+  assert.strictEqual(h.observer.stats().cacheHits, 5)
+})
+
+test('pane observer throttles a screen that keeps changing', async () => {
+  const h = observerHarness({ answers: [sampleAnswers('working')] })
+  const status = paneStatus()
+
+  for (let i = 0; i < 4; i++) {
+    h.screens.set('%1', `line a\nline b\nchanging content ${'x'.repeat(i)}`)
+    h.advance(2000)
+    await h.tick(status)
+  }
+
+  // Four distinct screens across 8s, with a 6s floor between calls.
+  assert.ok(h.calls.length <= 2, `expected throttling, got ${h.calls.length} calls`)
+  assert.ok(h.observer.stats().throttled > 0)
+})
+
+test('pane observer backs off a session after an error and never caches the failure', async () => {
+  const h = observerHarness({ answers: [new Error('timeout'), sampleAnswers('working')] })
+  const status = paneStatus()
+
+  await h.tick(status)
+  assert.strictEqual(h.calls.length, 1)
+  assert.strictEqual(h.observer.stats().errors, 1)
+
+  // Same screen, but the failure was not cached — the retry is blocked by the
+  // 60s error backoff rather than served a stale answer.
+  h.advance(10_000)
+  await h.tick(status)
+  assert.strictEqual(h.calls.length, 1, 'an errored session must back off')
+
+  h.advance(60_000)
+  await h.tick(status)
+  assert.strictEqual(h.calls.length, 2, 'the session must retry once the backoff expires')
+})
+
+test('pane observer pauses every session on a rate limit, not just the one that hit it', async () => {
+  const h = observerHarness({ answers: [new Error('rate-limited'), sampleAnswers('working')] })
+  const status = paneStatus()
+  status.sessions.s2 = Object.assign({}, status.sessions.s1, { sessionId: 's2', tmuxPane: '%2' })
+
+  await h.tick(status)
+  const afterFirst = h.calls.length
+  assert.ok(afterFirst >= 1)
+
+  h.advance(10_000)
+  await h.tick(status)
+  assert.strictEqual(h.calls.length, afterFirst, 'a 429 is an account-wide signal')
+})
+
+test('pane observer skips sessions a cheaper or better source already owns', async () => {
+  const cases = [
+    ['a remote session', { isRemote: true }],
+    ['an ended session', { endedAt: Date.now() }],
+    ['a crashed session', { phase: 'crashed', status: 'crashed' }],
+    ['an agent outside the allowlist', { agentType: 'traex' }],
+    ['a session with no pane', { tmuxPane: null }]
+  ]
+  for (const [label, session] of cases) {
+    const h = observerHarness()
+    await h.tick(paneStatus(session))
+    assert.strictEqual(h.calls.length, 0, `${label} must not be classified`)
+  }
+
+  // A recent hook is no longer a reason to skip a pane. The two sources are
+  // configured either/or (@scout-state-source), so in jev mode there are no
+  // hooks to defer to, and a leftover lastHookAt from before the switch must
+  // not put a session permanently out of reach.
+  const hooked = observerHarness()
+  await hooked.tick(paneStatus({ lastHookAt: hooked.now() - 5000 }))
+  assert.strictEqual(hooked.calls.length, 1)
+})
+
+test('pane observer refuses to revive a session from the leftovers of its own exit', async () => {
+  // The pane still shows the agent UI after the process is gone. Process
+  // liveness outranks the screen — without this the model reads the leftover
+  // chrome as an idle composer and resurrects a finished session.
+  const h = observerHarness()
+  await h.tick(paneStatus({ phase: 'interrupted', status: 'interrupted', terminalKind: 'processExit' }))
+  assert.strictEqual(h.calls.length, 0)
+
+  // An interrupt the user typed is different: that process is still there.
+  const cancelled = observerHarness()
+  await cancelled.tick(paneStatus({ phase: 'interrupted', status: 'interrupted', terminalKind: 'userInterrupt' }))
+  assert.strictEqual(cancelled.calls.length, 1)
+})
+
+test('pane observer classifies one screen once, no matter how many sessions claim the pane', async () => {
+  // Resumed turns and re-runs in the same window routinely leave several live
+  // records pointing at one pane. A pane shows one screen, so it is evidence
+  // about one session; classifying all of them would apply the same verdict
+  // repeatedly and put a row per record in the picker.
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'awaiting_approval', confidence: 0.95 },
+    blocked_on_user: { type: 'noul', noul: 0.95 }
+  }] })
+  const status = { sessions: {} }
+  for (let i = 0; i < 4; i++) {
+    status.sessions[`s${i}`] = {
+      sessionId: `s${i}`,
+      agentType: 'claude',
+      tmuxPane: '%1',
+      phase: 'running',
+      status: 'working',
+      // Newest by when the record was started — the process start time for a
+      // discovered session — not by lastUpdated, which the sweeps also write.
+      startedAt: 1000 + i,
+      stateEvidence: []
+    }
+  }
+
+  await h.tick(status)
+  const events = await h.tick(status)
+  assert.strictEqual(h.calls.length, 1)
+  assert.strictEqual(events.length, 1)
+  assert.strictEqual(events[0].sessionId, 's3', 'the newest record owns the screen')
+  assert.strictEqual(h.observer.observedAt().size, 1)
+})
+
+test('pane observer ignores a dead pane but not an unreadable tmux', async () => {
+  const dead = new Map([['%1', { paneId: '%1', paneDead: true }]])
+  dead.tmuxAvailable = true
+  const h = observerHarness()
+  await h.tick(paneStatus(), dead)
+  assert.strictEqual(h.calls.length, 0)
+
+  // tmux failing to answer is not evidence that a pane vanished.
+  const unknown = new Map()
+  unknown.tmuxAvailable = false
+  const blind = observerHarness()
+  await blind.tick(paneStatus(), unknown)
+  assert.strictEqual(blind.calls.length, 1)
+})
+
+test('pane observer lets a frozen screen accumulate the agreement that leaves a WAIT', async () => {
+  // The regression this guards: streaks count ticks, not API calls. If a cache
+  // hit did not advance the streak, a session whose dialog closed onto a screen
+  // already seen could never gather the two agreeing readings that leaving a
+  // WAIT requires, and would sit in WAIT forever.
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'working', confidence: 0.95 },
+    blocked_on_user: { type: 'noul', noul: 0.02 },
+    is_running: { type: 'noul', noul: 0.95 }
+  }] })
+  const status = paneStatus({ phase: 'waitingForApproval', status: 'waiting' })
+
+  await h.tick(status)
+  assert.deepStrictEqual(await h.tick(status), [], 'one reading is not enough')
+  assert.strictEqual(h.calls.length, 1)
+
+  h.advance(2000)
+  const second = await h.tick(status)
+  assert.strictEqual(h.calls.length, 1, 'the second reading came from cache')
+  assert.deepStrictEqual(
+    second.map(entry => entry.event.type),
+    [AGENT_EVENTS.PERMISSION_RESOLVED],
+    'a cached reading must still count toward the streak'
+  )
+  h.cleanup()
+})
+
+test('pane observer stays silent once the session already agrees with the screen', async () => {
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'working', confidence: 0.95 },
+    is_running: { type: 'noul', noul: 0.9 }
+  }] })
+  const status = paneStatus({ phase: 'running', status: 'working' })
+
+  await h.tick(status)
+  const events = await h.tick(status)
+  assert.strictEqual(events.length, 0, 'agreeing with the screen must not rewrite the session')
+
+  h.advance(5000)
+  assert.strictEqual((await h.tick(status)).length, 0)
+})
+
+test('shadow mode records readings in its own file and changes nothing', async () => {
+  // Shadow has exactly one job: leave a row for the agreement report. Routing
+  // that through the reducer cannot be behaviour-neutral — every path through
+  // applySessionEvent refreshes lastUpdated and lastEvent, the timestamps the
+  // 120s/180s idle sweeps measure, so a stream of shadow readings would
+  // postpone the very completions shadow mode must not touch.
+  const h = observerHarness({
+    observer: { mode: 'shadow' },
+    answers: [{
+      screen_state: { type: 'choice', choice: 'awaiting_approval', confidence: 0.95 },
+      blocked_on_user: { type: 'noul', noul: 0.95 }
+    }]
+  })
+  const status = paneStatus({ phase: 'running', status: 'working' })
+
+  await h.tick(status)
+  assert.deepStrictEqual(await h.tick(status), [], 'shadow must never reach the reducer')
+
+  const rows = h.shadowRows()
+  assert.strictEqual(rows.length, 1)
+  assert.strictEqual(rows[0].verdict, 'awaiting_approval')
+  assert.strictEqual(rows[0].gate, 'accept')
+  assert.strictEqual(rows[0].hookPhase, 'running', 'the report needs what the hooks thought at the time')
+  assert.strictEqual(rows[0].sessionId, 's1')
+
+  // Standing the idle sweeps down is itself a behaviour change.
+  assert.strictEqual(h.observer.observedAt().size, 0)
+
+  // The same verdict again is not new information for the report.
+  h.advance(5000)
+  await h.tick(status)
+  assert.strictEqual(h.shadowRows().length, 1)
+  h.cleanup()
+})
+
+test('pane observer reports observation times from memory so a frozen screen keeps the sweeps away', async () => {
+  const h = observerHarness({ answers: [sampleAnswers('working')] })
+  const status = paneStatus()
+
+  const captureAt = h.now()
+  await h.tick(status)
+  await h.tick(status)
+  // Stamped with when the screen was read, not when the answer was processed —
+  // the staleness checks that consume this depend on it saying so honestly.
+  assert.strictEqual(h.observer.observedAt().get('s1'), captureAt)
+
+  // No event is emitted for an unchanged screen, so the persisted
+  // paneObservation would go stale here — the in-memory map must not. Readings
+  // are interpreted one tick after capture, so the timestamp trails the clock
+  // by a tick; what matters is that it never trails far enough for the 120s
+  // sweep to call a session unobserved.
+  for (let i = 0; i < 5; i++) {
+    h.advance(30_000)
+    await h.tick(status)
+    assert.ok(h.now() - h.observer.observedAt().get('s1') <= 30_000)
+  }
+  assert.ok(h.observer.observedAt().get('s1') > captureAt, 'cache hits must keep it moving')
+  assert.strictEqual(h.calls.length, 1, 'and none of that cost an API call')
+})
+
+test('pane observer caps captures per tick and rotates so no session starves', async () => {
+  const h = observerHarness({ observer: { maxCapturesPerTick: 2 } })
+  const status = { sessions: {} }
+  for (let i = 0; i < 5; i++) {
+    status.sessions[`s${i}`] = {
+      sessionId: `s${i}`,
+      agentType: 'claude',
+      tmuxPane: `%${i}`,
+      phase: 'running',
+      status: 'working',
+      stateEvidence: []
+    }
+  }
+
+  const seen = new Set()
+  for (let tick = 0; tick < 5; tick++) {
+    h.advance(10_000)
+    await h.tick(status)
+    for (const state of h.calls) seen.add(state.screen)
+  }
+
+  assert.ok(h.observer.stats().captureCapped > 0, 'the cap must actually bite')
+  assert.strictEqual(h.observer.stats().captured, 10, '2 captures per tick across 5 ticks')
+})
+
+test('pane observer forgets sessions that left the registry', async () => {
+  const h = observerHarness()
+  const status = paneStatus()
+
+  await h.tick(status)
+  await h.tick(status)
+  assert.strictEqual(h.observer.stats().tracked, 1)
+  assert.strictEqual(h.observer.observedAt().size, 1)
+
+  h.observer.prune({ sessions: {} })
+  assert.strictEqual(h.observer.stats().tracked, 0)
+  assert.strictEqual(h.observer.observedAt().size, 0)
+})
+
+test('pane observer warm-starts its cache across a watcher restart', async () => {
+  // tmux reloading its config restarts the watcher. Without a warm start every
+  // session is reclassified from scratch even though no screen changed.
+  const text = 'agent line one\nagent line two\nagent line three'
+  const status = paneStatus()
+
+  const first = observerHarness()
+  await first.tick(status)
+  await first.tick(status)
+  assert.strictEqual(first.calls.length, 1)
+  first.observer.close()
+
+  const restarted = observerHarness({ store: first.storeDir })
+  // Real time, not the harness clock: the cache checks its TTL against
+  // Date.now(), and a seed stamped in the past would be rejected as expired.
+  assert.strictEqual(restarted.observer.seed(), 1)
+  assert.strictEqual(
+    restarted.observer.stats().cache.size,
+    1,
+    `the entry is keyed by screen content (fp:${text.length})`
+  )
+
+  await restarted.tick(status)
+  assert.strictEqual(restarted.calls.length, 0, 'a screen unchanged across a restart must not be re-asked')
+  first.cleanup()
+})
+
+test('every question in the set is read by a decision', () => {
+  // The question set is ~88% of the input tokens in a call, so a question
+  // nobody reads is a recurring bill for nothing. Both of the ones that were
+  // dropped also duplicated something already being asked.
+  const { paneQuestions } = require('../scripts/lib/pane-questions')
+  const source = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'lib', 'pane-classifier.js'), 'utf-8')
+  for (const name of Object.keys(paneQuestions())) {
+    assert.ok(source.includes(`'${name}'`), `${name} is asked but never read`)
+  }
+})
+
+test('jev metrics report latency, tokens and what they cost', () => {
+  let clock = 1_000_000
+  const metrics = createPaneMetrics({ now: () => clock })
+  for (const ms of [100, 200, 300, 400, 5000]) {
+    metrics.recordCall({ ok: true, latencyMs: ms, usage: { input_tokens: 2000 } }, { sessionId: 's1', agentType: 'claude' })
+  }
+  metrics.recordCall({ ok: false, errorKind: 'timeout', latencyMs: 8000 }, { sessionId: 's1', agentType: 'claude' })
+  clock += 3600_000
+
+  const snap = metrics.snapshot({ cacheHits: 94 })
+  assert.strictEqual(snap.calls, 6)
+  assert.strictEqual(snap.ok, 5)
+  assert.deepStrictEqual(snap.errorsByKind, { timeout: 1 })
+  assert.strictEqual(snap.latency.maxMs, 8000)
+  assert.strictEqual(snap.latency.p50Ms, 400, 'percentiles come from the samples, not the mean')
+  assert.strictEqual(snap.inputTokens, 10000)
+  // 10k tokens at $0.042/Mtok, over exactly one hour of uptime.
+  assert.strictEqual(snap.costUsd, 0.00042)
+  assert.strictEqual(snap.costUsdPerHour, 0.0004)
+
+  // A rate extrapolated from seconds of uptime is arithmetically right and
+  // practically nonsense, so it is withheld rather than shown.
+  const fresh = createPaneMetrics({ now: () => clock })
+  fresh.recordCall({ ok: true, latencyMs: 50, usage: { input_tokens: 2500 } }, {})
+  assert.strictEqual(fresh.snapshot().costUsdPerHour, null)
+  assert.ok(fresh.snapshot().costUsd > 0, 'what was already spent is always known')
+  // 6 paid calls out of 100 screens that needed an answer: the number that says
+  // whether normalization is still keeping animation out of the fingerprint.
+  assert.strictEqual(snap.paidShare, 0.06)
+})
+
+test('per-call jev logging is opt-in and off by default', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-metrics-'))
+  try {
+    const file = path.join(dir, 'pane-metrics.jsonl')
+    const quiet = createPaneMetrics({ file })
+    quiet.recordCall({ ok: true, latencyMs: 10, usage: { input_tokens: 5 } }, {})
+    assert.strictEqual(readMetrics({ file }).length, 0, 'a watcher must not append per call unasked')
+
+    const loud = createPaneMetrics({ file, logCalls: true })
+    loud.recordCall({ ok: false, errorKind: 'rate-limited', latencyMs: 12 }, { sessionId: 's1', agentType: 'codex' })
+    const [row] = readMetrics({ file })
+    assert.strictEqual(row.ok, false)
+    assert.strictEqual(row.error, 'rate-limited')
+    assert.strictEqual(row.agent, 'codex')
+    assert.strictEqual(row.ms, 12)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the observer reports what its calls cost', async () => {
+  const h = observerHarness()
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+
+  const jev = h.observer.stats().jev
+  assert.strictEqual(jev.calls, 1)
+  assert.strictEqual(jev.ok, 1)
+  assert.strictEqual(jev.inputTokens, 2551, 'usage must survive from the client to the report')
+  assert.ok(jev.costUsd > 0)
+  h.cleanup()
+})
+
+test('a reading in flight loses to a process exit that landed first', () => {
+  // The observer refuses to read a session whose process was seen to exit, but
+  // that check runs when the request is dispatched. An exit recorded while the
+  // answer is in flight has to be caught when it lands, or a permission_request
+  // turns the exit back into a wait — and no PID sweep can undo that, because
+  // leaving a wait needs an explicit resolver the sweeps cannot send.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'interrupted', status: 'interrupted',
+    terminalKind: 'processExit', endedAt: 900, stateEvidence: []
+  }
+  const stats = sync.createStats()
+  sync.applyPaneEvents({ version: 1, sessions: { s1: session } }, [{
+    sessionId: 's1',
+    event: {
+      type: AGENT_EVENTS.PERMISSION_REQUEST,
+      source: 'pane-model', stateSource: 'pane-model',
+      rawEventName: 'pane_awaiting_approval', timestamp: 800
+    }
+  }], stats)
+
+  assert.strictEqual(currentPhase(session), 'interrupted')
+  assert.strictEqual(session.endedAt, 900, 'the exit marker must survive')
+  assert.strictEqual(stats.paneModel.superseded, 1)
+
+  // crashed and stale are PID-only phases and get the same treatment.
+  for (const phase of ['crashed', 'stale']) {
+    const terminal = { sessionId: 's2', agentType: 'claude', phase, status: phase, stateEvidence: [] }
+    sync.applyPaneEvents({ version: 1, sessions: { s2: terminal } }, [{
+      sessionId: 's2',
+      event: { type: AGENT_EVENTS.TURN_COMPLETE, source: 'pane-model', timestamp: 800 }
+    }], sync.createStats())
+    assert.strictEqual(currentPhase(terminal), phase)
+  }
+})
+
+test('the capture cursor advances past the batch it processed', async () => {
+  // Stepping by one reuses all but one pane of the previous batch. With more
+  // panes than the cap, the last one then waits far past the 120s window the
+  // idle sweeps stand down for, which is when a false completion becomes
+  // possible on a session that is simply waiting its turn to be read.
+  const h = observerHarness({ observer: { maxCapturesPerTick: 4 } })
+  const status = { sessions: {} }
+  for (let i = 0; i < 20; i++) {
+    status.sessions[`s${i}`] = {
+      sessionId: `s${i}`, agentType: 'claude', tmuxPane: `%${i}`,
+      phase: 'running', status: 'working', stateEvidence: []
+    }
+  }
+
+  const seen = new Set()
+  for (let tick = 0; tick < 5; tick++) {
+    h.advance(2000)
+    await h.tick(status)
+    for (const state of h.calls) seen.add(state.screen)
+  }
+  // 5 ticks x 4 captures must cover all 20 panes exactly once, not 4 panes
+  // twenty times. One more tick to drain the last batch, since drain() runs
+  // ahead of dispatch() exactly as it does in the watcher loop.
+  await h.tick(status)
+  assert.strictEqual(h.observer.stats().captured, 24)
+  assert.strictEqual(h.observer.observedAt().size, 20, 'every pane must have been read once')
+  h.cleanup()
+})
+
+test('a shell prompt reading does not stand the timeout fallbacks down', async () => {
+  // shell_prompt is accepted but decides nothing — it defers to process
+  // liveness. Refreshing the observation for it would suppress the idle
+  // fallback forever on a session with no usable pid, leaving it BUSY while
+  // the model is saying the agent is gone.
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'shell_prompt', confidence: 0.95 }
+  }] })
+  const status = paneStatus({ phase: 'running', status: 'working' })
+
+  await h.tick(status)
+  assert.deepStrictEqual(await h.tick(status), [], 'a phase-less verdict emits nothing')
+  assert.strictEqual(h.observer.observedAt().size, 0)
+  h.cleanup()
+})
+
+test('the shadow log keeps a disagreement the verdict alone would hide', async () => {
+  // Rows exist to answer "did the model and the hooks agree". When the hooks
+  // move and the verdict does not, the second row IS the disagreement, so
+  // deduplicating on the verdict alone discards the only interesting one.
+  const h = observerHarness({
+    observer: { mode: 'shadow' },
+    answers: [sampleAnswers('working')]
+  })
+  const session = {
+    sessionId: 's1', agentType: 'claude', tmuxPane: '%1',
+    phase: 'running', status: 'working', stateEvidence: []
+  }
+  const status = { sessions: { s1: session } }
+
+  await h.tick(status)
+  await h.tick(status)
+  assert.strictEqual(h.shadowRows().length, 1)
+
+  // A hook completes the turn; the screen still reads as working.
+  session.phase = 'completed'
+  session.status = 'completed'
+  h.advance(5000)
+  await h.tick(status)
+
+  const rows = h.shadowRows()
+  assert.strictEqual(rows.length, 2)
+  assert.deepStrictEqual(rows.map(row => row.hookPhase), ['running', 'completed'])
+  assert.deepStrictEqual(rows.map(row => row.verdict), ['working', 'working'])
+  h.cleanup()
+})
+
+test('doctor and the watcher agree on whether the pane model is running', () => {
+  // A doctor that read only @scout-pane-model reported every prerequisite as
+  // fine for a `jev` install — no SDK, no key, and by then no hooks either.
+  const { effectivePaneMode } = require('../scripts/lib/state-source')
+  const { paneModelSettings } = require('../scripts/watcher')
+  const reader = options => name => options[name] || ''
+
+  for (const options of [
+    {},
+    { '@scout-state-source': 'jev' },
+    { '@scout-pane-model': 'shadow' },
+    { '@scout-pane-model': 'on' },
+    { '@scout-state-source': 'hook', '@scout-pane-model': 'on' },
+    { '@scout-state-source': 'hook', '@scout-pane-model': 'shadow' },
+    { '@scout-state-source': 'jev', '@scout-pane-model': 'off' }
+  ]) {
+    assert.strictEqual(
+      effectivePaneMode(reader(options)),
+      paneModelSettings(reader(options)).mode,
+      JSON.stringify(options)
+    )
+  }
+  // `on` is no longer accepted there: it let the model write phase with the
+  // hooks still installed, a side door around the either/or switch.
+  assert.strictEqual(effectivePaneMode(reader({ '@scout-pane-model': 'on' })), 'off')
+  // jev wins over an explicit off: the state source is the stronger statement.
+  assert.strictEqual(effectivePaneMode(reader({ '@scout-state-source': 'jev', '@scout-pane-model': 'off' })), 'on')
+})
+
+test('an observer rebuilt after a settings change keeps its cache and its bill', async () => {
+  // The watcher is not restarted by a tmux config reload, so it rebuilds the
+  // observer itself. Rebuilding without the handoff would re-buy every screen
+  // on the wall and reset the spend report on every config edit.
+  const h = observerHarness()
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1)
+
+  const carry = h.observer.handoff()
+  assert.ok(carry.cache && carry.metrics)
+  const before = h.observer.stats().jev
+
+  const rebuilt = observerHarness({ store: h.storeDir, observer: carry })
+  await rebuilt.tick(paneStatus())
+  assert.strictEqual(rebuilt.calls.length, 0, 'an unchanged screen must not be re-bought')
+  assert.strictEqual(rebuilt.observer.stats().jev.inputTokens, before.inputTokens)
+  h.cleanup()
+})
+
+test('a queued pane wait never outruns a process exit found in the same tick', () => {
+  // The agent exits after the screen was captured, so the exit is not recorded
+  // yet when the reading is queued — the supersession guard has nothing to
+  // catch. Ordering is what fixes it: once the record is in a WAIT, no PID
+  // sweep can move it, because leaving a wait needs an explicit resolver no
+  // sweep can send, and the dead session asks for attention forever.
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, 'status.json')
+    const now = Date.now()
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      sessions: {
+        dying: {
+          sessionId: 'dying',
+          agentType: 'claude',
+          phase: 'running',
+          status: 'working',
+          tmuxPane: '%1',
+          pid: 999999,
+          lastUpdated: now,
+          stateEvidence: []
+        }
+      }
+    }))
+
+    const result = sync.run(statusFile, {
+      codexMode: 'none',
+      claudeTranscript: false,
+      // The pid is long gone, so reconcileSessions records the exit this tick.
+      paneEvents: [{
+        sessionId: 'dying',
+        event: {
+          type: AGENT_EVENTS.PERMISSION_REQUEST,
+          source: 'pane-model',
+          stateSource: 'pane-model',
+          rawEventName: 'pane_awaiting_approval',
+          timestamp: now - 2000
+        }
+      }]
+    })
+
+    const session = result.status.sessions.dying
+    assert.notStrictEqual(currentPhase(session), 'waitingForApproval',
+      'a dead session must not be left asking for attention')
+    assert.strictEqual(result.stats.paneModel.superseded, 1)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a slow response never overwrites a newer reading of the same pane', async () => {
+  // Readings arrive in the order they were produced, not the order they were
+  // captured: a cache hit is recorded during dispatch while a request from an
+  // earlier tick lands whenever it lands. Applying the older one sends the
+  // session back to a wait it already left, and walks observedAt backwards.
+  const IDLE = 'the composer is empty\nnothing is running\nready for input'
+  const DIALOG = 'a dialog is open\nallow this command?\n1. Yes'
+  const held = []
+  const client = {
+    available: true,
+    reason: null,
+    classify(state) {
+      const dialog = state.screen.includes('dialog')
+      const answers = dialog
+        ? {
+          screen_state: { type: 'choice', choice: 'awaiting_approval', confidence: 0.95 },
+          blocked_on_user: { type: 'noul', noul: 0.95 }
+        }
+        : {
+          screen_state: { type: 'choice', choice: 'idle_ready', confidence: 0.95 },
+          blocked_on_user: { type: 'noul', noul: 0.02 }
+        }
+      const result = { ok: true, answers, usage: { input_tokens: 2551 }, model: 'jev-1.13.0', latencyMs: dialog ? 6000 : 40 }
+      // The dialog request is the slow one, resolved by hand below so a newer
+      // reading of the same pane can be queued ahead of it.
+      return dialog ? new Promise(resolve => held.push(() => resolve(result))) : Promise.resolve(result)
+    }
+  }
+
+  const h = observerHarness({ observer: { client } })
+  const status = {
+    sessions: {
+      s1: {
+        sessionId: 's1', agentType: 'claude', tmuxPane: '%1',
+        phase: 'running', status: 'working', stateEvidence: []
+      }
+    }
+  }
+
+  h.screens.set('%1', IDLE)
+  await h.tick(status)                       // answers IDLE, caches it
+  h.advance(6000)
+  await h.tick(status)                       // drains it, queues a cache hit
+
+  h.screens.set('%1', DIALOG)
+  h.advance(6000)
+  await h.tick(status)                       // starts the slow dialog request
+
+  h.screens.set('%1', IDLE)
+  h.advance(6000)
+  await h.tick(status)                       // queues a fresh IDLE cache hit
+  const newestAt = h.observer.observedAt().get('s1')
+
+  held.pop()()                               // the stale dialog answer lands now
+  await new Promise(resolve => setImmediate(resolve))
+
+  const events = await h.tick(status)
+  assert.ok(
+    !events.some(entry => entry.event.type === AGENT_EVENTS.PERMISSION_REQUEST),
+    'a reading older than one already processed describes a screen that is gone'
+  )
+  assert.strictEqual(h.observer.stats().stale, 1)
+  assert.ok(h.observer.observedAt().get('s1') >= newestAt, 'observedAt must never walk backwards')
+  h.cleanup()
+})
+
+test('per-call logging follows the option across a rebuild', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scout-metrics-'))
+  try {
+    const file = path.join(dir, 'pane-metrics.jsonl')
+    const metrics = createPaneMetrics({ file })
+    metrics.recordCall({ ok: true, latencyMs: 10, usage: { input_tokens: 5 } }, {})
+    assert.strictEqual(readMetrics({ file }).length, 0)
+
+    // The watcher reconfigures a running observer rather than restarting it, so
+    // this object outlives the settings it was built with. A switch left in the
+    // original closure would never take effect in either direction.
+    metrics.configure({ logCalls: true })
+    metrics.recordCall({ ok: true, latencyMs: 11, usage: { input_tokens: 5 } }, { agentType: 'claude' })
+    assert.strictEqual(readMetrics({ file }).length, 1)
+    assert.strictEqual(metrics.snapshot().calls, 2, 'the totals survive the reconfigure')
+
+    metrics.configure({ logCalls: false })
+    metrics.recordCall({ ok: true, latencyMs: 12, usage: { input_tokens: 5 } }, {})
+    assert.strictEqual(readMetrics({ file }).length, 1, 'disabling must stop the writes')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a rebuilt observer applies the new logging option to inherited metrics', async () => {
+  const h = observerHarness()
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+
+  const carry = h.observer.handoff()
+  const rebuilt = observerHarness({
+    store: h.storeDir,
+    observer: Object.assign({ logCalls: true }, carry)
+  })
+  rebuilt.screens.set('%1', 'a different screen\nline two\nline three')
+  rebuilt.advance(10_000)
+  await rebuilt.tick(paneStatus())
+  await rebuilt.tick(paneStatus())
+
+  assert.strictEqual(rebuilt.calls.length, 1, 'the changed screen costs one call')
+  assert.strictEqual(rebuilt.metricRows().length, 1, 'and logging turned on without a restart')
+  assert.ok(rebuilt.observer.stats().jev.calls >= 2, 'the earlier calls are still counted')
+  h.cleanup()
+})
+
+test('the pane tail skips the empty rows below a short CLI', () => {
+  // capture-pane returns every row of the pane. A tall pane with a few lines of
+  // output at the top is mostly blank rows beneath them; slicing the tail first
+  // kept only those, and the classifier skipped the empty screen forever.
+  const { lastLines } = require('../scripts/lib/pane-capture')
+  const raw = ['❯ fix the tests', '', '  Working on it', ...Array(67).fill('')].join('\n')
+  assert.strictEqual(lastLines(raw, 40), '❯ fix the tests\n\n  Working on it')
+  assert.strictEqual(normalizePaneText(lastLines(raw, 40)).split('\n').length, 2)
+  // Content taller than the limit is still cut from the top, as before.
+  const tall = Array.from({ length: 50 }, (_, i) => `line ${i}`).concat(['', ''])
+  assert.strictEqual(lastLines(tall.join('\n'), 3), 'line 47\nline 48\nline 49')
+})
+
+test('the jev client turns SDK retries off so the observer owns the budget', () => {
+  // SDK 0.6 retries 408/429/5xx and timeouts twice by default. That is up to
+  // three HTTP requests behind one budgeted call, and a 429 that only reaches
+  // the observer's account-wide cooldown after the SDK finishes retrying.
+  let config = null
+  const sdk = { TypeSafeClient: function (options) { config = options; this.systemOne = async () => ({}) } }
+  const { createJevClient } = require('../scripts/lib/jev-client')
+  assert.ok(createJevClient({ apiKey: 'test', sdk }).available)
+  assert.deepStrictEqual(config.retry, { maxRetries: 0 })
+})
+
+function fakePaneObserver(available, label) {
+  const observer = {
+    label,
+    closed: false,
+    seeded: 0,
+    stats: () => ({ available }),
+    handoff: () => ({ cache: `cache-of-${label}`, metrics: `metrics-of-${label}` }),
+    close() { observer.closed = true },
+    seed() { observer.seeded++ }
+  }
+  return observer
+}
+
+test('the settings poll rebuilds on a change and hands the cache over', () => {
+  const { refreshPaneObserver } = require('../scripts/watcher')
+  const old = fakePaneObserver(true, 'old')
+  const starts = []
+  const deps = {
+    log: () => {},
+    probe: () => { throw new Error('a ready client must never be probed') },
+    start: (settings, carry) => { starts.push({ settings, carry }); return fakePaneObserver(true, 'new') }
+  }
+  const current = { settings: { mode: 'shadow' }, signature: JSON.stringify({ mode: 'shadow' }), observer: old }
+
+  // Unchanged and healthy: the same object back, nothing rebuilt.
+  assert.strictEqual(refreshPaneObserver(current, { mode: 'shadow' }, deps), current)
+  assert.strictEqual(starts.length, 0)
+
+  const next = refreshPaneObserver(current, { mode: 'on' }, deps)
+  assert.strictEqual(old.closed, true)
+  assert.strictEqual(next.observer.label, 'new')
+  assert.strictEqual(starts[0].carry.cache, 'cache-of-old', 'a config edit must not re-buy every screen')
+  assert.strictEqual(next.observer.seeded, 0, 'a handed-over cache needs no reseed from disk')
+
+  // Switching off closes the observer — this is the change that stops billing.
+  const off = refreshPaneObserver(next, { mode: 'off' }, Object.assign({}, deps, { start: () => null }))
+  assert.strictEqual(off.observer, null)
+  assert.strictEqual(next.observer.closed, true)
+})
+
+test('the settings poll recovers once a missing key or SDK is supplied', () => {
+  // Enable-then-configure is the documented order, and supplying the key does
+  // not change the settings signature, so without this the client built at
+  // enable time stayed unavailable until someone restarted the watcher.
+  const { refreshPaneObserver } = require('../scripts/watcher')
+  const waiting = fakePaneObserver(false, 'waiting')
+  let ready = false
+  const logs = []
+  const starts = []
+  const deps = {
+    log: line => logs.push(line),
+    probe: () => (ready ? { available: true, model: 'jev-latest' } : { available: false, reason: 'no-key' }),
+    start: (settings, carry) => { starts.push(carry); return fakePaneObserver(true, 'ready') }
+  }
+  const current = { settings: { mode: 'on' }, signature: JSON.stringify({ mode: 'on' }), observer: waiting }
+
+  // Still no key: nothing rebuilt and nothing logged, however many polls.
+  for (let i = 0; i < 3; i++) assert.strictEqual(refreshPaneObserver(current, { mode: 'on' }, deps), current)
+  assert.deepStrictEqual(logs, [])
+
+  ready = true
+  const next = refreshPaneObserver(current, { mode: 'on' }, deps)
+  assert.strictEqual(waiting.closed, true)
+  assert.strictEqual(next.observer.label, 'ready')
+  assert.strictEqual(starts[0].client.available, true, 'the probed client is reused, not built twice')
+  assert.strictEqual(starts[0].cache, 'cache-of-waiting')
+  assert.strictEqual(logs.length, 1)
+})
+
+test('a timeout sweep touching an old record does not hand it the pane', async () => {
+  // Several live records routinely share a pane. The fallback sweeps write
+  // lastUpdated too, so ranking by it gave the screen to whichever record a
+  // sweep had just completed — reopening the obsolete one with readings that
+  // belong to the live session.
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'awaiting_approval', confidence: 0.95 },
+    blocked_on_user: { type: 'noul', noul: 0.95 }
+  }] })
+  const base = { agentType: 'claude', tmuxPane: '%1', stateEvidence: [] }
+  const status = {
+    sessions: {
+      live: Object.assign({}, base, { sessionId: 'live', phase: 'running', status: 'working', startedAt: 5000, lastUpdated: 6000 }),
+      old: Object.assign({}, base, {
+        sessionId: 'old', phase: 'completed', status: 'completed', startedAt: 1000,
+        // The idle sweep just completed it: the newest write on the pane.
+        lastUpdated: 9_000_000, lastEvent: { type: 'turn_complete', timestamp: 9_000_000 }
+      })
+    }
+  }
+
+  await h.tick(status)
+  const events = await h.tick(status)
+  assert.deepStrictEqual([...new Set(events.map(entry => entry.sessionId))], ['live'])
+  h.cleanup()
+})
+
+test('the prompt extractor finds the composer above blank pane rows', () => {
+  // A short CLI in a tall pane leaves blank rows below the composer. Counted
+  // from the last row, the composer fell outside the bottom window, and the
+  // unsent draft in it was read back as the submitted prompt and title.
+  const raw = [
+    '❯ the prompt that was actually sent',
+    '',
+    '  Done.',
+    '─'.repeat(40),
+    '❯ a draft the user has not sent',
+    '─'.repeat(40),
+    ...Array(30).fill('')
+  ].join('\n')
+  const extracted = extractPromptAndTitle(raw, 'claude')
+  assert.strictEqual(extracted.lastUserPrompt, 'the prompt that was actually sent')
+})
+
+test('observation times survive a settings rebuild and a watcher restart', async () => {
+  // Starting empty re-opens the window the map exists to close: the first tick
+  // after a rebuild runs the idle sweeps before anything has been read, and a
+  // session frozen on a long command is completed.
+  const h = observerHarness()
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+  const seenAt = h.observer.observedAt().get('s1')
+  assert.ok(Number.isFinite(seenAt))
+
+  // Rebuild: handed over in memory.
+  const rebuilt = observerHarness({ store: h.storeDir, observer: h.observer.handoff() })
+  assert.strictEqual(rebuilt.observer.observedAt().get('s1'), seenAt)
+
+  // Restart: written out, then read back by a fresh process.
+  h.observer.close()
+  const restarted = observerHarness({ store: h.storeDir })
+  restarted.observer.seed()
+  assert.strictEqual(restarted.observer.observedAt().get('s1'), seenAt)
+  h.cleanup()
+})
+
+test('switching from shadow to on keeps what shadow already read', async () => {
+  // Shadow reads every screen too. Starting the `on` observer empty ran the
+  // first tick's idle sweeps against nothing, completing a session frozen on a
+  // long command that shadow had been watching all along.
+  const h = observerHarness({ observer: { mode: 'shadow' } })
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+  assert.strictEqual(h.observer.observedAt().size, 0, 'shadow still stands nothing down')
+
+  const on = observerHarness({ store: h.storeDir, observer: Object.assign({ mode: 'on' }, h.observer.handoff()) })
+  assert.ok(Number.isFinite(on.observer.observedAt().get('s1')))
+  h.cleanup()
+})
+
+test('the key-file check matches the rule the watcher reads it by', () => {
+  const { keyFileState } = require('../scripts/lib/jev-client')
+  // Only the vocabulary is asserted here: the real file is the user's, and a
+  // test must not create, chmod or remove it.
+  assert.ok(['ok', 'bad-mode', 'missing'].includes(keyFileState()))
+  const doctor = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'doctor.js'), 'utf-8')
+  assert.ok(!/existsSync\(KEY_FILE\)/.test(doctor), 'doctor must not treat a file that exists as a file that works')
+})
+
+// A process snapshot in the shape readProcessTable() returns.
+function processTableOf(procs) {
+  const byPid = new Map()
+  const childrenByPpid = new Map()
+  for (const proc of procs) {
+    const full = Object.assign({ args: proc.command, commandLine: proc.command, basename: path.basename(proc.command), startedAtMs: Date.now() - 300000 }, proc)
+    byPid.set(full.pid, full)
+    if (!childrenByPpid.has(full.ppid)) childrenByPpid.set(full.ppid, [])
+    childrenByPpid.get(full.ppid).push(full)
+  }
+  return { byPid, childrenByPpid }
+}
+
+function discoveryFixture(windowName, agentPid = 556051) {
+  const now = Date.now()
+  const panePid = 556050
+  const panes = new Map([['%88', {
+    paneId: '%88', panePid, currentCommand: 'zsh', paneDead: false,
+    sessionName: 'work', windowIndex: 1, windowName, currentPath: '/tmp/demo'
+  }]])
+  panes.tmuxAvailable = true
+  const shell = { pid: panePid, ppid: 1, command: '/bin/zsh', args: '-zsh', commandLine: '-zsh', basename: 'zsh', startedAtMs: now - 600000 }
+  const claude = { pid: agentPid, ppid: panePid, command: '/opt/homebrew/bin/claude', args: 'claude', commandLine: 'claude', basename: 'claude', startedAtMs: now - 300000 }
+  const table = {
+    byPid: new Map([[shell.pid, shell], [claude.pid, claude]]),
+    childrenByPpid: new Map([[1, [shell]], [panePid, [claude]]])
+  }
+  return { now, panes, table }
+}
+
+test('a pane metadata change does not reset a session the model has moved', () => {
+  // In jev mode discovery records are the only records. A window rename —
+  // copy-mode alone renames it to "[tmux]" — re-sent DISCOVERED, which the
+  // contract maps to idle, and handed stateSource back to pane-discovery,
+  // which the picker hides as a placeholder.
+  const opts = { writeSession: false, writeStatus: false }
+  const first = discoveryFixture('agent')
+  const status = { version: 1, lastUpdated: first.now, sessions: {} }
+  sync.discoverPaneSessions(status, first.panes, first.table, sync.createStats(), Object.assign({ now: first.now }, opts))
+  const id = sync.discoverySessionId('claude', '%88')
+  const session = status.sessions[id]
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, source: 'pane-model', stateSource: 'pane-model', timestamp: first.now + 1
+  })
+  assert.strictEqual(currentPhase(session), 'running')
+
+  const renamed = discoveryFixture('[tmux]')
+  sync.discoverPaneSessions(status, renamed.panes, first.table, sync.createStats(), Object.assign({ now: first.now + 2000 }, opts))
+
+  const after = status.sessions[id]
+  assert.strictEqual(after.tmuxWindowName, '[tmux]', 'the metadata still lands')
+  assert.strictEqual(currentPhase(after), 'running')
+  assert.strictEqual(after.stateSource, 'pane-model')
+  assert.notStrictEqual(isVisibleInPicker(after), 'hidden')
+})
+
+test('a wait ends when the agent it belonged to is gone', () => {
+  // The user answers an approval dialog with Ctrl-C twice and lands at a shell.
+  // shell_prompt decides no phase — PID liveness does — but PID liveness sends
+  // process_exit, and the WAIT guard refuses that without a resolver. Without
+  // the resolver from the screen, the dead session asks for approval forever.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'waitingForApproval', status: 'working',
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval' }, pid: 424242, stateEvidence: []
+  }
+  const events = paneEvents(confidently('shell_prompt'), session, leaving('shell_prompt'))
+  assert.deepStrictEqual(events.map(event => event.type), [AGENT_EVENTS.PERMISSION_RESOLVED])
+  for (const event of events) applySessionEvent(session, event)
+
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.PROCESS_EXIT_DETECTED, source: 'pid', force: true, timestamp: Date.now()
+  })
+  assert.notStrictEqual(currentPhase(session), 'waitingForApproval')
+
+  // Outside a wait a shell prompt still sends nothing.
+  const running = { sessionId: 's2', agentType: 'claude', phase: 'running', status: 'working' }
+  assert.deepStrictEqual(paneEvents(confidently('shell_prompt'), running, leaving('shell_prompt')), [])
+})
+
+test('a never-prompted session stays idle when its empty composer is read', () => {
+  // idle_ready maps to completed; applied to a fresh session it showed DONE for
+  // work that never happened. A prompt on screen means there was a turn.
+  const fresh = { sessionId: 's1', agentType: 'claude', phase: 'idle', status: 'idle' }
+  assert.deepStrictEqual(paneEvents(confidently('idle_ready'), fresh), [])
+
+  const withPrompt = paneEvents(confidently('idle_ready'), fresh, {
+    options: { extracted: { lastUserPrompt: 'fix the tests' } }
+  })
+  assert.deepStrictEqual(withPrompt.map(event => event.type), [AGENT_EVENTS.TURN_COMPLETE])
+})
+
+test('a resolver meets the phase it lands on, not the one it was built for', () => {
+  // Two readings of one session can land in the same batch, both built while
+  // it was waiting. The first leaves the wait; the second's question_answered
+  // would then reopen a completed turn and drop its turn ids.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'completed', status: 'completed',
+    lastTurnId: 'turn-7', stateEvidence: []
+  }
+  const stats = sync.createStats()
+  sync.applyPaneEvents({ version: 1, sessions: { s1: session } }, [{
+    sessionId: 's1',
+    event: { type: AGENT_EVENTS.QUESTION_ANSWERED, source: 'pane-model', stateSource: 'pane-model', timestamp: Date.now() }
+  }], stats)
+  assert.strictEqual(currentPhase(session), 'completed')
+  assert.strictEqual(session.lastTurnId, 'turn-7')
+  assert.strictEqual(stats.paneModel.superseded, 1)
+})
+
+test('a reading captured before the process started is about another process', () => {
+  // Discovery ids are per pane, so an agent restarted in the same pane keeps
+  // the record, with the new process's start time.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'idle', status: 'idle', startedAt: 5000, stateEvidence: []
+  }
+  const stats = sync.createStats()
+  sync.applyPaneEvents({ version: 1, sessions: { s1: session } }, [{
+    sessionId: 's1',
+    event: { type: AGENT_EVENTS.PERMISSION_REQUEST, source: 'pane-model', stateSource: 'pane-model', timestamp: 4000 }
+  }], stats)
+  assert.strictEqual(currentPhase(session), 'idle')
+  assert.strictEqual(stats.paneModel.superseded, 1)
+})
+
+test('one rejected reading cannot be bridged into a wait exit', async () => {
+  // The streak used to count verdicts, not readings that passed: a working
+  // reading rejected at 0.1 followed by one at 0.99 was a "streak of two".
+  const h = observerHarness({ answers: [
+    { screen_state: { type: 'choice', choice: 'working', confidence: 0.1 } },
+    { screen_state: { type: 'choice', choice: 'working', confidence: 0.99 } }
+  ] })
+  const status = paneStatus({
+    phase: 'waitingForApproval', status: 'waiting',
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval', startedAt: 0 }
+  })
+  const screens = ['first screen\nline two\nline three', 'second screen\nline two\nline three']
+  let emitted = []
+  for (let i = 0; i < 3; i++) {
+    h.screens.set('%1', screens[Math.min(i, 1)])
+    h.advance(7000)
+    emitted = emitted.concat(await h.tick(status))
+  }
+  assert.strictEqual(h.calls.length, 2)
+  assert.deepStrictEqual(emitted, [], 'one trusted reading is not two')
+  h.cleanup()
+})
+
+test('a frozen screen below the strict bar leaves a wait on duration alone', async () => {
+  // Approved, then a long command with nothing on screen but a spinner, read at
+  // 0.7 — accepted, below the 0.75 exit bar. With strict evidence the only way
+  // out, the session stayed in WAIT for the whole command it was approved to run.
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'working', confidence: 0.7 },
+    blocked_on_user: { type: 'noul', noul: 0.02 }
+  }] })
+  const status = paneStatus({
+    phase: 'waitingForApproval', status: 'waiting',
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval', startedAt: 0 }
+  })
+
+  let emitted = []
+  for (let i = 0; i < 8; i++) {
+    h.advance(2000)
+    emitted = emitted.concat(await h.tick(status))
+  }
+  assert.strictEqual(h.calls.length, 1, 'all of it from one paid answer')
+  assert.deepStrictEqual([...new Set(emitted.map(entry => entry.event.type))], [AGENT_EVENTS.PERMISSION_RESOLVED])
+  h.cleanup()
+})
+
+test('a long free stretch does not delay reading the dialog that ends it', async () => {
+  // Backoff used to count cache hits. A frozen working screen — which costs
+  // nothing — ratcheted the interval to 30s, so the approval dialog that
+  // replaced it waited up to 30s to be read at all.
+  const h = observerHarness({ answers: [sampleAnswers('working')] })
+  const status = paneStatus({ phase: 'running', status: 'working' })
+  // 18s of cache hits: long enough to have ratcheted the old backoff to its
+  // 30s ceiling, short enough that the ceiling is still in force when the
+  // dialog appears.
+  for (let i = 0; i < 9; i++) {
+    h.advance(2000)
+    await h.tick(status)
+  }
+  assert.strictEqual(h.calls.length, 1)
+
+  h.screens.set('%1', 'a dialog appeared\nallow this?\n1. Yes')
+  h.advance(2000)
+  await h.tick(status)
+  assert.strictEqual(h.calls.length, 2, 'the changed screen is read on the next tick')
+  h.cleanup()
+})
+
+test('a rebuild inherits the rate-limit cooldown it was still inside', async () => {
+  const h = observerHarness({ answers: [new Error('rate-limited')] })
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1)
+
+  const rebuilt = observerHarness({ store: h.storeDir, observer: h.observer.handoff() })
+  rebuilt.advance(2000)
+  await rebuilt.tick(paneStatus())
+  assert.strictEqual(rebuilt.calls.length, 0, 'the new observer must not fire straight back into the 429')
+  h.cleanup()
+})
+
+test('switching from on to shadow stops standing the sweeps down', async () => {
+  const h = observerHarness()
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+  assert.strictEqual(h.observer.observedAt().size, 1)
+
+  const shadow = observerHarness({
+    store: h.storeDir,
+    observer: Object.assign({ mode: 'shadow' }, h.observer.handoff())
+  })
+  assert.strictEqual(shadow.observer.observedAt().size, 0, 'shadow changes no behaviour, inherited or not')
+  h.cleanup()
+})
+
+test('an answer from another model behind the alias is never served', async () => {
+  const calls = []
+  const models = ['jev-1.13.0', 'jev-1.14.0']
+  const client = {
+    available: true,
+    reason: null,
+    async classify(state) {
+      calls.push(state)
+      return { ok: true, answers: sampleAnswers('working'), usage: { input_tokens: 10 }, model: models[Math.min(calls.length - 1, 1)] }
+    }
+  }
+  const h = observerHarness({ observer: { client } })
+  const status = paneStatus()
+  await h.tick(status)
+  await h.tick(status)
+
+  h.screens.set('%1', 'another screen\nline two\nline three')
+  h.advance(7000)
+  await h.tick(status)
+  await h.tick(status)
+  h.screens.delete('%1')
+  h.advance(7000)
+  await h.tick(status)
+  assert.strictEqual(calls.length, 3, 'the old model\'s answer is not served again')
+  h.cleanup()
+})
+
+test('answers seeded from disk are checked against the model answering now', async () => {
+  // The old wipe compared against the model this process had last seen, which
+  // after a restart is nothing — so a previous model's answers loaded from disk
+  // were served indefinitely.
+  const first = observerHarness()
+  await first.tick(paneStatus())
+  await first.tick(paneStatus())
+  first.observer.close()
+
+  const calls = []
+  const client = {
+    available: true,
+    reason: null,
+    async classify(state) {
+      calls.push(state)
+      return { ok: true, answers: sampleAnswers('working'), usage: { input_tokens: 10 }, model: 'jev-2.0.0' }
+    }
+  }
+  const second = observerHarness({ store: first.storeDir, observer: { client } })
+  second.screens.set('%1', 'a screen the old model never saw\nline two\nline three')
+  await second.tick(paneStatus())
+  await second.tick(paneStatus())
+  assert.strictEqual(calls.length, 1)
+
+  second.screens.delete('%1')
+  second.advance(7000)
+  await second.tick(paneStatus())
+  assert.strictEqual(calls.length, 2, 'the seeded answer came from jev-1.13.0 and is a miss now')
+  second.cleanup()
+})
+
+test('a rollout alternating models keeps both models\' answers', async () => {
+  // Wiping on every change threw the whole cache away at each alternation.
+  let answering = 'jev-a'
+  const calls = []
+  const client = {
+    available: true,
+    reason: null,
+    async classify(state) {
+      calls.push(state)
+      return { ok: true, answers: sampleAnswers('working'), usage: { input_tokens: 10 }, model: answering }
+    }
+  }
+  const h = observerHarness({ observer: { client } })
+  const status = paneStatus()
+  // Past the backoff ceiling, so a read that is not made was served from cache.
+  const show = async (text, advance = 40000) => {
+    if (text === null) h.screens.delete('%1')
+    else h.screens.set('%1', text)
+    h.advance(advance)
+    await h.tick(status)
+    await h.tick(status)
+  }
+  await show(null)
+  answering = 'jev-b'
+  await show('screen two\nline two\nline three')
+  answering = 'jev-a'
+  await show('screen three\nline two\nline three')
+  assert.strictEqual(calls.length, 3)
+  await show(null)
+  assert.strictEqual(calls.length, 3, 'jev-a is answering again, so its first answer is still good')
+  h.cleanup()
+})
+
+// --- review round 6 ---
+
+test('an exited hook-era record does not hold its pane against a restarted agent', () => {
+  // After a switch to jev, a hook-era record whose agent exited still counted
+  // as a live real session for the pane, so discovery never created a record
+  // for the agent restarted there — and the observer rightly refuses to read
+  // the exited one. The pane went unwatched for good.
+  const { isRecordedProcessExit } = require('../scripts/lib/session-state')
+  const opts = { writeSession: false, writeStatus: false }
+  const f = discoveryFixture('agent')
+  const exited = {
+    sessionId: 'hook-1', agentType: 'claude', tmuxPane: '%88', phase: 'running', status: 'working',
+    startedAt: f.now - 900000, lastHookEventName: 'UserPromptSubmit', stateEvidence: []
+  }
+  applySessionEvent(exited, { type: AGENT_EVENTS.PROCESS_EXIT_DETECTED, source: 'pid', force: true, timestamp: f.now - 1000 })
+  assert.ok(isRecordedProcessExit(exited))
+
+  const status = { version: 1, lastUpdated: f.now, sessions: { 'hook-1': exited } }
+  sync.discoverPaneSessions(status, f.panes, f.table, sync.createStats(), Object.assign({ now: f.now }, opts))
+  assert.ok(status.sessions[sync.discoverySessionId('claude', '%88')], 'the restarted agent gets a record')
+})
+
+test('an agent restarted in the same pane starts a new record, not the old one revived', () => {
+  // Discovery ids are per pane, so the restart lands on the previous run's
+  // record. Revived in place it kept that run's prompt, title and turn ids.
+  const opts = { writeSession: false, writeStatus: false }
+  const id = sync.discoverySessionId('claude', '%88')
+  const previousRun = (status, now) => {
+    const session = status.sessions[id]
+    Object.assign(session, {
+      lastUserPrompt: 'the previous run\'s prompt', sessionTitle: 'the previous run', lastTurnId: 'turn-old'
+    })
+    applySessionEvent(session, {
+      type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, source: 'pane-model', stateSource: 'pane-model', timestamp: now + 1
+    })
+    return session
+  }
+
+  // Recorded as exited: a new session, whatever the pid.
+  const first = discoveryFixture('agent')
+  const exitedStatus = { version: 1, lastUpdated: first.now, sessions: {} }
+  sync.discoverPaneSessions(exitedStatus, first.panes, first.table, sync.createStats(), Object.assign({ now: first.now }, opts))
+  const exited = previousRun(exitedStatus, first.now)
+  applySessionEvent(exited, { type: AGENT_EVENTS.PROCESS_EXIT_DETECTED, source: 'pid', force: true, timestamp: first.now + 2 })
+  // Even with its old pid since reused by something alive.
+  exited.pid = process.pid
+  const restarted = discoveryFixture('agent', 556052)
+  sync.discoverPaneSessions(exitedStatus, restarted.panes, restarted.table, sync.createStats(), Object.assign({ now: first.now + 5000 }, opts))
+  const fresh = exitedStatus.sessions[id]
+  assert.strictEqual(fresh.lastUserPrompt, undefined)
+  assert.strictEqual(fresh.lastTurnId, undefined)
+  assert.strictEqual(fresh.sessionTitle, 'claude session')
+  assert.strictEqual(fresh.pid, 556052)
+
+  // Not recorded yet, but the old pid is gone and a new one is in the pane.
+  const second = discoveryFixture('agent')
+  const deadStatus = { version: 1, lastUpdated: second.now, sessions: {} }
+  sync.discoverPaneSessions(deadStatus, second.panes, second.table, sync.createStats(), Object.assign({ now: second.now }, opts))
+  previousRun(deadStatus, second.now).pid = 4194305
+  sync.discoverPaneSessions(deadStatus, restarted.panes, restarted.table, sync.createStats(), Object.assign({ now: second.now + 5000 }, opts))
+  assert.strictEqual(deadStatus.sessions[id].lastUserPrompt, undefined)
+
+  // A pid change along one process chain is the process-tree walk settling on
+  // a different process of the same run, not a restart.
+  const third = discoveryFixture('agent')
+  const liveStatus = { version: 1, lastUpdated: third.now, sessions: {} }
+  sync.discoverPaneSessions(liveStatus, third.panes, third.table, sync.createStats(), Object.assign({ now: third.now }, opts))
+  previousRun(liveStatus, third.now).pid = 556050
+  sync.discoverPaneSessions(liveStatus, restarted.panes, restarted.table, sync.createStats(), Object.assign({ now: third.now + 5000 }, opts))
+  assert.strictEqual(liveStatus.sessions[id].lastUserPrompt, 'the previous run\'s prompt')
+
+  // An old process that lives outside the chain — suspended with Ctrl-Z while
+  // a new agent was started in the pane — is a different run.
+  const fourth = discoveryFixture('agent')
+  const suspendedStatus = { version: 1, lastUpdated: fourth.now, sessions: {} }
+  sync.discoverPaneSessions(suspendedStatus, fourth.panes, fourth.table, sync.createStats(), Object.assign({ now: fourth.now }, opts))
+  previousRun(suspendedStatus, fourth.now)
+  const withSuspended = processTableOf([
+    { pid: 556050, ppid: 1, command: '/bin/zsh' },
+    { pid: 556052, ppid: 556050, command: '/opt/homebrew/bin/claude' },
+    { pid: 556051, ppid: 1, command: '/opt/homebrew/bin/claude' }
+  ])
+  sync.discoverPaneSessions(suspendedStatus, restarted.panes, withSuspended, sync.createStats(), Object.assign({ now: fourth.now + 5000 }, opts))
+  assert.strictEqual(suspendedStatus.sessions[id].pid, 556052)
+  assert.strictEqual(suspendedStatus.sessions[id].lastUserPrompt, undefined)
+})
+
+test('a reading the reducer refuses does not clear an ended flag', () => {
+  // applySessionUpdate reports `changed` for a refused event too — the refusal
+  // is written as evidence — so the correction keyed on `changed` ran for
+  // readings the guards had turned away.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'waitingForApproval', status: 'working', endedAt: 500,
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval' }, stateEvidence: []
+  }
+  sync.applyPaneEvents({ version: 1, sessions: { s1: session } }, [{ sessionId: 's1', event: {
+    type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, source: 'pane-model', stateSource: 'pane-model', timestamp: 1000
+  } }], sync.createStats())
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.strictEqual(session.endedAt, 500)
+})
+
+test('a refreshed wait with unchanged details keeps the wait clock running', () => {
+  // Re-sending the same details made sameWaitRefresh() false, so a title that
+  // became readable on an unchanged dialog restarted how long the user had
+  // been waiting.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'waitingForApproval', status: 'working',
+    pendingInteraction: { type: 'approval', phase: 'waitingForApproval', details: 'Bash: rm -rf build', startedAt: 500 },
+    stateEvidence: []
+  }
+  const extracted = { pendingDetails: 'Bash: rm -rf build', lastUserPrompt: 'clean the build', sessionTitle: 'clean the build' }
+  const events = paneEvents(confidently('awaiting_approval'), session, { options: { extracted, now: 9000 } })
+  for (const event of events) {
+    assert.strictEqual(event.pendingToolUse, undefined)
+    applySessionEvent(session, event)
+  }
+  assert.strictEqual(session.pendingInteraction.startedAt, 500)
+
+  const changed = paneEvents(confidently('awaiting_approval'), session,
+    { options: { extracted: Object.assign({}, extracted, { pendingDetails: 'Bash: rm -rf dist' }), now: 9500 } })
+  assert.strictEqual(changed[0].pendingToolUse.details, 'Bash: rm -rf dist', 'a new dialog is still announced')
+})
+
+test('a multi-line draft in the Claude composer is not read as the submitted prompt', () => {
+  // A four-line draft pushed the composer's marker out of the six-line window
+  // the fallback searches, and the draft's first line became the prompt.
+  const draft = [
+    '❯ the prompt that was actually sent',
+    '',
+    '  Done.',
+    '─'.repeat(40),
+    '❯ first line of a draft',
+    '  second line',
+    '  third line',
+    '  fourth line',
+    '  fifth line',
+    '─'.repeat(40),
+    '  󰉋 repos/example  Opus 5',
+    '  -- INSERT --'
+  ].join('\n')
+  assert.strictEqual(extractPromptAndTitle(draft, 'claude').lastUserPrompt, 'the prompt that was actually sent')
+})
+
+test('the wait-exit bar stays above the accept bar however high that is set', () => {
+  // A fixed offset capped at 0.9 stopped being any higher at all once the
+  // accept bar was 0.9, and leaving a wait became as easy as entering one.
+  const { paneModelSettings } = require('../scripts/watcher')
+  for (const accept of ['0.6', '0.9', '0.95']) {
+    const read = name => ({ '@scout-state-source': 'jev', '@scout-pane-model-confidence': accept })[name] || ''
+    const { thresholds } = paneModelSettings(read)
+    assert.ok(thresholds.waitExit > thresholds.accept, `accept ${accept}`)
+    assert.ok(thresholds.waitExit < 1, `accept ${accept}`)
+  }
+})
+
+test('a changed bottom of screen is read at the base interval despite a backoff', async () => {
+  // Streaming output reaching the same verdict backs a session off. A dialog
+  // replacing the composer is a different screen, and was held up to 30s.
+  let n = 0
+  let bottom = 'composer'
+  const capture = paneId => {
+    const text = `body ${n++}\nline two\nline three\n${bottom}`
+    return { paneId, raw: text, text, fingerprint: `fp:${text}`, bottom }
+  }
+  const h = observerHarness({ observer: { capture, intervalMs: 2000 } })
+  for (let i = 0; i < 5; i++) {
+    h.advance(40000)
+    await h.tick(paneStatus())
+  }
+  assert.strictEqual(h.calls.length, 5)
+  h.advance(2500)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 5, 'five identical verdicts back the body off')
+  bottom = 'Do you want to proceed?'
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 6, 'the moved bottom is not')
+  h.cleanup()
+})
+
+test('a cached answer with a different verdict ends the backoff', async () => {
+  // The screen went back to one seen before, so the change was answered from
+  // cache — but it is still a change, and the backoff built on the old verdict
+  // held the next paid read at the ceiling.
+  const answers = [sampleAnswers('idle_ready')].concat(Array(6).fill(sampleAnswers('working')))
+  const h = observerHarness({ answers, observer: { intervalMs: 2000 } })
+  const show = text => h.screens.set('%1', `${text}\nline two\nline three`)
+  show('the idle screen')
+  await h.tick(paneStatus())
+  for (let i = 0; i < 5; i++) {
+    h.advance(40000)
+    show(`streaming ${i}`)
+    await h.tick(paneStatus())
+  }
+  assert.strictEqual(h.calls.length, 6)
+  h.advance(100)
+  show('the idle screen')
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 6, 'served from cache')
+  h.advance(2400)
+  show('a new screen')
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 7)
+  h.cleanup()
+})
+
+test('paid reads go to the session that has waited longest', async () => {
+  // Capture order is the same every tick when the capture cap is not binding,
+  // so with the concurrency cap binding the first pane took the only slot on
+  // every tick and the others were never read.
+  let n = 0
+  const capture = paneId => {
+    const text = `${paneId} screen ${n++}\nline two\nline three`
+    return { paneId, raw: text, text, fingerprint: `fp:${text}` }
+  }
+  const h = observerHarness({ observer: { capture, concurrency: 1, intervalMs: 2000 } })
+  const status = { sessions: {} }
+  for (const i of [1, 2, 3]) {
+    status.sessions[`s${i}`] = {
+      sessionId: `s${i}`, agentType: 'claude', tmuxPane: `%${i}`, phase: 'running', status: 'working',
+      startedAt: 1000 + i, stateEvidence: []
+    }
+  }
+  const served = new Set()
+  for (let i = 0; i < 3; i++) {
+    h.advance(2000)
+    await h.tick(status)
+    served.add(h.calls[h.calls.length - 1].screen.split(' ')[0])
+  }
+  assert.strictEqual(h.calls.length, 3)
+  assert.deepStrictEqual([...served].sort(), ['%1', '%2', '%3'])
+  h.cleanup()
+})
+
+test('a settings rebuild keeps readings not yet drained and the counters', async () => {
+  // Paid for, landed, not yet applied: dropped with the old observer, and the
+  // counters restarted at zero next to inherited spend.
+  const h = observerHarness()
+  await h.tick(paneStatus({ phase: 'idle', status: 'idle' }))
+  assert.strictEqual(h.calls.length, 1)
+
+  const rebuilt = observerHarness({ store: h.storeDir, observer: h.observer.handoff() })
+  const events = rebuilt.observer.drain()
+  assert.ok(events.length > 0, 'the landed reading is applied by the replacement')
+  assert.strictEqual(rebuilt.observer.stats().calls, 1)
+  h.cleanup()
+})
+
+test('a throttled screen is never parsed', async () => {
+  // Prompt and title extraction ran for every captured pane before the throttle
+  // decided nothing would be done with them.
+  let reads = 0
+  let n = 0
+  const capture = paneId => {
+    const text = `screen ${n++}\nline two\nline three`
+    return { paneId, text, fingerprint: `fp:${text}`, get raw() { reads++; return text } }
+  }
+  const h = observerHarness({ observer: { capture, intervalMs: 2000 } })
+  await h.tick(paneStatus())
+  const afterCall = reads
+  h.advance(100)
+  await h.tick(paneStatus())
+  assert.strictEqual(reads, afterCall)
+  h.cleanup()
+})
+
+test('shadow rows repeat at a heartbeat while nothing changes', async () => {
+  // The agreement report weighs each row by the time until the next one. Rows
+  // written only on a change leave a long agreeing stretch looking like one
+  // instant, and a burst of flapping outweighing it.
+  const h = observerHarness({ observer: { mode: 'shadow' } })
+  for (let i = 0; i < 8; i++) {
+    await h.tick(paneStatus())
+    h.advance(10000)
+  }
+  assert.strictEqual(h.shadowRows().length, 2)
+  h.cleanup()
+})
+
+test('pane agreement is reported over time, not over rows', () => {
+  const home = tempDir()
+  try {
+    const now = Date.now()
+    const t0 = now - 600000
+    const row = (at, verdict, modelPhase) => JSON.stringify({
+      at, sessionId: 's1', agentType: 'claude', hookPhase: 'running', verdict, modelPhase, gate: 'accept'
+    })
+    const rows = [row(t0, 'working', 'running')]
+    for (let i = 0; i < 10; i++) rows.push(row(t0 + 60000 + i * 1000, 'idle_ready', 'completed'))
+    rows.push(row(t0 + 70000, 'working', 'running'))
+    fs.mkdirSync(path.join(home, '.tmux-scout'), { recursive: true })
+    fs.writeFileSync(path.join(home, '.tmux-scout', 'pane-agreement.jsonl'), rows.join('\n') + '\n')
+    const out = execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'debug.js'), 'pane-agreement'], {
+      encoding: 'utf-8', env: Object.assign({}, process.env, { HOME: home })
+    })
+    // Two agreeing minutes against ten disagreeing seconds, not 2 rows of 12.
+    assert.ok(/agreement 92% of observed time/.test(out), out)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+function fakeTmuxEnv(home, options) {
+  const bin = path.join(home, 'bin')
+  fs.mkdirSync(bin, { recursive: true })
+  const cases = Object.entries(options).map(([name, value]) => `  *${name}*) echo '${value}' ;;`).join('\n')
+  fs.writeFileSync(path.join(bin, 'tmux'), [
+    '#!/bin/sh',
+    'case "$*" in',
+    '  -V) echo "tmux 3.4" ;;',
+    '  show-option*)',
+    '    case "$*" in',
+    cases,
+    '    esac ;;',
+    '  *) exit 1 ;;',
+    'esac',
+    ''
+  ].join('\n'), { mode: 0o755 })
+  const env = Object.assign({}, process.env, { HOME: home, PATH: `${bin}:${process.env.PATH}` })
+  delete env.TYPESAFE_API_KEY
+  delete env.TMUX
+  return env
+}
+
+test('a missing key fails the doctor only when the screen is the state source', () => {
+  // Shadow changes nothing; a missing prerequisite there is worth a warning,
+  // not a failed health check.
+  const doctor = path.join(__dirname, '..', 'scripts', 'doctor.js')
+  const clientLine = options => {
+    const home = tempDir()
+    try {
+      const result = require('child_process').spawnSync(process.execPath, [doctor], {
+        encoding: 'utf-8', env: fakeTmuxEnv(home, options)
+      })
+      return result.stdout.replace(/\x1b\[[0-9;]*m/g, '').split('\n').find(line => / client - /.test(line)) || ''
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+  assert.ok(clientLine({ '@scout-pane-model': 'shadow' }).includes('[WARN] client'))
+  assert.ok(clientLine({ '@scout-state-source': 'jev' }).includes('[FAIL] client'))
+})
+
+test('a one-off watcher tick honours the observations the running watcher persisted', () => {
+  // `watcher.js once` has no observer, so it ran the idle sweep with no record
+  // of what was being watched and completed a session frozen on a long command.
+  const once = observedAt => {
+    const home = tempDir()
+    try {
+      const scout = path.join(home, '.tmux-scout')
+      fs.mkdirSync(scout, { recursive: true })
+      const now = Date.now()
+      fs.writeFileSync(path.join(scout, 'status.json'), JSON.stringify({ version: 1, lastUpdated: now, sessions: {
+        s1: { sessionId: 's1', agentType: 'claude', phase: 'running', status: 'working',
+          startedAt: now - 600000, lastUpdated: now - 300000, stateEvidence: [] }
+      } }))
+      if (observedAt) fs.writeFileSync(path.join(scout, 'pane-observed.json'), JSON.stringify({ s1: now - observedAt }))
+      execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'watcher.js'), 'once'], {
+        env: fakeTmuxEnv(home, { '@scout-state-source': 'jev' }), stdio: 'ignore'
+      })
+      return JSON.parse(fs.readFileSync(path.join(scout, 'status.json'), 'utf-8')).sessions.s1.phase
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+  assert.strictEqual(once(1000), 'running')
+  assert.strictEqual(once(null), 'completed', 'without an observation the fallback still applies')
+})
+
+test('a cache write that fails leaves no temp file behind', () => {
+  const { writeCache } = require('../scripts/lib/pane-store')
+  const dir = tempDir()
+  try {
+    // A directory where the file should be: the temp write succeeds and the
+    // rename over it fails.
+    const target = path.join(dir, 'pane-cache.json')
+    fs.mkdirSync(target)
+    fs.writeFileSync(path.join(target, 'occupied'), '')
+    assert.strictEqual(writeCache({ k: { at: 1 } }, target), false)
+    assert.deepStrictEqual(fs.readdirSync(dir), ['pane-cache.json'])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// --- review round 7 ---
+
+test('a child session never takes its parent\'s screen', async () => {
+  // Child records share the parent's pane and fire hooks of their own, so the
+  // child is usually the most recently active record there. An approval read
+  // off the parent's screen landed on the hidden child, and the row the user
+  // sees never moved.
+  const h = observerHarness({ answers: [confidently('awaiting_approval')] })
+  const status = { sessions: {
+    parent: { sessionId: 'parent', agentType: 'claude', tmuxPane: '%1', phase: 'running', status: 'working',
+      startedAt: 1000, lastHookAt: 1000, stateEvidence: [] },
+    child: { sessionId: 'child', parentSessionId: 'parent', agentType: 'claude', tmuxPane: '%1', phase: 'running',
+      status: 'working', startedAt: 2000, lastHookAt: 3000, stateEvidence: [] }
+  } }
+  await h.tick(status)
+  const events = await h.tick(status)
+  assert.ok(events.length > 0)
+  assert.deepStrictEqual([...new Set(events.map(entry => entry.sessionId))], ['parent'])
+  h.cleanup()
+})
+
+test('a cancel marker left on screen does not interrupt a session never prompted', () => {
+  // idle_ready plus a visible marker is upgraded to interrupted, which slipped
+  // past the guard written only for completed.
+  const session = { sessionId: 's1', agentType: 'claude', phase: 'idle', status: 'idle', stateEvidence: [] }
+  const marked = confidently('idle_ready', { interrupt_marker_visible: { noul: 0.9 } })
+  assert.deepStrictEqual(paneEvents(marked, session), [])
+  const prompted = Object.assign({}, session, { lastUserPrompt: 'do the thing' })
+  assert.deepStrictEqual(paneEvents(marked, prompted).map(event => event.type), [AGENT_EVENTS.INTERRUPTED])
+})
+
+test('a prompt left on screen by the pane\'s previous process is not the new session\'s', async () => {
+  // Codex draws inline, so a restart lands below the previous run's prompt.
+  // Read as this session's, it titled the new session with it and showed DONE
+  // for a turn that never happened.
+  const screen = prompt => [
+    `› ${prompt}`,
+    '  some output from that turn',
+    '─ Worked for 1m 02s ──────────────────────',
+    '› Ask Codex to do anything',
+    '  gpt · repo · main · Ready'
+  ].join('\n')
+  const h = observerHarness({ answers: [confidently('idle_ready')] })
+  // The previous run, read while it was alive.
+  const previous = paneStatus({ agentType: 'codex', phase: 'completed', status: 'completed', startedAt: 1000,
+    lastUserPrompt: 'the previous run\'s prompt' })
+  h.screens.set('%1', screen('the previous run\'s prompt'))
+  await h.tick(previous)
+  await h.tick(previous)
+
+  // Restarted in the pane: a new instance under the same discovery id.
+  const status = paneStatus({ agentType: 'codex', phase: 'idle', status: 'idle', startedAt: 5000 })
+  h.screens.set('%1', screen('the previous run\'s prompt') + '\n')
+  h.advance(7000)
+  await h.tick(status)
+  assert.deepStrictEqual(await h.tick(status), [])
+
+  h.screens.set('%1', screen('a prompt sent to this session'))
+  h.advance(7000)
+  await h.tick(status)
+  const events = await h.tick(status)
+  assert.deepStrictEqual(events.map(entry => entry.event.type), [AGENT_EVENTS.TURN_COMPLETE])
+  assert.strictEqual(events[0].event.updates.lastUserPrompt, 'a prompt sent to this session')
+  h.cleanup()
+})
+
+test('a pid flip while the old process lives keeps the session where it was', () => {
+  // The process-tree walk can settle on a wrapper one tick and its child the
+  // next. That was sent as DISCOVERED, which resets to idle and hands the row
+  // back to pane-discovery — hidden in the picker, flickering with every flip.
+  const opts = { writeSession: false, writeStatus: false }
+  const first = discoveryFixture('agent')
+  const status = { version: 1, lastUpdated: first.now, sessions: {} }
+  sync.discoverPaneSessions(status, first.panes, first.table, sync.createStats(), Object.assign({ now: first.now }, opts))
+  const id = sync.discoverySessionId('claude', '%88')
+  const session = status.sessions[id]
+  applySessionEvent(session, {
+    type: AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE, source: 'pane-model', stateSource: 'pane-model', timestamp: first.now + 1
+  })
+  const startedAt = session.startedAt
+
+  // The walk now settles on the binary the wrapper started.
+  const flipped = processTableOf([
+    { pid: 556050, ppid: 1, command: '/bin/zsh' },
+    { pid: 556051, ppid: 556050, command: 'node' },
+    // Started a moment after the wrapper, as a child is.
+    { pid: 556052, ppid: 556051, command: '/opt/homebrew/bin/claude', startedAtMs: first.now - 100000 }
+  ])
+  sync.discoverPaneSessions(status, first.panes, flipped, sync.createStats(), Object.assign({ now: first.now + 2000 }, opts))
+  const after = status.sessions[id]
+  assert.strictEqual(after.pid, 556052, 'the new pid is still recorded')
+  assert.strictEqual(currentPhase(after), 'running')
+  assert.strictEqual(after.stateSource, 'pane-model')
+  // Kept too: anything keyed on the instance would otherwise see a new one.
+  assert.strictEqual(after.startedAt, startedAt)
+})
+
+test('dialog details are extracted in the form the reducer stores them', () => {
+  // Cut at 200 characters, a detail ending in a space never equalled the
+  // trimmed stored value, so every tick re-sent the wait and rewrote the file.
+  const args = 'a'.repeat(193) + ' and the rest of a long command'
+  const raw = [`⏺ Bash(${args})`, '  ⎿  Waiting…', '', '│ Do you want to proceed?'].join('\n')
+  const { details } = extractToolLine(raw, 'claude')
+  assert.strictEqual(details, details.trim())
+
+  const session = { sessionId: 's1', agentType: 'claude', phase: 'running', status: 'working', stateEvidence: [] }
+  const extracted = { pendingDetails: details }
+  for (const event of paneEvents(confidently('awaiting_approval'), session, { options: { extracted } })) {
+    applySessionEvent(session, event)
+  }
+  assert.strictEqual(currentPhase(session), 'waitingForApproval')
+  assert.deepStrictEqual(paneEvents(confidently('awaiting_approval'), session, { options: { extracted, now: 3000 } }), [])
+})
+
+test('an approval is not described by a tool call that already finished', () => {
+  // Scanning up for the nearest tool line found the one before the prose, so
+  // a Bash approval was shown as the Read that completed a minute earlier.
+  const dialog = ['╭──────────────────────╮', '│ Bash command         │', '│ Do you want to proceed?', '╰──────────────────────╯']
+  const finished = ['⏺ Read(src/a.ts)', '  ⎿  Read 40 lines', '', '⏺ I need to run the migration script.', '', ...dialog].join('\n')
+  assert.deepStrictEqual(extractToolLine(finished, 'claude'), {})
+  const pending = ['⏺ Read(src/a.ts)', '  ⎿  Read 40 lines', '', '⏺ Bash(./migrate.sh --apply)', '  ⎿  Waiting…', '', ...dialog].join('\n')
+  assert.strictEqual(extractToolLine(pending, 'claude').details, 'Bash: ./migrate.sh --apply')
+})
+
+test('a throwing response handler releases its request slot once', async () => {
+  // .then(handler).catch(handler) ran the rejection handler too when the
+  // success handler threw, releasing the slot twice: inFlight went negative
+  // and the concurrency cap stopped holding.
+  const metrics = {
+    configure() {},
+    recordCall() { throw new Error('metrics broke') },
+    snapshot() { return {} }
+  }
+  const h = observerHarness({ observer: { metrics } })
+  await h.tick(paneStatus())
+  await new Promise(resolve => setImmediate(resolve))
+  assert.strictEqual(h.observer.handoff().schedule.inFlight, 0)
+  h.cleanup()
+})
+
+test('a settings poll that cannot read tmux keeps the running observer', () => {
+  // An unreadable option read as unset, which means off: one tmux hiccup tore
+  // the observer down with its spend report, cooldown and token bucket.
+  const { pollPaneSettings } = require('../scripts/watcher')
+  const running = fakePaneObserver(true, 'running')
+  const pane = { settings: { mode: 'on' }, signature: JSON.stringify({ mode: 'on' }), observer: running }
+  const logs = []
+  const after = pollPaneSettings(pane, {
+    read: () => { throw new Error('no server running') },
+    log: line => logs.push(line),
+    start: () => { throw new Error('must not rebuild') }
+  })
+  assert.strictEqual(after, pane)
+  assert.strictEqual(running.closed, false)
+  assert.strictEqual(logs.length, 1)
+
+  // And the reader the watcher polls with does throw, where the lenient one
+  // reports an unset option.
+  const home = tempDir()
+  try {
+    const bin = path.join(home, 'bin')
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+    const out = execFileSync(process.execPath, ['-e', `
+      const s = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'state-source'))})
+      let strict = 'returned'
+      try { s.readTmuxOptionStrict('@scout-state-source') } catch (_) { strict = 'threw' }
+      console.log(JSON.stringify({ lenient: s.readTmuxOption('@scout-state-source'), strict }))
+    `], { encoding: 'utf-8', env: Object.assign({}, process.env, { PATH: `${bin}:${process.env.PATH}` }) })
+    assert.deepStrictEqual(JSON.parse(out), { lenient: '', strict: 'threw' })
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a key the watcher cannot see fails the doctor in jev mode', () => {
+  // Exported only in a login shell: doctor sees it, the watcher — started by
+  // tmux run-shell — does not, and in jev mode nothing updates phase.
+  const doctor = path.join(__dirname, '..', 'scripts', 'doctor.js')
+  const keyLine = options => {
+    const home = tempDir()
+    try {
+      const env = fakeTmuxEnv(home, options)
+      env.TYPESAFE_API_KEY = 'not-a-real-key'
+      const result = require('child_process').spawnSync(process.execPath, [doctor], { encoding: 'utf-8', env })
+      return result.stdout.replace(/\x1b\[[0-9;]*m/g, '').split('\n').find(line => / API key - /.test(line)) || ''
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+  assert.ok(keyLine({ '@scout-state-source': 'jev' }).includes('[FAIL] API key'))
+  assert.ok(keyLine({ '@scout-pane-model': 'shadow' }).includes('[WARN] API key'))
+})
+
+test('jev-metrics leaves failed calls out of latency and projects no rate from seconds', () => {
+  const home = tempDir()
+  try {
+    const now = Date.now()
+    fs.mkdirSync(path.join(home, '.tmux-scout'), { recursive: true })
+    fs.writeFileSync(path.join(home, '.tmux-scout', 'pane-metrics.jsonl'), [
+      { at: now - 3000, ok: false, error: 'threw', ms: null },
+      { at: now - 2000, ok: false, error: 'threw', ms: null },
+      { at: now - 1000, ok: true, ms: 640, inputTokens: 2000 }
+    ].map(row => JSON.stringify(row)).join('\n') + '\n')
+    const out = execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'debug.js'), 'jev-metrics'], {
+      encoding: 'utf-8', env: Object.assign({}, process.env, { HOME: home })
+    })
+    assert.ok(/p50 640ms/.test(out), out)
+    assert.ok(!/\/month/.test(out), out)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('setup status in jev mode checks only the agents the pane model does not read', () => {
+  const home = tempDir()
+  const status = (...args) => require('child_process').spawnSync(process.execPath,
+    [path.join(__dirname, '..', 'scripts', 'setup.js'), 'status', ...args],
+    { encoding: 'utf-8', env: fakeTmuxEnv(home, { '@scout-state-source': 'jev' }) })
+  try {
+    // Read from the pane: no hooks on purpose, so nothing is missing.
+    const covered = status('--claude', '--codex')
+    assert.strictEqual(covered.status, 0, covered.stdout + covered.stderr)
+    // Not read from the pane: its hooks are its only source of state.
+    const kimi = status('--kimi')
+    assert.strictEqual(kimi.status, 1, kimi.stdout)
+    assert.ok(/Kimi/.test(kimi.stdout))
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+// --- review round 8 ---
+
+test('a prompt on screen the first time a pane is read is taken as the session\'s', async () => {
+  // With no earlier process seen in the pane there is nothing to have inherited
+  // it from. Set aside anyway, a session whose first turn finished before it was
+  // read stayed an idle, hidden placeholder for good.
+  const screen = [
+    '› summarize the repo',
+    '  here is the summary',
+    '─ Worked for 12s ──────────────────────',
+    '› Ask Codex to do anything',
+    '  gpt · repo · main · Ready'
+  ].join('\n')
+  const h = observerHarness({ answers: [confidently('idle_ready')] })
+  const status = paneStatus({ agentType: 'codex', phase: 'idle', status: 'idle', startedAt: 5000 })
+  h.screens.set('%1', screen)
+  await h.tick(status)
+  const events = await h.tick(status)
+  assert.deepStrictEqual(events.map(entry => entry.event.type), [AGENT_EVENTS.TURN_COMPLETE])
+  assert.strictEqual(events[0].event.updates.lastUserPrompt, 'summarize the repo')
+})
+
+test('an answer landing after a rebuild is still written to disk', async () => {
+  // The dirty flag lived in the observer that sent the request. The answer went
+  // into the shared cache, but only the closed observer knew it was unsaved.
+  let resolve
+  const client = {
+    available: true,
+    reason: null,
+    classify: () => new Promise(done => { resolve = done })
+  }
+  const h = observerHarness({ observer: { client } })
+  await h.tick(paneStatus())
+  const rebuilt = observerHarness({ store: h.storeDir, observer: h.observer.handoff() })
+  h.observer.close()
+  resolve({ ok: true, answers: sampleAnswers('working'), usage: { input_tokens: 10 }, model: 'jev-1' })
+  await new Promise(done => setImmediate(done))
+  rebuilt.observer.close()
+  const written = JSON.parse(fs.readFileSync(path.join(h.storeDir, 'pane-cache.json'), 'utf-8'))
+  assert.strictEqual(Object.keys(written).length, 1)
+})
+
+test('a replacement that fails to build leaves the running observer running', () => {
+  const { pollPaneSettings } = require('../scripts/watcher')
+  const running = fakePaneObserver(true, 'running')
+  const pane = { settings: { mode: 'shadow' }, signature: JSON.stringify({ mode: 'shadow' }), observer: running }
+  const after = pollPaneSettings(pane, {
+    read: name => (name === '@scout-state-source' ? 'jev' : ''),
+    log: () => {},
+    start: () => { throw new Error('bad options') }
+  })
+  assert.strictEqual(after.observer, running)
+  assert.strictEqual(running.closed, false, 'closed, it reported ready while dispatching nothing')
+})
+
+test('in jev mode an agent the pane model does not read keeps its hooks', () => {
+  // Skipping every hook left kimi, opencode and the rest with no state at all.
+  const home = tempDir()
+  const setup = (...args) => require('child_process').spawnSync(process.execPath,
+    [path.join(__dirname, '..', 'scripts', 'setup.js'), ...args],
+    { encoding: 'utf-8', env: fakeTmuxEnv(home, { '@scout-state-source': 'jev' }) })
+  try {
+    const claude = setup('install', '--claude')
+    assert.ok(/read from the pane, so they get no hooks/.test(claude.stdout), claude.stdout)
+    assert.strictEqual(fs.existsSync(path.join(home, '.claude', 'settings.json')), false)
+
+    const kimi = setup('install', '--kimi')
+    assert.ok(!/get no hooks/.test(kimi.stdout), kimi.stdout)
+    assert.strictEqual(setup('status', '--kimi').status, 0, 'installed like in hook mode')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a startup screen does not start a turn in a session never prompted', () => {
+  // A spinner while MCP servers boot reads as working. Once that moved the
+  // session to running, the never-prompted guard no longer applied, and the
+  // composer that followed completed a turn nobody sent.
+  const session = { sessionId: 's1', agentType: 'codex', phase: 'idle', status: 'idle', stateEvidence: [] }
+  const booting = { confidence: 'none', composer: true }
+  assert.deepStrictEqual(paneEvents(confidently('working'), session, { options: { extracted: booting } }), [])
+  // Where the composer was not found, a missing prompt proves nothing.
+  const unknown = { confidence: 'none', composer: false }
+  assert.deepStrictEqual(paneEvents(confidently('working'), session, { options: { extracted: unknown } })
+    .map(event => event.type), [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE])
+  const prompted = { lastUserPrompt: 'fix the build', sessionTitle: 'fix the build', composer: true }
+  assert.deepStrictEqual(paneEvents(confidently('working'), session, { options: { extracted: prompted } })
+    .map(event => event.type), [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE])
+})
+
+test('the extractor reports whether it found the composer', () => {
+  const { extractPromptAndTitle: extract } = require('../scripts/lib/pane-text-extract')
+  assert.strictEqual(extract(['  Booting MCP server: github', '› Ask Codex to do anything', '  gpt · repo'].join('\n'), 'codex').composer, true)
+  assert.strictEqual(extract('  only output here\n  and more\n  and more', 'codex').composer, false)
+})
+
+test('a reading built for a replaced record is not applied to its successor', () => {
+  // Discovery ids are per pane. A restart between capture and apply left the
+  // old instance's events — its guards, its prompt — landing on the new one.
+  const session = { sessionId: 'd1', agentType: 'codex', phase: 'idle', status: 'idle', startedAt: 9000, stateEvidence: [] }
+  const stats = sync.createStats()
+  sync.applyPaneEvents({ version: 1, sessions: { d1: session } }, [{
+    sessionId: 'd1',
+    startedAt: 1000,
+    event: { type: AGENT_EVENTS.TURN_COMPLETE, source: 'pane-model', stateSource: 'pane-model', timestamp: 9500,
+      updates: { lastUserPrompt: 'the old run\'s prompt' } }
+  }], stats)
+  assert.strictEqual(currentPhase(session), 'idle')
+  assert.strictEqual(session.lastUserPrompt, undefined)
+  assert.strictEqual(stats.paneModel.superseded, 1)
+})
+
+test('a wait whose tool fixes it as a plan is not re-sent over its subtype', () => {
+  // The reducer derives the subtype from a recorded ExitPlanMode before any
+  // reason an event carries, so a reading of `approval` could never take —
+  // and was re-sent every tick, rewriting the session file each time.
+  const session = {
+    sessionId: 's1', agentType: 'claude', phase: 'waitingForApproval', status: 'working',
+    pendingToolUse: { tool: 'ExitPlanMode', details: 'ExitPlanMode' },
+    pendingInteraction: { type: 'plan', phase: 'waitingForApproval', details: 'ExitPlanMode', startedAt: 500 },
+    stateEvidence: []
+  }
+  assert.deepStrictEqual(paneEvents(confidently('awaiting_approval'), session), [])
+  // With no tool recorded, the screen's subtype is the only one there is.
+  const unpinned = Object.assign({}, session, { pendingToolUse: null })
+  assert.strictEqual(paneEvents(confidently('awaiting_approval'), unpinned).length, 1)
+})
+
+test('a rejected key is replaced once a different one can be found', () => {
+  // tmux set-environment does not reach a client already built, so a rotated
+  // key left every call a 401 until the watcher was restarted by hand.
+  const { refreshPaneObserver } = require('../scripts/watcher')
+  const failing = Object.assign(fakePaneObserver(true, 'failing'), {
+    stats: () => ({ available: true, authFailing: true, keyId: 'old' })
+  })
+  const current = { settings: { mode: 'on' }, signature: JSON.stringify({ mode: 'on' }), observer: failing }
+  const starts = []
+  const deps = key => ({
+    log: () => {},
+    probe: () => ({ available: true, keyId: key, model: 'jev-1' }),
+    start: (settings, carry) => { starts.push(carry.client.keyId); return fakePaneObserver(true, 'new') }
+  })
+  assert.strictEqual(refreshPaneObserver(current, { mode: 'on' }, deps('old')), current, 'the same key would fail again')
+  assert.strictEqual(starts.length, 0)
+  const next = refreshPaneObserver(current, { mode: 'on' }, deps('new'))
+  assert.notStrictEqual(next, current)
+  assert.deepStrictEqual(starts, ['new'])
+  assert.strictEqual(failing.closed, true)
+})
+
+test('an authentication failure is reported until a call succeeds again', async () => {
+  const h = observerHarness({ answers: [new Error('auth')] })
+  await h.tick(paneStatus())
+  await new Promise(resolve => setImmediate(resolve))
+  assert.strictEqual(h.observer.stats().authFailing, true)
+})
+
+test('a rotated key in the tmux environment wins over the one this process started with', () => {
+  const home = tempDir()
+  try {
+    const bin = path.join(home, 'bin')
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\necho "TYPESAFE_API_KEY=rotated-key"\n', { mode: 0o755 })
+    const out = execFileSync(process.execPath, ['-e', `
+      const { resolveApiKey } = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'jev-client'))})
+      console.log(resolveApiKey(null))
+    `], { encoding: 'utf-8', env: Object.assign({}, process.env, {
+      HOME: home, PATH: `${bin}:${process.env.PATH}`, TYPESAFE_API_KEY: 'startup-key'
+    }) })
+    assert.strictEqual(out.trim(), 'rotated-key')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('a Node too old for the SDK is not probed again every poll', () => {
+  const { refreshPaneObserver } = require('../scripts/watcher')
+  const stuck = Object.assign(fakePaneObserver(false, 'stuck'), {
+    stats: () => ({ available: false, reason: 'node-too-old' })
+  })
+  const current = { settings: { mode: 'on' }, signature: JSON.stringify({ mode: 'on' }), observer: stuck }
+  assert.strictEqual(refreshPaneObserver(current, { mode: 'on' }, {
+    log: () => {},
+    probe: () => { throw new Error('probed, forking tmux for nothing') }
+  }), current)
+})
+
+test('the SDK is an optional dependency', () => {
+  // It needs Node 20; the plugin supports 16. As a hard dependency, npm with
+  // engine-strict refused to install the plugin at all on 16 and 18.
+  const pkg = require('../package.json')
+  assert.ok(!pkg.dependencies || !pkg.dependencies['@typesafe-ai/sdk'])
+  assert.ok(pkg.optionalDependencies['@typesafe-ai/sdk'])
+})
+
+test('shadow mode never parses the screen', async () => {
+  let reads = 0
+  const capture = paneId => {
+    const text = 'agent line one\nagent line two\nagent line three'
+    return { paneId, text, fingerprint: `fp:${text}`, get raw() { reads++; return text } }
+  }
+  const h = observerHarness({ observer: { mode: 'shadow', capture } })
+  await h.tick(paneStatus())
+  await h.tick(paneStatus())
+  assert.strictEqual(reads, 0)
+})
+
+test('fixtures are scored through the same capture pipeline as live panes', () => {
+  // jev-eval normalized the whole fixture, so anything past the last 40 lines
+  // was sent to the model in evaluation and never in production.
+  const { captureFromText, DEFAULT_TAIL_LINES } = require('../scripts/lib/pane-capture')
+  const long = Array.from({ length: DEFAULT_TAIL_LINES + 20 }, (_, i) => `line ${i}`).join('\n') + '\n\n'
+  const captured = captureFromText('%1', long)
+  assert.strictEqual(captured.text.split('\n').length, DEFAULT_TAIL_LINES)
+  assert.ok(captured.text.endsWith(`line ${DEFAULT_TAIL_LINES + 19}`))
+  const evalSource = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'dev', 'jev-eval.js'), 'utf-8')
+  assert.ok(/captureFromText\(/.test(evalSource))
+})
+
+test('the state source is either hooks or the pane model, never both', () => {
+  const { STATE_SOURCES, stateSource } = require('../scripts/lib/state-source')
+  // Unset means hooks: that is what every install predating this option had.
+  assert.strictEqual(stateSource(() => ''), STATE_SOURCES.HOOK)
+  assert.strictEqual(stateSource(() => 'JEV'), STATE_SOURCES.JEV)
+  assert.strictEqual(stateSource(() => ' jev '), STATE_SOURCES.JEV)
+  // A typo falls back to the safe side rather than leaving a system with the
+  // hooks uninstalled and nothing reading the screen either.
+  assert.strictEqual(stateSource(() => 'typo'), STATE_SOURCES.HOOK)
+})
+
+test('jev turns the pane model on without needing @scout-pane-model', () => {
+  const { paneModelSettings } = require('../scripts/watcher')
+  const reader = options => name => options[name] || ''
+  assert.strictEqual(paneModelSettings(reader({ '@scout-state-source': 'jev' })).mode, 'on')
+  // shadow stays reachable through the old option, which is how the agreement
+  // report gets its data before anyone flips the switch.
+  assert.strictEqual(paneModelSettings(reader({ '@scout-pane-model': 'shadow' })).mode, 'shadow')
+  assert.strictEqual(paneModelSettings(reader({})).mode, 'off')
+})
+
+test('the settings watcher builds are ones the observer can actually use', async () => {
+  // Nothing exercised watcher.js's own settings path, which is why an allowlist
+  // that survived direct construction but not the real wiring went unnoticed.
+  const { paneModelSettings } = require('../scripts/watcher')
+  const settings = paneModelSettings()
+  assert.ok(['off', 'shadow', 'on'].includes(settings.mode))
+
+  // Simulate what paneModelSettings produces when the option is enabled, then
+  // feed it through createPaneObserver exactly as startPaneObserver does.
+  const { toAgentSet, DEFAULTS } = require('../scripts/lib/pane-observer')
+  const enabled = {
+    mode: 'on',
+    intervalMs: DEFAULTS.intervalMs,
+    tailLines: DEFAULTS.tailLines,
+    agents: toAgentSet(DEFAULTS.agents),
+    thresholds: undefined
+  }
+  const h = observerHarness({ observer: enabled })
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1, 'watcher-built settings must classify a default-agent session')
+})
+
+test('watcher status stays quiet about the pane model until it is switched on', () => {
+  const { formatPaneModelStats } = require('../scripts/watcher')
+  assert.strictEqual(formatPaneModelStats(undefined), '')
+  assert.strictEqual(formatPaneModelStats({ mode: 'off' }), '')
+
+  const line = formatPaneModelStats({
+    mode: 'on',
+    available: true,
+    calls: 4,
+    cacheHits: 96,
+    emitted: 3,
+    errors: 0,
+    throttled: 1,
+    queued: 0,
+    hitRate: 0.96
+  })
+  assert.ok(line.includes('hitRate=96%'), line)
+  assert.ok(line.includes('calls=4'), line)
+})
+
+test('the agreement report reads its window the way the docs describe', () => {
+  const { parseDuration } = require('../scripts/debug')
+  assert.strictEqual(parseDuration('24h', 0), 24 * 3600 * 1000)
+  assert.strictEqual(parseDuration('30m', 0), 30 * 60 * 1000)
+  assert.strictEqual(parseDuration('7d', 0), 7 * 86400 * 1000)
+  assert.strictEqual(parseDuration('12', 0), 12 * 3600 * 1000, 'a bare number means hours')
+  assert.strictEqual(parseDuration('nonsense', 99), 99)
+})
+
+test('answer cache reports a hit rate for the watcher status line', () => {
+  const cache = createAnswerCache()
+  const key = answerCacheKey('claude', 1, 'abc123')
+  assert.strictEqual(cache.stats().hitRate, 0)
+
+  cache.get(key)                                 // miss
+  cache.set(key, { answers: sampleAnswers() })
+  cache.get(key)                                 // hit
+  cache.get(key)                                 // hit
+  assert.ok(Math.abs(cache.stats().hitRate - 2 / 3) < 1e-9)
 })
 
 test('flow fixture expectations can read status-prefixed paths', () => {

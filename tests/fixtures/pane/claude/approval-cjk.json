@@ -1,0 +1,9 @@
+{
+  "name": "claude approval dialog with a Chinese transcript around it",
+  "agent": "claude",
+  "expect": {
+    "choice": "awaiting_approval",
+    "phase": "waitingForApproval",
+    "pendingInteractionType": "approval"
+  }
+}

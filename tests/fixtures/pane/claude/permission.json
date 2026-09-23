@@ -1,0 +1,9 @@
+{
+  "name": "claude bash permission box blocks the turn",
+  "agent": "claude",
+  "expect": {
+    "choice": "awaiting_approval",
+    "phase": "waitingForApproval",
+    "pendingInteractionType": "approval"
+  }
+}

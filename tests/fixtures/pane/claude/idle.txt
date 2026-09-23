@@ -1,0 +1,12 @@
+  I updated the retry policy in fetcher.ts and added a regression test. All 41
+  tests pass.
+
+※ recap: switched the fetcher to exponential backoff and covered the 429 path.
+  (disable recaps in /config)
+                                              new task? /clear to save 283.2k tokens
+─────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────
+
+  󰉋 example-repo 󰘬 main 󰏫10󰋖4  Opus 5 (1M context) ctx:83%
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents

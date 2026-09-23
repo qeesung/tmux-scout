@@ -1,0 +1,8 @@
+{
+  "name": "claude exited and left the shell prompt behind",
+  "agent": "claude",
+  "expect": {
+    "choice": "shell_prompt",
+    "phase": null
+  }
+}

@@ -1,0 +1,17 @@
+   分支 qsc/cosy-services-v2 正在发布到 BOE。这套代码新增了一整个知识维度：7 张
+   数据表、6 个端点共 21 个 action、2 个专用向量集合。单测覆盖 76.3%，但全部跑在
+   mock 上——真实数据库的大小写折叠、符号解析、向量读写这三条路径只有 BOE 能验。
+
+   我需要执行迁移脚本来应用这次 schema 变更。
+
+╭─────────────────────────────────────────────────────────────────────────────╮
+│ Bash command                                                                │
+│                                                                             │
+│   ./scripts/migrate.sh --apply --env boe                                    │
+│   应用待执行的数据库迁移                                                      │
+│                                                                             │
+│ Do you want to proceed?                                                     │
+│ ❯ 1. Yes                                                                    │
+│   2. Yes, and don't ask again for ./scripts/migrate.sh commands             │
+│   3. No, and tell Claude what to do differently (esc)                       │
+╰─────────────────────────────────────────────────────────────────────────────╯

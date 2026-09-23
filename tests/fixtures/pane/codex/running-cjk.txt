@@ -1,0 +1,11 @@
+  正在分析 gitgateway 的限流逻辑，需要先确认 user-repo quota 的计算口径。
+
+    Read internal/ratelimit/quota.go
+    Search PullRateLimited|user-repo
+
+  从采样窗口看，5 分钟内 500 次请求有 216 次被拦截，来源是 149 个不同 IP。
+
+─ Working ────────────────────────────────────────────────────────────────
+⠙   ⠈         ⠄                   ⢀                ⠐     ⠐
+» Esc to interrupt                ⠁                  ⠈        ⠄    ⠂
+  gpt-6-astra ultra · gitgateway · master · Working · Context 54% left

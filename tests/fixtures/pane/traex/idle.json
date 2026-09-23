@@ -1,0 +1,8 @@
+{
+  "name": "traex finished and shows its placeholder composer",
+  "agent": "traex",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

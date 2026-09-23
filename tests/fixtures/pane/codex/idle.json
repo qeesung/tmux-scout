@@ -1,0 +1,8 @@
+{
+  "name": "codex reports Ready with an empty composer",
+  "agent": "codex",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

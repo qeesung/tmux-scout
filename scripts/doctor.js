@@ -7,6 +7,7 @@ const path = require('path')
 const { spawnSync } = require('child_process')
 
 const { HOOK_MANAGERS, checkManagerHealth } = require('./setup/managers')
+const { STATE_SOURCES, STATE_SOURCE_OPTION, effectivePaneMode, screenReadAgents, stateSource } = require('./lib/state-source')
 
 const PROJECT_DIR = path.resolve(__dirname, '..')
 const STATUS_DIR = path.join(os.homedir(), '.tmux-scout')
@@ -240,11 +241,27 @@ function checkStorage() {
 function checkHooks() {
   section('Hooks')
 
+  // Per agent: in jev mode the agents the pane model reads should have no
+  // hooks, and every other agent still needs its own.
+  const fromScreen = screenReadAgents(tmuxOption)
+  const leftover = []
   let anyInstalled = false
 
   for (const manager of HOOK_MANAGERS) {
     const report = checkManagerHealth(manager)
     const label = `${report.label} hooks`
+    if (fromScreen.has(manager.id)) {
+      if (report.installed || report.partial) {
+        leftover.push(manager)
+        // Both sources write phase. The pane model re-reads the screen every
+        // few seconds, so a hook that fires late overwrites a correct reading
+        // with a stale one — and the failure looks like the model being wrong.
+        warn(label, `installed, but ${STATE_SOURCE_OPTION}=jev reads this agent from the pane`)
+      } else {
+        ok(label, 'not needed; read from the pane')
+      }
+      continue
+    }
     if (report.installed) {
       ok(label, report.summary)
       anyInstalled = true
@@ -256,7 +273,11 @@ function checkHooks() {
     }
   }
 
-  if (!anyInstalled) {
+  if (leftover.length > 0) {
+    warn('state source', `jev, but hooks are still installed for agents it reads; run scripts/setup.sh uninstall ${leftover.map(manager => manager.flag).join(' ')}`)
+  } else if (fromScreen.size > 0) {
+    ok('state source', `jev; ${[...fromScreen].join(', ')} read from the pane, any other agent through its hooks`)
+  } else if (!anyInstalled) {
     warn('agent tracking', 'no hooks installed; run scripts/setup.sh install')
   }
 }
@@ -297,6 +318,87 @@ function checkWatcher() {
   }
 }
 
+// How serious a missing prerequisite is depends on who needs the classifier.
+// In shadow mode nothing does — hooks still drive state — so a problem here is
+// a warning that explains why the report stays empty. With
+// `@scout-state-source jev` the classifier is the only thing that moves a
+// session's phase, the hooks are gone, and the same problem is a failure.
+function checkPaneModel() {
+  // The same resolution the watcher uses, not just @scout-pane-model: with
+  // `@scout-state-source jev` and no pane-model option the classifier runs, and
+  // a doctor that returned here would report that phase comes from the screen
+  // while the SDK, the Node version and the API key went unchecked — after the
+  // hooks were already uninstalled.
+  const mode = effectivePaneMode(tmuxOption)
+  if (mode === 'off') return
+  const problem = stateSource(tmuxOption) === STATE_SOURCES.JEV ? fail : warn
+
+  section('Pane model')
+  ok('mode', stateSource(tmuxOption) === STATE_SOURCES.JEV
+    ? `${mode} (via ${STATE_SOURCE_OPTION}=jev)`
+    : `${mode} (via @scout-pane-model)`)
+
+  // Build the real client rather than re-deriving its preconditions: a doctor
+  // that reports green while the watcher reports no-key is worse than no check.
+  // Requiring jev-client is safe — it pulls in the SDK only inside the factory,
+  // and the factory reports rather than throws.
+  const { KEY_FILE, MIN_NODE_MAJOR, createJevClient, keyFileState, resolveApiKey } = require('./lib/jev-client')
+  const client = createJevClient({ apiKey: resolveApiKey() })
+  const REASONS = {
+    'no-key': `no API key; \`tmux set-environment -g TYPESAFE_API_KEY ...\` or write ${KEY_FILE} (chmod 600)`,
+    'no-sdk': `@typesafe-ai/sdk not installed; run \`npm install\` in ${PROJECT_DIR}`,
+    'node-too-old': `Node v${process.versions.node}; the TypeSafe SDK needs v${MIN_NODE_MAJOR} or newer`
+  }
+  if (client.available) ok('client', `ready (${client.model})`)
+  else problem('client', REASONS[client.reason] || client.reason)
+
+  // Which tier supplied the key matters for diagnosis: the watcher is launched
+  // by `tmux run-shell` and inherits the environment the tmux server started
+  // with, not the user's shell — the same reason this plugin special-cases PATH.
+  const fileState = keyFileState()
+  if (fileState === 'bad-mode') {
+    // Checked regardless of whether this shell happens to have the key: the
+    // watcher does not inherit this shell's environment and will skip the file.
+    problem('API key file', `${KEY_FILE} is readable by other accounts, so the watcher ignores it; chmod 600 it`)
+  }
+  if (client.available) {
+    if (tmuxEnv('TYPESAFE_API_KEY')) ok('API key', 'from tmux global environment')
+    else if (fileState === 'ok') ok('API key', KEY_FILE)
+    else problem('API key', 'only in this shell\'s environment; the watcher will not see it')
+  }
+
+  const state = readJson(path.join(STATUS_DIR, 'watcher-state.json'), {})
+  const stats = state.paneModel
+  if (!stats) {
+    warn('recent activity', 'no readings yet; the watcher may not have ticked since this was enabled')
+    return
+  }
+  ok('recent activity', `${stats.calls} calls / ${stats.errors} errors since the watcher started`)
+
+  const jev = stats.jev
+  if (jev && jev.calls > 0) {
+    ok('latency', `p50 ${jev.latency.p50Ms}ms / p95 ${jev.latency.p95Ms}ms / max ${jev.latency.maxMs}ms`)
+    // Extrapolated from this watcher's uptime, which is the only rate available
+    // before a month has passed and the one people actually want to see.
+    ok('spend', jev.costUsdPerHour === null
+      ? `$${jev.costUsd.toFixed(4)} so far; too little uptime to project a rate`
+      : `$${jev.costUsd.toFixed(4)} so far, $${(jev.costUsdPerHour * 24 * 30).toFixed(2)}/month at this rate`)
+    // 8s is the client timeout. Sitting near it means responses are landing two
+    // or three ticks late, which shows up as state that lags the screen.
+    if (jev.latency.p95Ms > 4000) {
+      warn('latency', `p95 ${jev.latency.p95Ms}ms is close to the 8000ms timeout; readings will lag the screen`)
+    }
+  }
+  // Readings served from cache out of readings served at all — throttled ticks
+  // are neither. Agents streaming output legitimately pay for most readings, so
+  // only a rate that stays very low over a long sample is worth a warning: that
+  // is what normalization letting an animation through looks like.
+  const hitRate = Number.isFinite(stats.hitRate) ? stats.hitRate : null
+  if (hitRate === null || stats.calls + stats.cacheHits < 100) return
+  if (hitRate >= 0.5) ok('cache hit rate', `${Math.round(hitRate * 100)}%`)
+  else warn('cache hit rate', `${Math.round(hitRate * 100)}% over ${stats.calls + stats.cacheHits} readings; screens may not be normalizing`)
+}
+
 function main() {
   console.log()
   console.log(c.bold('tmux-scout doctor'))
@@ -307,6 +409,7 @@ function main() {
   checkStorage()
   checkHooks()
   checkWatcher()
+  checkPaneModel()
 
   console.log()
   if (failures > 0) {

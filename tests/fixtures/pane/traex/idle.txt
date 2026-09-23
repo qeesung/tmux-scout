@@ -1,0 +1,9 @@
+  Summary
+  - The rate limit is enforced per user-repo pair at 120 requests per minute.
+  - Recommended mitigation is a shallow clone plus a shared cache.
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ⏱  Worked for 7m 40s · done 2:42 PM
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄ Analyze issue ▄
+❯ Implement {feature}
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  Test-O-New high · Context 40% left · ~/repos/example · main · No changes

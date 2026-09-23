@@ -1,0 +1,8 @@
+{
+  "name": "claude finished its turn with an empty input box",
+  "agent": "claude",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

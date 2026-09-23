@@ -249,6 +249,82 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 
 `watcher status` includes the bridge state, latest tick mode, duration, reconcile change count, Codex JSONL files read, parsed event count, and JSONL parse errors when present.
 
+### Pane state from the screen (experimental, off by default)
+
+Hooks tell tmux-scout what *happened*; the pane tells it what *is*. Hook events can be missed — Codex has no `SessionEnd` or `Notification` — and a missed event leaves a session stuck until the next one arrives, which is why there are 120s/180s timeout fallbacks that guess. Reading the screen instead makes state a function of what is on it right now, so a stuck session corrects itself on the next tick.
+
+This sends the bottom of a pane to [TypeSafe Jev](https://typesafe.ai), a model that answers structured questions rather than generating text. It costs money, so it is off unless you turn it on.
+
+Start with `shadow`, which reads the screen and records what the model concluded without touching any session:
+
+```bash
+set -g @scout-pane-model shadow   # off (default) | shadow
+```
+
+After a day or so, compare what it saw against what the hooks decided:
+
+```bash
+node scripts/debug.js pane-agreement --since 24h
+```
+
+Once those numbers convince you, switch the driver over:
+
+```bash
+set -g @scout-state-source jev    # hook (default) | jev
+```
+
+The two are **either/or per agent**, not a blend. Both write phase, so running them together for one agent means a late hook overwriting a correct reading with a stale one — and the failure looks like the model being wrong. The agents the pane model reads (`@scout-pane-model-agents`, below) are read from the screen; every other agent keeps its hooks, which are then its only source of state. `setup.sh install` skips hooks for the agents the model reads, `doctor` warns if it finds them anyway, and switching an existing install needs one step:
+
+```bash
+scripts/setup.sh uninstall --claude --codex --gemini   # remove the hooks those agents already have
+```
+
+The classifier introduces no new event type: it translates a reading into the same `permission_request` / `question_asked` / `turn_complete` events the hooks send, so every guard in the reducer applies to it unchanged. What is given up with the hooks is precision the screen cannot show — exact tool arguments, turn and request ids, and the transcript path — which is why `shadow` exists to measure the trade before you take it.
+
+Other options:
+
+```bash
+set -g @scout-pane-model-interval 6                 # seconds between paid calls per session; backs off to 30s
+                                                    # while a screen keeps changing to the same verdict
+set -g @scout-pane-model-agents claude,codex,gemini # which CLIs to read
+set -g @scout-pane-model-confidence 0.55            # below this the model is ignored
+set -g @scout-pane-model-lines 40                   # how much of the pane tail to send
+```
+
+Requirements, all checked by `scripts/setup.sh doctor`:
+
+- **Node 20+** and `npm install` in the plugin directory. TPM installs do not run `npm install`, so the SDK is an optional dependency: without it the feature stays off and everything else works unchanged, and on an older Node `npm install` skips it rather than failing.
+- **An API key.** The watcher is started by `tmux run-shell` and inherits the environment the tmux *server* started with, not your shell — so exporting it in `.zshrc` is not enough. Use either:
+
+```bash
+tmux set-environment -g TYPESAFE_API_KEY sk-...
+# or
+install -m 600 /dev/null ~/.tmux-scout/typesafe.key && $EDITOR ~/.tmux-scout/typesafe.key
+```
+
+To rotate the key, run the same `set-environment` with the new one. A running watcher picks it up within about 15 seconds of its old key being refused; no restart is needed.
+
+To see what it is actually costing and how fast it responds:
+
+```bash
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher status
+```
+
+That prints a `jev` line with call count, p50/p95/max latency, input tokens, spend so far and a per-hour rate. For history across watcher restarts, turn on per-call logging and read it back:
+
+```bash
+tmux set -g @scout-jev-log-calls on
+node scripts/debug.js jev-metrics --since 24h
+```
+
+Cost is controlled by never asking about a screen twice: pane text is normalized to strip spinners, elapsed timers and token counts, then content-addressed, so an idle session costs one call a day no matter how long it sits there (cached answers are kept for 24 hours, and dropped at once if the model behind `jev-latest` changes). `watcher status` prints the cache hit rate: readings served from cache out of readings served at all. Agents streaming output pay for most of their readings, so the rate falls while they work; a rate that stays low while everything is idle means animation is leaking through normalization and being paid for.
+
+To inspect a single pane while tuning:
+
+```bash
+node scripts/debug.js classify %39 --state
+```
+
 ### Pane access tracking
 
 The picker orders sessions by how recently you looked at them. By default tmux-scout records every pane you focus — via the picker, prefix keys, mouse, or window/session switches — using a `pane-focus-in` hook, so the ordering reflects real recency rather than only picker jumps. To disable:

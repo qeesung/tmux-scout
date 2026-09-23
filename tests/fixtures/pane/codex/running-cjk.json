@@ -1,0 +1,8 @@
+{
+  "name": "codex mid-turn with a Chinese transcript",
+  "agent": "codex",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

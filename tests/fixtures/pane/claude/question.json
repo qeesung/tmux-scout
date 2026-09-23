@@ -1,0 +1,9 @@
+{
+  "name": "claude asks the user to choose between approaches",
+  "agent": "claude",
+  "expect": {
+    "choice": "awaiting_answer",
+    "phase": "waitingForAnswer",
+    "pendingInteractionType": "question"
+  }
+}

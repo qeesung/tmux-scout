@@ -5,6 +5,7 @@
 const path = require('path')
 const { spawnSync } = require('child_process')
 const { managerById, selectManagers } = require('./setup/managers')
+const { STATE_SOURCE_OPTION, screenReadAgents } = require('./lib/state-source')
 
 const args = process.argv.slice(2)
 const command = args.find(a => !a.startsWith('-'))
@@ -39,6 +40,10 @@ function otherSelectedManagers() {
   return selectedManagers.filter(manager => manager.id !== 'claude' && manager.id !== 'codex')
 }
 
+function labelsFor(ids) {
+  return selectedManagers.filter(manager => ids.has(manager.id)).map(manager => manager.label)
+}
+
 function printActionRows(results) {
   for (const { event, action } of results || []) {
     const icon = action === 'ok' ? c.green('✓')
@@ -59,9 +64,31 @@ function doInstall() {
   console.log()
   console.log(c.bold('tmux-scout hook setup'))
   console.log(c.dim('─'.repeat(21)))
+
+  // Hooks and the pane model are either/or per agent: both write phase, and the
+  // stale one would undo the fresh one. So an agent the pane model reads gets
+  // no hooks — and every other agent still does. Skipping all of them left an
+  // agent outside the model's list with no state at all, hidden forever as a
+  // discovery placeholder.
+  const fromScreen = flags.has('--force') ? new Set() : screenReadAgents()
+  const installs = id => shouldRun(id) && !fromScreen.has(id)
+  const skipped = labelsFor(fromScreen)
+  if (skipped.length > 0) {
+    const flagsFor = selectedManagers.filter(manager => fromScreen.has(manager.id)).map(manager => manager.flag)
+    console.log()
+    console.log('  ' + c.yellow('⊘') + ` ${STATE_SOURCE_OPTION} is ${c.bold('jev')}: ${skipped.join(', ')} ` +
+      'are read from the pane, so they get no hooks')
+    console.log(c.dim(`    Hooks for them from before? Run \`scripts/setup.sh uninstall ${flagsFor.join(' ')}\`.`))
+    console.log(c.dim(`    To install anyway: \`tmux set -g ${STATE_SOURCE_OPTION} hook\`, or pass --force.`))
+  }
+  if (!selectedManagers.some(manager => installs(manager.id))) {
+    console.log()
+    return
+  }
+
   let ok = true
 
-  if (shouldRun('claude')) {
+  if (installs('claude')) {
     console.log()
     printManagerHeader('claude')
     const r = claude.install()
@@ -82,7 +109,7 @@ function doInstall() {
     }
   }
 
-  if (shouldRun('codex')) {
+  if (installs('codex')) {
     console.log()
     printManagerHeader('codex')
     const r = codex.install()
@@ -101,7 +128,7 @@ function doInstall() {
     }
   }
 
-  for (const manager of otherSelectedManagers()) {
+  for (const manager of otherSelectedManagers().filter(item => installs(item.id))) {
     console.log()
     printManagerHeader(manager.id)
     const r = manager.module.install()
@@ -168,7 +195,22 @@ function doUninstall() {
 }
 
 function doStatus() {
+  // Agents the pane model reads have no hooks on purpose, so they are not
+  // checked: listed as 0/N before exiting 1, they read as a broken install.
+  // Hooks left over for them are the actual problem, and doctor reports those.
+  const fromScreen = screenReadAgents()
+  const checks = id => shouldRun(id) && !fromScreen.has(id)
+  const readFromScreen = labelsFor(fromScreen)
+  if (readFromScreen.length > 0 && !quiet) {
+    console.log(c.cyan('tmux-scout') + `: ${STATE_SOURCE_OPTION}=jev; ${readFromScreen.join(', ')} ` +
+      'are read from the pane and need no hooks')
+  }
+
   if (flags.has('--any')) {
+    // tmux-scout.tmux runs `status --quiet --any` on every start and nags to
+    // run `setup.sh install` when it fails. With the pane model reading the
+    // usual agents, having none of their hooks is the intended state.
+    if (fromScreen.size > 0) process.exit(0)
     const { checkManagerHealth } = require('./setup/managers')
     const anyInstalled = selectedManagers.some(manager => {
       const report = checkManagerHealth(manager)
@@ -184,7 +226,7 @@ function doStatus() {
 
   if (!quiet) console.log()
 
-  if (shouldRun('claude')) {
+  if (checks('claude')) {
     const r = claude.status()
     if (r.installed === r.total) {
       if (quiet) {
@@ -205,7 +247,7 @@ function doStatus() {
     }
   }
 
-  if (shouldRun('codex')) {
+  if (checks('codex')) {
     const r = codex.status()
     if (!r.available) {
       // Codex not installed — not a problem
@@ -233,7 +275,7 @@ function doStatus() {
     }
   }
 
-  for (const manager of otherSelectedManagers()) {
+  for (const manager of otherSelectedManagers().filter(item => checks(item.id))) {
     const report = require('./setup/managers').checkManagerHealth(manager)
     if (report.installed) {
       if (!quiet) console.log(c.green(manager.label) + `: ${report.summary} ` + c.green('✓'))

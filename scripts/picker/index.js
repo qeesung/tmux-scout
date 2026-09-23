@@ -10,8 +10,20 @@ let cached
 try {
   const sync = require('./sync')
   const watcherRunning = sync.isWatcherRunning()
+  // When the watcher owns reconciliation, the picker must not run the sweeps
+  // that force a session to a terminal state. idleComplete belongs with the
+  // others: only the watcher can see which sessions the pane model is currently
+  // watching, so running it here would force-complete a session the watcher was
+  // deliberately leaving alone.
   cached = sync.run(statusFile, watcherRunning
-    ? { reconcile: false, codexMode: 'none', paneGroundTruth: false, stuckSweep: false, registryPrune: false }
+    ? {
+      reconcile: false,
+      codexMode: 'none',
+      paneGroundTruth: false,
+      stuckSweep: false,
+      idleComplete: false,
+      registryPrune: false
+    }
     : {})
 } catch (_) {}
 require('./render').run(statusFile, currentPane, cached)

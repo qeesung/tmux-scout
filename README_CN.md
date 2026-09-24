@@ -21,6 +21,7 @@
 - **状态栏组件** — 在 tmux 的 status-right 中显示按状态分类的会话计数（如 `0|1|2`），每 2 秒刷新
 - **自动刷新** — `Ctrl-T` 切换每 2 秒自动刷新选择器
 - **崩溃检测** — 自动检测死亡进程和过期的 Codex JSONL 文件并清理
+- **读屏模式（可选）** — 不再依赖 hook 事件，而是直接读取每个 agent 的终端画面，按屏幕上此刻显示的内容判断状态；漏掉一个事件不会再让会话卡住（[详情](#从屏幕读取状态可选默认关闭)）
 
 ## 依赖
 
@@ -80,6 +81,8 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 
 安装命令是**幂等**的 — 重复运行不会重复添加。如果你移动了仓库位置，重新运行 install 会自动更新 hook 路径。
 不带 agent 参数时，`install`、`uninstall` 和 `status` 会作用于所有支持的集成；可以通过 agent 参数限定范围。
+
+开启[读屏模式](#从屏幕读取状态可选默认关闭)后，`install` 会跳过状态由读屏负责的 agent，它们不需要 hook。
 
 ### 修改了什么
 
@@ -224,8 +227,11 @@ set -g @scout-watchdog off
 这不是 launchd/systemd daemon，而是一个由 tmux 拥有的单实例 Node.js 进程；关闭选项或 tmux 不可用时会退出。watchdog 使用混合循环：
 
 - 每 2 秒做进程/pane 生命周期检查和 Codex JSONL 增量读取
+- [读屏模式](#从屏幕读取状态可选默认关闭)下，在两次检查之间每秒重新读取一次 agent pane（画面没变时只是一次字符串比较）
 - 每 30 秒做 Codex JSONL 发现
 - 每 60 秒做一次全量 reconcile
+
+开关和 `@scout-watchdog-interval` 每 15 秒重新读取一次，而不是每轮都读，所以关闭 watchdog 后最多需要 15 秒它才会退出。
 
 watchdog 运行时还会在 `~/.tmux-scout/run/bridge.sock` 启动本地 single-writer bridge。agent hook 会优先把更新发送到这个 Unix socket，由同一个进程串行写状态；如果 socket 不可用，则回退到直接原子写文件。
 
@@ -246,6 +252,103 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 ```
 
 `watcher status` 会包含 bridge 状态、最近一次 tick 的模式、耗时、reconcile 变更数、读取的 Codex JSONL 文件数、解析事件数，以及出现时的 JSONL 解析错误数。
+
+### 从屏幕读取状态（可选，默认关闭）
+
+**为什么需要。** hook 是边缘触发的：只有 agent CLI 主动报告变化时，tmux-scout 才知道会话状态变了。一旦某个事件漏掉或者根本没有（Codex 没有 `SessionEnd` 和 `Notification`；`Stop` 触发时审批框可能还在屏幕上），会话就会一直错到下一个事件到来，所以 hook 路径里才需要靠超时去猜的兜底。读屏模式是水平触发的：直接读每个 agent 的 pane，状态就是屏幕上此刻显示的内容。某一次读错了，下一次读屏会纠正回来。
+
+**工作方式。**
+
+1. watchdog 大约每秒一次，用一次 tmux 调用读取所有 agent pane 的底部内容。
+2. 去掉每一帧都在变、但不代表状态变化的内容（转圈动画、计时器、token 计数、Codex 背景粒子），保证同一个状态总是得到同一份文字。文字没变的画面直接跳过。
+3. 以前见过的画面直接复用上次的答案。新画面连同"这个 CLI 的界面长什么样"的说明，一起发给 [TypeSafe Jev](https://typesafe.ai)：一个回答结构化问题、而不是生成文字的模型。问它：agent 是在工作、已完成、在等审批还是在提问；是否卡在等人操作；是否有东西在运行；这一轮是否被取消。
+4. 通过下面各项检查的答案，被翻译成和 hook 完全相同的事件（`permission_request`、`question_asked`、`turn_complete` 等），走同一套会话状态机。picker 和状态栏的表现与 hook 模式完全一样。
+
+**如何保证状态可信。**
+
+- **每个 agent 只有一个写入方。** 由读屏负责的 agent 不装 hook，其他 agent 继续用 hook。两个延迟不同的来源不会互相覆盖。
+- **答案要过关才采纳。** 置信度低于门槛（默认 0.55）时忽略模型，会话保持原状态。几个独立的问题互相校验：模型说"在等审批"，但"是否卡在等人操作"的答案是否定的，就不采纳。看不懂的画面（编辑器、分页器）不下结论。被拒的画面最多重问 2 次。
+- **只能从已有状态里选。** 模型只能在现有的几种状态里选择，读屏结果要经过和 hook 事件相同的守卫，不能随意指定状态。
+- **进入等待容易，离开等待难。** `WAIT` 要连续两次置信度达到 0.75 以上（默认门槛下），或者连续约 10 秒判断一致才会解除。重绘时的一帧误读清不掉审批状态。
+- **自动纠错。** 每次读屏都和会话的真实状态对比，不一致才改。
+- **过期的读数作废：** 比已应用读数更早的画面，以及进程已经被替换的 pane 上的读数，都会丢弃。复用的 pane 里新开的会话，不会继承上一个进程留下的提问。
+- **客观事实优先于模型。** 进程和 pane 是否存活由系统直接探测，优先级最高：进程退出了，会话就结束，屏幕上的残留文字不能让它"复活"。屏幕上是普通 shell 提示符时，交给存活探测判断。超时兜底仍然保留，用于读屏失效的情况（没有 key、被限流）；模型正在正常确认某个会话时，兜底会让位，所以画面长时间不动的长命令不会被误判为已完成。
+- **可追溯。** 每次状态变化都记录来源和原因：`node scripts/debug.js evidence <session-id>`。
+- **先测量再上线。** 每次调整给模型的说明，都要用一批标注好的真实画面打分。"很确定但判错"一律算失败，没有商量余地。
+
+**速度与成本**（在约 25 个 agent pane 的机器上实测）：
+
+| | |
+|---|---|
+| 回合结束 → 显示 `DONE` | 1.5–4.5 秒 |
+| 开始工作 → 显示 `BUSY` | 1 秒以内 |
+| watchdog CPU 占用 | 约单核 2% |
+| 每次调用模型 | 约 $0.0001（只按输入计费，输出免费） |
+| 画面命中缓存的比例 | 97–98% |
+| 花费 | agent 工作时每小时几美分；空闲会话大约每天一次调用 |
+
+**开启步骤。**
+
+1. 先用 `shadow` 模式试运行：只读屏并记录模型的判断，不改任何会话。跑一天左右，对比它和 hook 的判断是否一致：
+
+   ```bash
+   set -g @scout-pane-model shadow   # off（默认）| shadow
+   node scripts/debug.js pane-agreement --since 24h
+   ```
+
+2. 满足以下条件（都可以用 `scripts/setup.sh doctor` 检查）：
+   - **Node 20+**，并在插件目录执行 `npm install`。TPM 安装不会执行 `npm install`，所以 SDK 是可选依赖：没装时这个功能保持关闭，其他功能照常；Node 版本太旧时 `npm install` 会跳过它，不会报错。
+   - **API key。** watchdog 由 `tmux run-shell` 启动，继承的是 tmux *服务端*启动时的环境变量，不是你的 shell 的，所以只在 `.zshrc` 里 export 没用。用下面任一方式：
+
+     ```bash
+     tmux set-environment -g TYPESAFE_API_KEY sk-...
+     # 或者
+     install -m 600 /dev/null ~/.tmux-scout/typesafe.key && $EDITOR ~/.tmux-scout/typesafe.key
+     ```
+
+     换 key 时，用新 key 再执行一次同样的 `set-environment`。旧 key 被拒后约 15 秒内，运行中的 watchdog 会自动换用新 key，不需要重启。
+
+3. 切换过去，并卸掉这些 agent 已有的 hook：
+
+   ```bash
+   set -g @scout-state-source jev    # hook（默认）| jev
+   scripts/setup.sh uninstall --claude --codex --gemini
+   ```
+
+   这是**按 agent 二选一**，不是混用：`@scout-pane-model-agents` 里的 agent 由读屏负责，其他 agent 继续用 hook。`setup.sh install` 会跳过读屏 agent 的 hook，`doctor` 发现残留时会提示。配置修改 15 秒内就会生效，不需要重启 watchdog。
+
+**可选配置。**
+
+```bash
+set -g @scout-pane-model-agents claude,codex,gemini # 哪些 CLI 由读屏负责
+set -g @scout-pane-model-confidence 0.55            # 低于这个置信度时忽略模型
+set -g @scout-pane-model-interval 6                 # 画面持续变化时，同一会话两次付费调用的间隔（秒）；
+                                                    # 结论一直不变时逐步退避到 30 秒
+set -g @scout-pane-model-lines 40                   # 发送 pane 底部多少行
+```
+
+这个间隔只对持续变化的画面生效。画面刚静止下来，或者底部变了（比如弹出了审批框），只要距离该会话上次调用满 2 秒就会立刻去读：这正是回合结束或需要你操作的时刻。
+
+**观察运行情况。**
+
+```bash
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher status
+```
+
+会输出一行 `pane-model`（调用次数、缓存命中数和命中率、重问次数、已应用的读数），和一行 `jev`（p50/p95/max 延迟、输入 token、累计花费和每小时花费）。如果所有 agent 都空闲时命中率还一直很低，说明有动画没被过滤掉，正在被重复付费。
+
+想看跨重启的历史，打开逐次调用日志再读取；想看模型此刻怎么判断某个 pane，直接对它分类：
+
+```bash
+tmux set -g @scout-jev-log-calls on
+node scripts/debug.js jev-metrics --since 24h
+node scripts/debug.js classify %39 --state
+```
+
+**局限。**
+
+- 屏幕上看不到 hook 事件携带的全部信息：对读屏的 agent，精确的工具参数、turn 和 request id、transcript 路径都拿不到了。`shadow` 模式就是用来在切换前衡量这个取舍的。
+- 每个 CLI 的界面说明只根据真实画面来写。Claude Code 和 Codex 已完整描述；Traex 运行中的样子、Gemini CLI 运行中和已完成的样子还没有，这些情况下模型只能依据通用判断标准。
 
 ### 面板访问追踪
 
@@ -273,7 +376,12 @@ hook 安装在固定槽位（`pane-focus-in[9909]`），因此在 config 重载�
 ├── run/bridge.sock                  # watchdog single-writer Unix socket
 ├── codex-hooks-manifest.json        # tmux-scout 管理的 Codex event hook trust key
 ├── codex-original-notify.json       # 备份的原始 Codex notify 命令
-└── access-history.json              # picker MRU 排序用的 pane 访问历史
+├── access-history.json              # picker MRU 排序用的 pane 访问历史
+├── typesafe.key                     # 读屏模式：API key（如果用文件保存）
+├── pane-cache.json                  # 读屏模式：每个画面的答案，保留 24 小时
+├── pane-observed.json               # 读屏模式：每个会话最近一次被确认的时间
+├── pane-agreement.jsonl             # shadow 模式：模型与 hook 的对比记录，供 pane-agreement 使用
+└── pane-metrics.jsonl               # 每次调用的延迟和花费（开启 @scout-jev-log-calls 时）
 ```
 
 tmux-scout 会保留当前仍可见或近期可见的会话。隐藏的内部会话以及终端态的 `STALE` / `CRASH` 行会在短暂展示窗口后移除；带有明确 `endedAt` 的快照最多保留 24 小时后清理。
@@ -283,6 +391,8 @@ tmux-scout 会保留当前仍可见或近期可见的会话。隐藏的内部会
 tmux-scout 现在优先使用 Codex event hook，可以近实时同步会话开始、提示提交、工具执行、审批等待和回合完成状态。这是一套基于事件钩子的近实时生命周期跟踪方式，而非轮询。
 
 在默认 watchdog 路径下，tmux-scout 仍以 hook 作为主状态源，并增加一套校正机制：进程/pane 生命周期检查、带 offset 缓存的 Codex transcript 尾部增量读取、registry 清理，以及周期性全量 reconcile。快速路径不会反复全量读取所有 transcript。
+
+设置 `@scout-state-source jev` 后，由读屏负责的 agent 完全不使用 hook：它们的状态来自屏幕，底层仍有进程/pane 存活探测和超时兜底。详见[从屏幕读取状态](#从屏幕读取状态可选默认关闭)。
 
 内部会把 hook、pane、transcript、PID、stale timeout 等观察结果统一交给 session-state reducer。短时间竞态里，高置信度的 hook/PID 事件会压过低置信度的 pane/transcript 观察；但 crash/stale 这类终止事件仍会关闭已经死亡的会话。
 

@@ -253,6 +253,8 @@ function createPaneObserver(options = {}) {
         lastPaidVerdict: null,
         paidRepeat: 0,
         pendingFingerprint: null,
+        // The screen seen by the previous capture; see `settled` in dispatch().
+        lastSeenFingerprint: null,
         // The newest screen the gate rejected, and how many times it has been
         // sent again since; see dispatch().
         rejectedFingerprint: null,
@@ -470,6 +472,12 @@ function createPaneObserver(options = {}) {
       const agentType = String(session.agentType || '').toLowerCase()
       const state = sessionState(sessionId)
       const key = answerCacheKey(agentType, PANE_QUESTION_SET_VERSION, capturedPane.fingerprint)
+      // The same screen twice in a row: it has stopped changing. A working
+      // agent's screen keeps moving, while a finished turn, a dialog or a
+      // question sits still — so a screen settling is the moment worth reading,
+      // whatever the agent. See the interval below.
+      const settled = state.lastSeenFingerprint === capturedPane.fingerprint
+      state.lastSeenFingerprint = capturedPane.fingerprint
 
       // Free and instant: no interval, no budget, no concurrency slot.
       const cached = key ? cache.get(key) : null
@@ -492,13 +500,15 @@ function createPaneObserver(options = {}) {
       if (state.pendingFingerprint === capturedPane.fingerprint) continue
       if (state.refusedFingerprint === capturedPane.fingerprint) continue
       // The backoff is for a body that keeps scrolling to the same conclusion.
-      // When the bottom of the screen moved — a dialog replaced the composer, the
-      // turn ended — that is a different screen, read as soon as the minimum
-      // interval allows. Streaming output had pushed a newly shown approval
-      // dialog up to 30s back; the base interval still held a finished turn
-      // for up to 6s.
+      // A screen that is not doing that is read as soon as the minimum interval
+      // allows, and there are two ways to tell. The bottom moved — a dialog
+      // replaced the composer — or the screen settled. The bottom alone missed
+      // every finished Claude turn: its status line sits above the composer,
+      // outside the few lines the bottom covers, so a turn that ended after a
+      // streak of `working` waited out the backoff, up to 30s. A settled screen
+      // costs at most one call, since its answer is then cached.
       const bottomMoved = state.lastPaidBottom !== capturedPane.bottom
-      const wait = bottomMoved ? DEFAULTS.minIntervalMs : effectiveInterval(state)
+      const wait = bottomMoved || settled ? DEFAULTS.minIntervalMs : effectiveInterval(state)
       if (at - state.lastCallAt < wait) {
         counters.throttled++
         continue

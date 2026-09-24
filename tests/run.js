@@ -4516,6 +4516,32 @@ test('a changed bottom of screen waits the minimum interval, not the base one', 
   h.cleanup()
 })
 
+test('a screen that stops changing is read at the minimum interval despite a backoff', async () => {
+  // A finished Claude turn changes the line above the composer, not the
+  // bottom few lines — so after a streak of `working` it waited out the whole
+  // backoff before anyone read it.
+  let n = 0
+  let body = null
+  const capture = paneId => {
+    const text = `${body || `body ${n++}`}\nline two\nline three\ncomposer`
+    return { paneId, raw: text, text, fingerprint: `fp:${text}`, bottom: 'composer' }
+  }
+  const h = observerHarness({ observer: { capture, intervalMs: 2000 } })
+  for (let i = 0; i < 5; i++) {
+    h.advance(40000)
+    await h.tick(paneStatus())
+  }
+  assert.strictEqual(h.calls.length, 5)
+  body = 'Worked for <dur> · done'
+  h.advance(2100)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 5, 'first sight of the new screen: it might still be moving')
+  h.advance(2100)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 6, 'seen twice: it has settled')
+  h.cleanup()
+})
+
 test('a screen whose answer the gate rejected is asked again, a bounded number of times', async () => {
   // %166: a finished turn answered idle_ready at 0.46 was cached, the screen
   // stayed put, and the same rejected answer came back every tick for good.

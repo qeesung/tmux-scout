@@ -27,6 +27,11 @@
 // (n * maxProbability - 1) / (n - 1): adding or removing an outcome shifts the
 // scale, so thresholds must be re-tuned when the outcome list changes.
 
+// v5: every CLI's hints fill the same five slots (see HINT_SLOTS). Codex
+// gained what separates its working screen from its idle one — its composer
+// keeps the placeholder while a turn runs — and every quoted example is now in
+// the normalized form the model actually receives.
+//
 // v4: rewrote the Claude hints. They described a running turn by "esc to
 // interrupt", which current Claude Code no longer prints, and a glyph the
 // model never sees (normalization turns it into "*"); a finished turn's
@@ -55,7 +60,7 @@
 // the confidence scale for every other answer.
 const { lastLines } = require('./pane-capture')
 
-const PANE_QUESTION_SET_VERSION = 4
+const PANE_QUESTION_SET_VERSION = 5
 const BOTTOM_LINES = 8
 
 const AGENT_LABELS = Object.freeze({
@@ -76,37 +81,98 @@ const AGENT_LABELS = Object.freeze({
 // Per-CLI rendering notes. Kept to a few lines and held in the state rather
 // than forked into separate question sets, so there is one set to tune and one
 // set to test; adding a CLI is a data change.
-const AGENT_HINTS = Object.freeze({
-  // Written against the screen as the model receives it — normalized, so the
-  // animated glyph is "*" and every duration is "<dur>" — not as a person sees
-  // it; an example the model can never encounter is no example.
-  claude: [
-    'Its composer is a single line starting with "❯", drawn between two long horizontal rules. It stays on screen, usually empty, for the whole of a running turn, so an empty composer on its own does not mean the agent is idle.',
-    'A submitted instruction is echoed earlier in the transcript on a line that also starts with "❯".',
-    'Just above the composer, a running turn shows a status line of "*", a verb ending in "…" and a live counter in parentheses, such as "* Perambulating… (<dur> · ↓ <tok>)" or "* Infusing… (<dur> · thinking with high effort)". While that line is there the agent is working. A shell command still running also shows "(ctrl+b ctrl+b (twice) to run in background)".',
-    'A finished turn replaces it with a past-tense line such as "* Worked for <dur> · done 6:16 PM" or "* Churned for <dur> · done 11:00 AM · 1 shell still running", often followed by a "※ recap:" summary. With that line above an empty composer the turn is over and the agent is idle, even when its last message ends by asking the person something: a question it cannot continue without is drawn as a boxed option list instead.',
-    'Approval dialogs are boxed and list numbered options beginning with "1. Yes".',
-    'The bottom status line reads like "-- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)".'
-  ],
-  codex: [
-    'Its composer line starts with "»" and shows the grey placeholder "Ask Codex to do anything" when empty.',
-    'The bottom status line contains " · Ready · " when the agent is idle and waiting for a new instruction.',
-    'A finished turn prints a separator like "─ Worked for 3m 37s ─".',
-    'Tool activity is printed as indented lines such as "    Read config.yml" or "    Search TODO".'
-  ],
-  gemini: [
-    'Its composer is a box containing "> " with a footer showing the model name and remaining context percentage.',
-    'Tool confirmations ask "Apply this change?" with options "Yes, allow once / Yes, allow always / No".'
-  ],
-  traex: [
-    'Its composer shows a grey placeholder such as "Implement {feature}" when empty.',
-    'A finished turn prints "⏱ Worked for 7m 40s · done 2:42 PM".'
-  ]
+//
+// Every agent TUI has the same five things worth describing, so each CLI fills
+// the same slots and agentHints() renders them in one order. The slots are
+// what separates the outcomes: a CLI whose running turn was not described
+// scored 0.38 on a screen that was plainly working, because the generic
+// criteria describe no particular CLI and the model had to guess. A slot
+// nobody has seen on a real screen is left out, not guessed — an invented
+// example sends the model looking for text that is never there. Not yet seen:
+// traex while working, Gemini CLI while working or finished.
+//
+// Each slot is a complete sentence about its own subject, rendered without a
+// label. Prefixing the slot name ("Composer: …") was measured and bought
+// nothing; rewording the same facts cost Claude 0.05-0.10 of confidence on
+// finished screens. Change the wording only with `npm run jev-eval` and live
+// screens to compare against.
+//
+// Everything in double quotes is screen text AS THE MODEL RECEIVES IT, which is
+// not what a person sees: pane-capture normalizes the screen first, so an
+// animated glyph is "*", braille is gone, durations are "<dur>", token counts
+// "<tok>", percentages "<pct>", box-drawing runs "───", and whitespace is
+// collapsed. A test holds every quote to that. The Claude hints once quoted
+// "✻ Thinking… (12s · esc to interrupt)": a glyph normalization removes, a
+// duration it rewrites, and a phrase Claude Code no longer prints.
+const HINT_SLOTS = Object.freeze([
+  // What the input line looks like, and whether it stays up while a turn runs.
+  'composer',
+  // What only a running turn shows.
+  'working',
+  // What only a finished turn shows.
+  'finished',
+  // What the agent draws when it cannot go on without the person.
+  'waiting',
+  // What looks meaningful but reads the same in every state.
+  'chrome'
+])
+
+const AGENT_SCREENS = Object.freeze({
+  claude: {
+    composer:
+      'Its composer is a single line starting with "❯", drawn between two long horizontal rules. It stays on ' +
+      'screen, usually empty, for the whole of a running turn, so an empty composer on its own does not mean the ' +
+      'agent is idle. A submitted instruction is echoed earlier in the transcript on a line that also starts with ' +
+      '"❯".',
+    working:
+      'Just above the composer, a running turn shows a status line of "*", a verb ending in "…" and a live counter ' +
+      'in parentheses, such as "* Perambulating… (<dur> · ↓ <tok>)" or "* Infusing… (<dur> · thinking with high ' +
+      'effort)". While that line is there the agent is working. A shell command still running also shows ' +
+      '"(ctrl+b ctrl+b (twice) to run in background)".',
+    finished:
+      'A finished turn replaces it with a past-tense line such as "* Worked for <dur> · done 6:16 PM" or "* Churned ' +
+      'for <dur> · done 11:00 AM · 1 shell still running", often followed by a "※ recap:" summary. With that line ' +
+      'above an empty composer the turn is over and the agent is idle, even when its last message ends by asking ' +
+      'the person something: a question it cannot continue without is drawn as a boxed option list instead.',
+    waiting: 'Approval dialogs are boxed and list numbered options beginning with "1. Yes".',
+    chrome: 'The bottom status line reads like "-- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)".'
+  },
+  codex: {
+    composer:
+      'Its composer is a line starting with "»", showing the placeholder "Ask Codex to do anything" when empty. It ' +
+      'stays on screen, placeholder included, while a turn runs, so on its own it does not mean the agent is idle. ' +
+      'A submitted instruction is echoed in the transcript on a line starting with "›".',
+    working:
+      'A running turn shows a line such as "• Working (<dur> • esc to interrupt)" just above the composer, and ' +
+      '"Working" among the fields of the bottom status line. Older versions print a "─ Working ───" separator ' +
+      'instead, and the composer reads "» Esc to interrupt". Tool activity is printed as lines such as ' +
+      '"Read config.yml" or "Search TODO".',
+    finished:
+      'A finished turn shows a line such as "Worked for <dur> · done 11:33 AM" or "─ Worked for <dur> ───" above ' +
+      'the composer, and "Ready" among the fields of the bottom status line.',
+    chrome:
+      'Warnings starting with "⚠", such as an MCP server that failed to start, are startup noise rather than a ' +
+      'question.'
+  },
+  gemini: {
+    composer: 'Its composer is a box containing ">", with a footer showing the model name and the context left.',
+    waiting:
+      'Tool confirmations ask "Apply this change?" with the options "Yes, allow once", "Yes, allow always" and "No".'
+  },
+  traex: {
+    composer:
+      'Its composer is a line starting with "❯" between two "▄▄▄" banners, the upper one carrying the session ' +
+      'title, such as "▄▄▄ Analyze issue ▄". Empty, it shows a placeholder such as "Implement {feature}".',
+    finished: 'A finished turn prints a line such as "⏱ Worked for <dur> · done 2:42 PM" above the composer.',
+    chrome:
+      'The status line lists the model, the context left, the directory and the branch, such as "Test-O-New high · ' +
+      'Context <pct> left · ~/repos/example · main · No changes".'
+  }
 })
 
-const DEFAULT_HINTS = Object.freeze([
-  'Its composer is the input line at the very bottom, usually marked with ">", "›" or "❯".'
-])
+const GENERIC_SCREEN = Object.freeze({
+  composer: 'Its composer is the input line at the very bottom, usually marked with ">", "›" or "❯".'
+})
 
 const PANE_QUESTIONS = Object.freeze({
   screen_state: {
@@ -234,7 +300,8 @@ function agentLabel(agentType) {
 }
 
 function agentHints(agentType) {
-  return AGENT_HINTS[agentType] || DEFAULT_HINTS
+  const screen = AGENT_SCREENS[agentType] || GENERIC_SCREEN
+  return HINT_SLOTS.filter(slot => screen[slot]).map(slot => screen[slot])
 }
 
 // State is a JSON object rather than one blob so the rendering notes cannot be
@@ -259,7 +326,10 @@ function paneQuestions() {
 }
 
 module.exports = {
+  AGENT_SCREENS,
+  HINT_SLOTS,
   PANE_QUESTION_SET_VERSION,
+  agentHints,
   buildPaneState,
   paneQuestions
 }

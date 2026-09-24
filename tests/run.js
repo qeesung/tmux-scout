@@ -3421,6 +3421,33 @@ test('every question in the set is read by a decision', () => {
   }
 })
 
+test('every example quoted in the agent hints is text the model can actually receive', () => {
+  // The model reads the normalized screen, not the one a person sees. The
+  // Claude hints once quoted "✻ Thinking… (12s · esc to interrupt)" — a glyph
+  // normalization turns into "*" and a duration it rewrites to "<dur>" — and a
+  // plainly working screen scored 0.38.
+  const { AGENT_SCREENS, agentHints } = require('../scripts/lib/pane-questions')
+  for (const agent of [...Object.keys(AGENT_SCREENS), 'some-unknown-cli']) {
+    for (const hint of agentHints(agent)) {
+      for (const [, quoted] of hint.matchAll(/"([^"]+)"/g)) {
+        assert.strictEqual(normalizePaneText(quoted), quoted, `${agent}: "${quoted}" never appears on a normalized screen`)
+      }
+    }
+  }
+})
+
+test('every agent hint fills a known slot and every agent describes its composer', () => {
+  // A misspelt slot is not rendered at all, and would drop the hint silently.
+  const { AGENT_SCREENS, HINT_SLOTS, agentHints } = require('../scripts/lib/pane-questions')
+  const slots = new Set(HINT_SLOTS)
+  for (const [agent, screen] of Object.entries(AGENT_SCREENS)) {
+    for (const slot of Object.keys(screen)) assert.ok(slots.has(slot), `${agent}: unknown slot ${slot}`)
+    assert.ok(screen.composer, `${agent}: no composer`)
+    assert.strictEqual(agentHints(agent).length, Object.keys(screen).length)
+  }
+  assert.ok(agentHints('some-unknown-cli')[0].startsWith('Its composer'), 'an unknown CLI still gets the generic composer')
+})
+
 test('jev metrics report latency, tokens and what they cost', () => {
   let clock = 1_000_000
   const metrics = createPaneMetrics({ now: () => clock })

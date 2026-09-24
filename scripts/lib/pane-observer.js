@@ -343,9 +343,18 @@ function createPaneObserver(options = {}) {
           // it pauses everything; anything else backs off just this session.
           if (kind === 'rate-limited') sched.globalCooldownUntil = now() + DEFAULTS.globalCooldownMs
           else state.retryAfter = now() + DEFAULTS.errorBackoffMs
+          // Refused for what is on the screen, so the same screen is refused
+          // again: it is not re-sent until the screen changes. Retried on the
+          // error backoff instead, one pane showing key material was re-sent
+          // every minute for as long as it stayed on screen.
+          if (kind === 'forbidden') state.refusedFingerprint = capturedPane.fingerprint
           if (closed) return
           counters.errors++
-          if (log) log(`pane classify failed (${kind || 'unknown'}) for ${sessionId}`)
+          if (log) {
+            const detail = [result && result.status, result && result.error && String(result.error).slice(0, 120)]
+              .filter(Boolean).join(' ')
+            log(`pane classify failed (${kind || 'unknown'}${detail ? `: ${detail}` : ''}) for ${sessionId}`)
+          }
           return
         }
         sched.authFailing = false
@@ -457,6 +466,7 @@ function createPaneObserver(options = {}) {
 
       if (at < sched.globalCooldownUntil || at < state.retryAfter) continue
       if (state.pendingFingerprint === capturedPane.fingerprint) continue
+      if (state.refusedFingerprint === capturedPane.fingerprint) continue
       // The backoff is for a body that keeps scrolling to the same conclusion.
       // When the bottom of the screen moved — a dialog replaced the composer, the
       // turn ended — that is a different screen, and only the base interval

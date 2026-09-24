@@ -8,6 +8,16 @@ const os = require('os')
 const path = require('path')
 const TOML = require('../scripts/vendor/iarna-toml/toml')
 
+// Nothing here may read or change the tmux server the tests happen to run
+// under. Several scripts read tmux options — @scout-state-source among them —
+// and a developer running in jev mode turned hook-install tests into no-ops.
+// An empty socket directory means "no server", which is what every test
+// expects unless it puts a fake tmux on PATH itself.
+const TMUX_ISOLATION_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tmux-scout-test-'))
+process.env.TMUX_TMPDIR = TMUX_ISOLATION_DIR
+delete process.env.TMUX
+process.on('exit', () => fs.rmSync(TMUX_ISOLATION_DIR, { recursive: true, force: true }))
+
 const { DEFAULT_TAIL_BYTES, readFileTail, readJsonlFile, readJsonlIncremental, splitJsonlLines } = require('../scripts/lib/jsonl-tail-reader')
 const { applySessionEvent, currentPhase } = require('../scripts/lib/session-state')
 const { classifyCodexSession } = require('../scripts/lib/codex-session-classifier')
@@ -3642,6 +3652,16 @@ test('a queued pane wait never outruns a process exit found in the same tick', (
   // sweep can move it, because leaving a wait needs an explicit resolver no
   // sweep can send, and the dead session asks for attention forever.
   const dir = tempDir()
+  // Pane %1 exists; only its agent is gone. Without a reachable tmux the
+  // liveness sweeps stand down — tmux being unreachable is not evidence of
+  // anything — so the test brings its own.
+  const bin = path.join(dir, 'bin')
+  fs.mkdirSync(bin)
+  fs.writeFileSync(path.join(bin, 'tmux'),
+    '#!/bin/sh\ncase "$1" in list-panes) printf "%s\\n" "%1\t999998\tzsh\t0\twork\t0\twin\t/tmp" ;; *) exit 1 ;; esac\n',
+    { mode: 0o755 })
+  const savedPath = process.env.PATH
+  process.env.PATH = `${bin}:${savedPath}`
   try {
     const statusFile = path.join(dir, 'status.json')
     const now = Date.now()
@@ -3682,6 +3702,7 @@ test('a queued pane wait never outruns a process exit found in the same tick', (
       'a dead session must not be left asking for attention')
     assert.strictEqual(result.stats.paneModel.superseded, 1)
   } finally {
+    process.env.PATH = savedPath
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
@@ -5124,6 +5145,54 @@ test('fixtures are scored through the same capture pipeline as live panes', () =
   assert.ok(captured.text.endsWith(`line ${DEFAULT_TAIL_LINES + 19}`))
   const evalSource = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'dev', 'jev-eval.js'), 'utf-8')
   assert.ok(/captureFromText\(/.test(evalSource))
+})
+
+// --- live test round ---
+
+test('a 403 for one screen is not reported as a bad key', async () => {
+  // Every other pane was answered with the same key. Counted as `auth`, it read
+  // as a broken key and flagged the whole client for a rebuild.
+  const failing = status => createJevClient({
+    apiKey: 'test-key',
+    sdk: { TypeSafeClient: class { async systemOne() { throw Object.assign(new Error('refused'), { status }) } } }
+  })
+  const refused = await failing(403).classify({}, {})
+  assert.strictEqual(refused.errorKind, 'forbidden')
+  assert.strictEqual(refused.status, 403)
+  assert.strictEqual((await failing(401).classify({}, {})).errorKind, 'auth')
+})
+
+test('a screen the API refused is not re-sent until it changes', async () => {
+  // Retried on the error backoff, one pane showing key material was re-sent
+  // every minute for as long as it stayed on screen.
+  const h = observerHarness({ answers: [new Error('forbidden'), sampleAnswers('working')] })
+  await h.tick(paneStatus())
+  await new Promise(resolve => setImmediate(resolve))
+  assert.strictEqual(h.observer.stats().authFailing, false, 'the key is fine')
+  h.advance(120000)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1)
+  h.screens.set('%1', 'a different screen\nline two\nline three')
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 2)
+})
+
+test('the watcher logs why it stopped', async () => {
+  // Run under tmux run-shell -b, its stderr goes nowhere: a signal or an
+  // uncaught error used to leave a clean exit and no trace in the log.
+  const home = tempDir()
+  const child = spawn(process.execPath, [path.join(__dirname, '..', 'scripts', 'watcher.js'), 'run'], {
+    env: fakeTmuxEnv(home, {}), stdio: 'ignore'
+  })
+  const logFile = path.join(home, '.tmux-scout', 'watcher.log')
+  const started = Date.now()
+  while (Date.now() - started < 10000) {
+    if (fs.existsSync(logFile) && /started pid=/.test(fs.readFileSync(logFile, 'utf-8'))) break
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  child.kill('SIGTERM')
+  await new Promise(resolve => child.on('exit', resolve))
+  assert.ok(/stopped by SIGTERM/.test(fs.readFileSync(logFile, 'utf-8')))
 })
 
 test('the state source is either hooks or the pane model, never both', () => {

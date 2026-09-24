@@ -469,12 +469,24 @@ async function runLoop({ requireTmuxOption }) {
     removeOwnLock()
   }
   process.on('exit', shutdown)
+  // Every way out is logged. The daemon runs under `tmux run-shell -b`, so its
+  // stderr goes nowhere: a watcher that died from an uncaught error in some
+  // callback, or was sent a signal, used to leave a clean exit and no trace —
+  // and in jev mode, with no hooks, nothing else moves session state.
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(signal, () => {
+      appendLog(`stopped by ${signal} pid=${process.pid}`)
       shutdown()
       process.exit(0)
     })
   }
+  const fatal = kind => error => {
+    appendLog(`fatal: ${kind} ${error && error.stack ? error.stack : String(error)}`)
+    shutdown()
+    process.exit(1)
+  }
+  process.on('uncaughtException', fatal('uncaught exception'))
+  process.on('unhandledRejection', fatal('unhandled rejection'))
 
   appendLog(`started pid=${process.pid}`)
   const state = loadState()

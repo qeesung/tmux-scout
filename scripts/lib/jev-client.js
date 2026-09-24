@@ -96,7 +96,11 @@ function errorKindFor(error) {
   if (name === 'APIConnectionError') return 'offline'
   if (name === 'APIUserAbortError') return 'aborted'
   if (name === 'RateLimitError' || status === 429) return 'rate-limited'
-  if (name === 'AuthenticationError' || status === 401 || status === 403) return 'auth'
+  if (name === 'AuthenticationError' || status === 401) return 'auth'
+  // Not the key: a 403 came back for one pane's screen while every other pane
+  // was answered with the same key. Counted as `auth`, it read as a broken key
+  // and flagged the whole client for a rebuild over one screen.
+  if (name === 'PermissionDeniedError' || status === 403) return 'forbidden'
   if (Number.isFinite(status)) return 'http'
   return 'unknown'
 }
@@ -175,6 +179,7 @@ function createJevClient(options = {}) {
           ok: false,
           errorKind: errorKindFor(error),
           error: error && error.message,
+          status: error && Number.isFinite(error.status) ? error.status : undefined,
           latencyMs: Date.now() - started
         }
       }

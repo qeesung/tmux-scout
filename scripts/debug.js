@@ -150,8 +150,22 @@ function commandJevMetrics(args) {
     .filter(row => !agentFilter || String(row.agent).toLowerCase() === agentFilter)
 
   if (rows.length === 0) {
-    console.log(`no jev calls logged in the last ${args.since || '24h'}.`)
-    console.log('Per-call logging is opt-in: `tmux set -g @scout-jev-log-calls on`.')
+    // Said plainly, because "no calls logged" reads as "not running": this
+    // command reads the per-call log only, which is off unless asked for,
+    // while the live totals the watcher keeps are always there.
+    const { readTmuxOption } = require('./lib/state-source')
+    const logging = ['1', 'on', 'true', 'yes'].includes(String(readTmuxOption('@scout-jev-log-calls')).trim().toLowerCase())
+    const live = (readJson(path.join(pathsFromArgs(args).statusDir, 'watcher-state.json'), {}).paneModel || {}).jev
+    if (live && live.calls > 0) {
+      console.log(`the pane model is running: ${live.calls} calls since the watcher started ` +
+        `(live totals: \`scripts/setup.sh watcher status\`).`)
+    }
+    if (logging) {
+      console.log(`per-call logging is on, but no calls were logged in the last ${args.since || '24h'}.`)
+    } else {
+      console.log('per-call logging is off, so there is no history to show here.')
+      console.log('turn it on with `tmux set -g @scout-jev-log-calls on`; the watcher picks it up within 15s.')
+    }
     return
   }
 

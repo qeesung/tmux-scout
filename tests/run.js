@@ -5195,6 +5195,24 @@ test('the watcher logs why it stopped', async () => {
   assert.ok(/stopped by SIGTERM/.test(fs.readFileSync(logFile, 'utf-8')))
 })
 
+test('an empty call log is not reported as the pane model being off', () => {
+  // "no jev calls logged" read as "jev is not running" while it was making
+  // calls: the per-call log is opt-in, the live totals are always kept.
+  const home = tempDir()
+  try {
+    fs.mkdirSync(path.join(home, '.tmux-scout'), { recursive: true })
+    fs.writeFileSync(path.join(home, '.tmux-scout', 'watcher-state.json'),
+      JSON.stringify({ paneModel: { jev: { calls: 34 } } }))
+    const out = execFileSync(process.execPath, [path.join(__dirname, '..', 'scripts', 'debug.js'), 'jev-metrics'], {
+      encoding: 'utf-8', env: fakeTmuxEnv(home, {})
+    })
+    assert.ok(/pane model is running: 34 calls/.test(out), out)
+    assert.ok(/per-call logging is off/.test(out), out)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('the state source is either hooks or the pane model, never both', () => {
   const { STATE_SOURCES, stateSource } = require('../scripts/lib/state-source')
   // Unset means hooks: that is what every install predating this option had.

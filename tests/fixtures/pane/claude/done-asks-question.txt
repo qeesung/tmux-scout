@@ -1,0 +1,21 @@
+⏺ Review of the uncommitted changes — 5 findings:
+
+  1. retry.ts:42 — the backoff ceiling is never applied when the server sends
+     Retry-After, so a 429 with a long header stalls the queue.
+  2. fetcher.ts:118 — errors from the second attempt are swallowed.
+  3. fetcher.spec.ts — no test covers the ceiling.
+  4. config.ts:12 — the default timeout is read before the env override.
+  5. README — the retry section still describes linear backoff.
+
+  I'd fix 1–3 first: 1 and 2 lose requests, 3 is what would have caught them.
+  Want me to start with those?
+
+✻ Churned for 17m 51s · done 4:35 PM
+
+※ recap: you asked for a review of the uncommitted changes; it is done with 5
+  findings. Next: wait for you to confirm fixing 1–3.
+─────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────
+  󰉋 example-repo 󰘬 feature/retry  Opus 5 (1M context) ctx:58%
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents

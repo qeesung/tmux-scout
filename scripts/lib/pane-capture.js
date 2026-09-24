@@ -16,7 +16,7 @@
 // The same normalized text is both hashed and sent to the classifier, so a
 // cached answer always corresponds to the state that produced it.
 
-const { execFileSync } = require('child_process')
+const { execFileSync, spawnSync } = require('child_process')
 const crypto = require('crypto')
 
 const DEFAULT_TAIL_LINES = 40
@@ -133,6 +133,51 @@ function capturePaneTail(paneId, lines = DEFAULT_TAIL_LINES) {
   return captureFromText(paneId, captured, lines)
 }
 
+// capturePanes(paneIds, lines) -> Map<paneId, capture>, one tmux process for all
+// of them. Starting a process is the expensive part, not the capture: on a
+// machine where every spawn costs 60-190ms, twelve panes read one at a time
+// took most of a 2-second tick, and every pane waited three ticks for a turn.
+// As one command sequence, 46 panes read in about 160ms.
+//
+// Each pane's output is preceded by a line carrying a marker unique to the
+// call, which is what the output is split on; the pane id printed after it
+// says whose screen follows. A pane that closed since it was listed ends the
+// sequence — tmux stops at the first command that fails — so the panes after
+// it are read again by another call. A pane missing from the map was not read.
+function capturePanes(paneIds, lines = DEFAULT_TAIL_LINES, run = runTmux) {
+  const captures = new Map()
+  let pending = [...new Set((paneIds || []).filter(Boolean).map(String))]
+  while (pending.length > 0) {
+    const marker = `\u001fscout:${crypto.randomBytes(6).toString('hex')}:`
+    const args = []
+    for (const paneId of pending) {
+      if (args.length > 0) args.push(';')
+      args.push('display-message', '-p', '-t', paneId, `${marker}#{pane_id}`, ';', 'capture-pane', '-p', '-J', '-t', paneId)
+    }
+    const result = run(args)
+    if (!result || typeof result.stdout !== 'string') break
+    const segments = result.stdout.split(marker).slice(1)
+    segments.forEach((segment, index) => {
+      // The last segment of a failed sequence is the pane that failed.
+      if (result.status !== 0 && index === segments.length - 1) return
+      const newline = segment.indexOf('\n')
+      if (newline < 0 || segment.slice(0, newline) !== pending[index]) return
+      captures.set(pending[index], captureFromText(pending[index], segment.slice(newline + 1), lines))
+    })
+    if (result.status === 0 || segments.length === 0) break
+    pending = pending.slice(segments.length)
+  }
+  return captures
+}
+
+function runTmux(args) {
+  return spawnSync('tmux', args, {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    maxBuffer: 32 * 1024 * 1024
+  })
+}
+
 // The pure half of capturePaneTail, for callers that already have the text —
 // jev-eval replays fixtures through it, so what it scores is what production
 // would have sent.
@@ -149,6 +194,7 @@ function captureFromText(paneId, captured, lines = DEFAULT_TAIL_LINES) {
 module.exports = {
   DEFAULT_TAIL_LINES,
   capturePaneTail,
+  capturePanes,
   captureFromText,
   BRAILLE,
   bottomFingerprint,

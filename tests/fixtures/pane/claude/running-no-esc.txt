@@ -1,0 +1,16 @@
+⏺ Read(src/fetcher.ts)
+  ⎿  Read 212 lines
+
+⏺ Bash(./bin/run.js symbol search "retry policy" --top-n 2 --json 2>&1 | jq -c
+      '{n:(.results|length)}')
+  ⎿  {"n":2}
+
+⏺ Bash(npm test -- fetcher.spec.ts 2>&1 | tail -5)
+  ⎿  Running…
+
+✢ Perambulating… (4m 13s · ↓ 14.2k tokens · thinking more with high effort)
+─────────────────────────────────────── example-branch ─
+❯
+─────────────────────────────────────────────────────────────────────────────────
+  󰉋 example-repo 󰘬 feature/cache  Opus 5 ctx:71%
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents

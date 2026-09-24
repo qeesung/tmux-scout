@@ -24,7 +24,7 @@
 // would buy nothing and cost responsiveness: when a dialog closes and the screen
 // returns to a shape already seen, the session updates on the very next tick.
 
-const { capturePaneTail, DEFAULT_TAIL_LINES } = require('./pane-capture')
+const { capturePanes, DEFAULT_TAIL_LINES } = require('./pane-capture')
 const { answerCacheKey, createAnswerCache } = require('./pane-answer-cache')
 const { extractPromptAndTitle, extractToolLine } = require('./pane-text-extract')
 const {
@@ -64,11 +64,15 @@ const DEFAULTS = Object.freeze({
   requestsPerMinute: 30,
   errorBackoffMs: 60000,
   globalCooldownMs: 60000,
-  // A ceiling on subprocesses per tick. Captures are execSync, so on a machine
-  // with dozens of agent panes an uncapped loop would add real latency to the
-  // tick that the liveness sweeps share. Sessions are taken round-robin, so a
-  // capped tick delays a reading rather than starving one.
-  maxCapturesPerTick: 12
+  // A ceiling on panes read per tick. They are read in one tmux call, which
+  // costs a few milliseconds per pane rather than a process each, so this only
+  // bites on a wall of agents far past the usual; when it does, sessions are
+  // taken round-robin, so a capped tick delays a reading rather than starving
+  // one.
+  maxCapturesPerTick: 64,
+  // How many more times a screen whose answer the gate rejected is sent again.
+  // See dispatch().
+  maxReasks: 2
 })
 
 // Normalizes here rather than at each call site: this is the one place that
@@ -120,9 +124,17 @@ function createPaneObserver(options = {}) {
   const mode = normalizeMode(options.mode)
   const client = options.client || null
   const cache = options.cache || createAnswerCache()
-  const capture = typeof options.capture === 'function' ? options.capture : capturePaneTail
+  // `capture` reads one pane, for tests that script screens pane by pane.
+  const captureMany = typeof options.captureMany === 'function'
+    ? options.captureMany
+    : typeof options.capture === 'function'
+      ? (paneIds, lines) => new Map(paneIds.map(paneId => [paneId, options.capture(paneId, lines)]))
+      : capturePanes
   const now = typeof options.now === 'function' ? options.now : Date.now
   const log = typeof options.log === 'function' ? options.log : null
+  // Told when a paid answer lands. Otherwise it waited for the watcher's next
+  // tick, which on average added a whole second on top of the request itself.
+  const onReading = typeof options.onReading === 'function' ? options.onReading : null
   const thresholds = options.thresholds
   // Overridable so tests never touch the real ~/.tmux-scout.
   const shadowFile = options.shadowFile || SHADOW_FILE
@@ -147,6 +159,7 @@ function createPaneObserver(options = {}) {
   const maxCapturesPerTick = Number.isFinite(options.maxCapturesPerTick)
     ? options.maxCapturesPerTick
     : DEFAULTS.maxCapturesPerTick
+  const maxReasks = Number.isFinite(options.maxReasks) ? options.maxReasks : DEFAULTS.maxReasks
 
   // Everything request pacing depends on, in one object so a rebuild after a
   // settings change can inherit it whole. Rebuilt without it, the new observer
@@ -223,7 +236,8 @@ function createPaneObserver(options = {}) {
     emitted: 0,
     throttled: 0,
     budgetBlocked: 0,
-    captureCapped: 0
+    captureCapped: 0,
+    reasks: 0
   }
 
   function sessionState(sessionId) {
@@ -239,6 +253,10 @@ function createPaneObserver(options = {}) {
         lastPaidVerdict: null,
         paidRepeat: 0,
         pendingFingerprint: null,
+        // The newest screen the gate rejected, and how many times it has been
+        // sent again since; see dispatch().
+        rejectedFingerprint: null,
+        reasks: 0,
         shadowSignature: null
       }
       sessions.set(sessionId, state)
@@ -367,6 +385,7 @@ function createPaneObserver(options = {}) {
         if (key && cache.set(key, result)) sched.cacheDirty = true
         if (closed) return
         record(sessionId, session, result.answers, capturedPane, extracted, at, true)
+        if (onReading) onReading()
       }, error => {
         sched.inFlight--
         if (state.pendingFingerprint === capturedPane.fingerprint) state.pendingFingerprint = null
@@ -438,17 +457,13 @@ function createPaneObserver(options = {}) {
     // stand down for, which is exactly when a false completion becomes possible.
     const start = sched.cursor % claims.length
     const ordered = claims.slice(start).concat(claims.slice(0, start))
+    const batch = ordered.slice(0, maxCapturesPerTick)
+    counters.captureCapped += ordered.length - batch.length
+    const screens = captureMany(batch.map(claim => claim.session.tmuxPane), tailLines)
     const wanting = []
-    let captures = 0
 
-    for (const { sessionId, session } of ordered) {
-      if (captures >= maxCapturesPerTick) {
-        counters.captureCapped++
-        continue
-      }
-
-      const capturedPane = capture(session.tmuxPane, tailLines)
-      captures++
+    for (const { sessionId, session } of batch) {
+      const capturedPane = screens.get(session.tmuxPane)
       if (!capturedPane || !hasEnoughContent(capturedPane)) continue
       counters.captured++
 
@@ -458,10 +473,19 @@ function createPaneObserver(options = {}) {
 
       // Free and instant: no interval, no budget, no concurrency slot.
       const cached = key ? cache.get(key) : null
+      let reask = false
       if (cached && fromCurrentModel(cached)) {
         counters.cacheHits++
         record(sessionId, session, cached.answers, capturedPane, extractFor(capturedPane, agentType), at)
-        continue
+        // A weak answer is cached like any other, and on a screen that then
+        // stays put it is the only answer that screen ever gets. When the gate
+        // rejected it, that froze the session in whatever it showed before: a
+        // Claude turn that finished on a 0.46 idle_ready stayed BUSY for as
+        // long as the screen did. The model does not answer the same screen
+        // identically every time, so it is asked again — a bounded number of
+        // times, and never for an unreadable screen, which will not improve.
+        reask = state.rejectedFingerprint === capturedPane.fingerprint && state.reasks < maxReasks
+        if (!reask) continue
       }
 
       if (at < sched.globalCooldownUntil || at < state.retryAfter) continue
@@ -469,16 +493,17 @@ function createPaneObserver(options = {}) {
       if (state.refusedFingerprint === capturedPane.fingerprint) continue
       // The backoff is for a body that keeps scrolling to the same conclusion.
       // When the bottom of the screen moved — a dialog replaced the composer, the
-      // turn ended — that is a different screen, and only the base interval
-      // applies. Streaming output had otherwise pushed a newly shown approval
-      // dialog up to 30s back.
+      // turn ended — that is a different screen, read as soon as the minimum
+      // interval allows. Streaming output had pushed a newly shown approval
+      // dialog up to 30s back; the base interval still held a finished turn
+      // for up to 6s.
       const bottomMoved = state.lastPaidBottom !== capturedPane.bottom
-      const wait = bottomMoved ? intervalMs : effectiveInterval(state)
+      const wait = bottomMoved ? DEFAULTS.minIntervalMs : effectiveInterval(state)
       if (at - state.lastCallAt < wait) {
         counters.throttled++
         continue
       }
-      wanting.push({ sessionId, session, state, capturedPane, agentType })
+      wanting.push({ sessionId, session, state, capturedPane, agentType, reask })
     }
 
     // Paid calls go to whoever has waited longest, not to whoever comes first in
@@ -487,15 +512,19 @@ function createPaneObserver(options = {}) {
     // went unclassified for minutes — long enough for the idle sweeps to
     // complete sessions that were still working.
     wanting.sort((a, b) => a.state.lastCallAt - b.state.lastCallAt)
-    for (const { sessionId, session, state, capturedPane, agentType } of wanting) {
+    for (const { sessionId, session, state, capturedPane, agentType, reask } of wanting) {
       if (sched.inFlight >= concurrency || !takeToken(at)) {
         counters.budgetBlocked++
         continue
       }
+      if (reask) {
+        state.reasks++
+        counters.reasks++
+      }
       request(sessionId, session, state, capturedPane, extractFor(capturedPane, agentType), agentType, at)
     }
 
-    sched.cursor = (start + Math.max(1, captures)) % claims.length
+    sched.cursor = (start + Math.max(1, batch.length)) % claims.length
   }
 
   function extractFor(capturedPane, agentType) {
@@ -579,6 +608,16 @@ function createPaneObserver(options = {}) {
         currentPhase: phaseNow,
         thresholds
       })
+
+      const fingerprint = reading.capture && reading.capture.fingerprint
+      if (fingerprint && interp.gate === 'reject' && interp.verdict !== 'unknown') {
+        if (state.rejectedFingerprint !== fingerprint) {
+          state.rejectedFingerprint = fingerprint
+          state.reasks = 0
+        }
+      } else if (state.rejectedFingerprint === fingerprint) {
+        state.rejectedFingerprint = null
+      }
 
       if (reading.paid) {
         state.paidRepeat = state.lastPaidVerdict === interp.verdict ? state.paidRepeat + 1 : 1

@@ -1,0 +1,8 @@
+{
+  "name": "claude finished its turn with a question in its last message and the normal empty composer below",
+  "agent": "claude",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

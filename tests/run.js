@@ -4467,7 +4467,7 @@ test('the wait-exit bar stays above the accept bar however high that is set', ()
   }
 })
 
-test('a changed bottom of screen is read at the base interval despite a backoff', async () => {
+test('a changed bottom of screen is read at the minimum interval despite a backoff', async () => {
   // Streaming output reaching the same verdict backs a session off. A dialog
   // replacing the composer is a different screen, and was held up to 30s.
   let n = 0
@@ -4489,6 +4489,159 @@ test('a changed bottom of screen is read at the base interval despite a backoff'
   await h.tick(paneStatus())
   assert.strictEqual(h.calls.length, 6, 'the moved bottom is not')
   h.cleanup()
+})
+
+test('a changed bottom of screen waits the minimum interval, not the base one', async () => {
+  // A finished turn moves the bottom — the spinner line becomes "Worked for" —
+  // and waiting out the base 6s interval kept it BUSY that much longer.
+  let n = 0
+  let bottom = 'spinner'
+  const capture = paneId => {
+    const text = `body ${n++}\nline two\nline three\n${bottom}`
+    return { paneId, raw: text, text, fingerprint: `fp:${text}`, bottom }
+  }
+  const h = observerHarness({ observer: { capture } })
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1)
+  bottom = 'done'
+  h.advance(1500)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1, 'still inside the minimum interval')
+  h.advance(600)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 2, 'read 2.1s after the last call, not 6s')
+  h.advance(2100)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 2, 'a body that scrolls under an unchanged bottom still waits the base interval')
+  h.cleanup()
+})
+
+test('a screen whose answer the gate rejected is asked again, a bounded number of times', async () => {
+  // %166: a finished turn answered idle_ready at 0.46 was cached, the screen
+  // stayed put, and the same rejected answer came back every tick for good.
+  const weak = { screen_state: { type: 'choice', choice: 'idle_ready', confidence: 0.46 } }
+  const h = observerHarness({ answers: [weak], observer: { intervalMs: 2000 } })
+  h.screens.set('%1', 'finished\nline two\nline three')
+  for (let i = 0; i < 8; i++) {
+    await h.tick(paneStatus())
+    h.advance(40000)
+  }
+  assert.strictEqual(h.calls.length, 3, 'the first answer and two more')
+  assert.strictEqual(h.observer.stats().reasks, 2)
+
+  // A different rejected screen has its own allowance.
+  h.screens.set('%1', 'another\nline two\nline three')
+  for (let i = 0; i < 8; i++) {
+    await h.tick(paneStatus())
+    h.advance(40000)
+  }
+  assert.strictEqual(h.calls.length, 6)
+  h.cleanup()
+})
+
+test('a re-asked screen that is accepted moves the session and stops the re-asking', async () => {
+  const weak = { screen_state: { type: 'choice', choice: 'idle_ready', confidence: 0.46 } }
+  const h = observerHarness({ answers: [weak, sampleAnswers('idle_ready')], observer: { intervalMs: 2000 } })
+  h.screens.set('%1', 'finished\nline two\nline three')
+  const emitted = []
+  for (let i = 0; i < 6; i++) {
+    emitted.push(...await h.tick(paneStatus()))
+    h.advance(40000)
+  }
+  assert.strictEqual(h.calls.length, 2)
+  assert.ok(emitted.some(item => item.event.type === AGENT_EVENTS.TURN_COMPLETE), 'the accepted answer completes the turn')
+  h.cleanup()
+})
+
+test('an unreadable screen is not asked again', async () => {
+  // `unknown` is the model saying there is nothing to decide; asking again
+  // buys the same answer.
+  const unreadable = { screen_state: { type: 'choice', choice: 'unknown', confidence: 0.9 } }
+  const h = observerHarness({ answers: [unreadable], observer: { intervalMs: 2000 } })
+  for (let i = 0; i < 6; i++) {
+    await h.tick(paneStatus())
+    h.advance(40000)
+  }
+  assert.strictEqual(h.calls.length, 1)
+  h.cleanup()
+})
+
+test('a paid answer landing wakes the watcher; a cached one does not', async () => {
+  let woken = 0
+  const h = observerHarness({ observer: { onReading: () => woken++ } })
+  await h.tick(paneStatus())
+  assert.strictEqual(woken, 1)
+  h.advance(40000)
+  await h.tick(paneStatus())
+  assert.strictEqual(h.calls.length, 1, 'the same screen is answered from cache')
+  assert.strictEqual(woken, 1)
+  h.cleanup()
+})
+
+test('every pane a tick reads is captured in one call', async () => {
+  const batches = []
+  const captureMany = paneIds => {
+    batches.push(paneIds)
+    return new Map(paneIds.map(paneId => {
+      const text = `${paneId} one\ntwo\nthree`
+      return [paneId, { paneId, raw: text, text, fingerprint: `fp:${paneId}` }]
+    }))
+  }
+  const h = observerHarness({ observer: { captureMany } })
+  const status = { sessions: {} }
+  for (const n of [1, 2, 3]) {
+    status.sessions[`s${n}`] = { sessionId: `s${n}`, agentType: 'claude', tmuxPane: `%${n}`, phase: 'running', status: 'working', stateEvidence: [] }
+  }
+  await h.tick(status)
+  assert.deepStrictEqual(batches, [['%1', '%2', '%3']])
+  assert.strictEqual(h.calls.length, 3)
+  h.cleanup()
+})
+
+test('capturePanes reads many panes in one tmux call and resumes after one that closed', () => {
+  const { capturePanes } = require('../scripts/lib/pane-capture')
+  // %2 closed after it was listed. tmux prints the marker for it with an empty
+  // pane id, then stops the whole sequence at its capture-pane.
+  const screens = { '%1': 'one\n\n', '%3': 'three\n' }
+  const runs = []
+  const run = args => {
+    runs.push(args)
+    let stdout = ''
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === 'display-message') {
+        stdout += args[i + 4].replace('#{pane_id}', screens[args[i + 3]] ? args[i + 3] : '') + '\n'
+      } else if (args[i] === 'capture-pane') {
+        if (!screens[args[i + 4]]) return { status: 1, stdout }
+        stdout += screens[args[i + 4]]
+      }
+    }
+    return { status: 0, stdout }
+  }
+  const captures = capturePanes(['%1', '%2', '%3'], 40, run)
+  assert.deepStrictEqual([...captures.keys()], ['%1', '%3'])
+  assert.strictEqual(captures.get('%1').raw, 'one', 'trailing blank rows trimmed as for a single capture')
+  assert.strictEqual(captures.get('%3').raw, 'three')
+  assert.strictEqual(runs.length, 2)
+  assert.ok(!runs[1].includes('%1') && !runs[1].includes('%2'), 'the second call reads only what the first did not reach')
+  // Unavailable tmux reads nothing rather than throwing into the tick.
+  assert.strictEqual(capturePanes(['%1'], 40, () => ({ error: new Error('ENOENT'), stdout: null })).size, 0)
+})
+
+test('the tick timer wakes early on a landed answer, but not sooner than its minimum gap', async () => {
+  const { createTickTimer } = require('../scripts/watcher')
+  const timer = createTickTimer()
+  let started = Date.now()
+  const woken = timer.sleep(2000, 60)
+  setTimeout(() => timer.wake(), 5)
+  await woken
+  const early = Date.now() - started
+  assert.ok(early >= 55 && early < 1000, `woke after ${early}ms`)
+
+  // A wake between sleeps is not carried into the next one.
+  timer.wake()
+  started = Date.now()
+  await timer.sleep(150, 10)
+  assert.ok(Date.now() - started >= 140, 'a sleep nobody wakes runs its full length')
 })
 
 test('a cached answer with a different verdict ends the backoff', async () => {
@@ -9290,6 +9443,54 @@ test('sync applies exact Claude-only idle interrupt conditions', () => {
   }
 })
 
+// %166: the turn ended on a screen whose readings the gate rejected, so the
+// session kept the tool its last accepted reading saw — and a tool switched
+// the 120s fallback off, leaving it BUSY with nothing running.
+test('idle fallback is not switched off by a tool the pane model read off the screen', () => {
+  const dir = tempDir()
+  try {
+    const statusFile = path.join(dir, '.tmux-scout', 'status.json')
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true })
+    fs.mkdirSync(path.join(dir, '.tmux-scout', 'sessions'), { recursive: true })
+    const now = Date.now()
+    const running = (sessionId, stateSource) => ({
+      sessionId,
+      agentType: 'claude',
+      status: 'working',
+      phase: 'running',
+      stateSource,
+      startedAt: now - 600000,
+      lastUpdated: now - 300000,
+      activeTool: 'shell'
+    })
+    fs.writeFileSync(statusFile, JSON.stringify({
+      version: 1,
+      lastUpdated: now,
+      sessions: {
+        staleScreenTool: running('staleScreenTool', 'pane-model'),
+        watchedScreenTool: running('watchedScreenTool', 'pane-model'),
+        hookTool: running('hookTool', 'claude-hooks')
+      }
+    }, null, 2))
+
+    const result = sync.run(statusFile, {
+      reconcile: false,
+      codexMode: 'none',
+      claudeTranscript: false,
+      idleCompleteMs: 60000,
+      paneObservedAt: new Map([['watchedScreenTool', now - 1000]])
+    })
+
+    assert.strictEqual(currentPhase(result.status.sessions.staleScreenTool), 'completed')
+    // Still being read and accepted: a long command on a frozen screen.
+    assert.strictEqual(currentPhase(result.status.sessions.watchedScreenTool), 'running')
+    // A hook-announced tool is running until a hook says otherwise.
+    assert.strictEqual(currentPhase(result.status.sessions.hookTool), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('Claude long-running tool stays BUSY through the idle sweep', () => {
   const dir = tempDir()
   try {
@@ -12912,8 +13113,12 @@ test('codex jsonl discovery remains disabled for subagent sessions', () => {
 
 async function main() {
   let failed = 0
+  // TEST_FILTER=<substring> runs only the tests whose name contains it; the
+  // full suite takes minutes, which is too slow for checking one change.
+  const filter = process.env.TEST_FILTER
+  const selected = filter ? tests.filter(item => item.name.includes(filter)) : tests
 
-  for (const { name, fn } of tests) {
+  for (const { name, fn } of selected) {
     try {
       await fn()
       console.log(`ok - ${name}`)
@@ -12925,7 +13130,7 @@ async function main() {
   }
 
   console.log()
-  console.log(`${tests.length - failed}/${tests.length} tests passed.`)
+  console.log(`${selected.length - failed}/${selected.length} tests passed.`)
   if (failed > 0) process.exit(1)
 }
 

@@ -27,6 +27,17 @@
 // (n * maxProbability - 1) / (n - 1): adding or removing an outcome shifts the
 // scale, so thresholds must be re-tuned when the outcome list changes.
 
+// v4: rewrote the Claude hints. They described a running turn by "esc to
+// interrupt", which current Claude Code no longer prints, and a glyph the
+// model never sees (normalization turns it into "*"); a finished turn's
+// "Worked for … · done <time>" line was not described at all. Real screens
+// scored 0.38-0.56 — a running Bash rejected outright, a finished turn whose
+// last message asked a question accepted by 0.01 — and a rejected answer on a
+// screen that stays put holds the session in its old phase. The second case is
+// not Claude-specific: awaiting_answer now says the question must be drawn in
+// place of the composer, which is also the line hooks draw — a turn that ends
+// on a question in prose is a Stop, not a wait.
+//
 // v3: dropped `has_numbered_options` and `agent_exited`. Neither was read by any
 // decision — they only reached the shadow log — and each duplicated something
 // already being asked: `agent_exited` is the `shell_prompt` outcome of
@@ -44,7 +55,7 @@
 // the confidence scale for every other answer.
 const { lastLines } = require('./pane-capture')
 
-const PANE_QUESTION_SET_VERSION = 3
+const PANE_QUESTION_SET_VERSION = 4
 const BOTTOM_LINES = 8
 
 const AGENT_LABELS = Object.freeze({
@@ -66,10 +77,14 @@ const AGENT_LABELS = Object.freeze({
 // than forked into separate question sets, so there is one set to tune and one
 // set to test; adding a CLI is a data change.
 const AGENT_HINTS = Object.freeze({
+  // Written against the screen as the model receives it — normalized, so the
+  // animated glyph is "*" and every duration is "<dur>" — not as a person sees
+  // it; an example the model can never encounter is no example.
   claude: [
-    'Its composer is a single line starting with "❯", drawn between two long horizontal rules.',
+    'Its composer is a single line starting with "❯", drawn between two long horizontal rules. It stays on screen, usually empty, for the whole of a running turn, so an empty composer on its own does not mean the agent is idle.',
     'A submitted instruction is echoed earlier in the transcript on a line that also starts with "❯".',
-    'A running turn shows a line such as "✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)"; the leading glyph animates.',
+    'Just above the composer, a running turn shows a status line of "*", a verb ending in "…" and a live counter in parentheses, such as "* Perambulating… (<dur> · ↓ <tok>)" or "* Infusing… (<dur> · thinking with high effort)". While that line is there the agent is working. A shell command still running also shows "(ctrl+b ctrl+b (twice) to run in background)".',
+    'A finished turn replaces it with a past-tense line such as "* Worked for <dur> · done 6:16 PM" or "* Churned for <dur> · done 11:00 AM · 1 shell still running", often followed by a "※ recap:" summary. With that line above an empty composer the turn is over and the agent is idle, even when its last message ends by asking the person something: a question it cannot continue without is drawn as a boxed option list instead.',
     'Approval dialogs are boxed and list numbered options beginning with "1. Yes".',
     'The bottom status line reads like "-- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)".'
   ],
@@ -118,8 +133,11 @@ const PANE_QUESTIONS = Object.freeze({
       awaiting_answer:
         'The agent has stopped and is asking the person an open question, or offering a choice about WHAT it should ' +
         'do, rather than asking permission to run something it already decided on. It needs information or a ' +
-        'decision before it can continue. An empty composer waiting for a brand new instruction is NOT this: choose ' +
-        'idle_ready for that.',
+        'decision before it can continue. The question is drawn as a prompt of its own at the bottom — an option ' +
+        'list to pick from, or an input labelled as the answer to it — in place of the agent\'s normal composer. An ' +
+        'empty composer waiting for a brand new instruction is NOT this: choose idle_ready for that. Neither is a ' +
+        'question at the end of the agent\'s last message with its normal composer below: that turn is over, so ' +
+        'choose idle_ready.',
       working:
         'The agent is producing output or executing something right now. Typical shapes: an animated spinner; a ' +
         'live elapsed-time or token counter; words such as "Thinking", "Working", "Running", "Compacting"; a hint ' +
@@ -131,8 +149,9 @@ const PANE_QUESTIONS = Object.freeze({
         'composer may be empty, may show only a greyed-out placeholder hint, OR may contain text the person is ' +
         'still typing and has not sent yet — a half-written instruction sitting in the composer is still this ' +
         'outcome, because the agent is idle either way. A status line may read "Ready", "done", "Worked for ' +
-        '<duration>", or offer to clear the conversation. The previous answer above it is complete. There is no ' +
-        'question from the agent, no option list and no running indicator.',
+        '<duration>", or offer to clear the conversation. The previous answer above it is complete, and may end by ' +
+        'asking the person something. There is no question prompt drawn in place of the composer, no option list ' +
+        'and no running indicator.',
       shell_prompt:
         'The AI agent is not running at all. The bottom of the screen is an ordinary operating-system shell prompt: ' +
         'a line ending in "$", "%" or "#", or showing a username, hostname, directory path or git branch, with ' +

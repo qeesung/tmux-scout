@@ -1,0 +1,8 @@
+{
+  "name": "claude is working; the live status line no longer says esc to interrupt",
+  "agent": "claude",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

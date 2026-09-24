@@ -1231,7 +1231,13 @@ function sweepIdleRunningSessions(status, stats, options = {}) {
     if (!session || session.endedAt) continue
     if (session.agentType !== 'claude') continue
     if (currentPhase(session) !== 'running') continue
-    if (session.activeTool) continue
+    // A tool a hook announced is running until a hook says it finished. One
+    // the pane model read off the screen is only as current as its last
+    // accepted reading: when the readings stop being accepted, it is the last
+    // thing the screen showed before, and honouring it switched this fallback
+    // off for a turn that had already ended. A tool genuinely still running is
+    // protected by the fresh-observation check below.
+    if (session.activeTool && session.stateSource !== 'pane-model') continue
     if (session.isRemote) continue
 
     const updatedAt = Number.isFinite(session.lastUpdated) ? session.lastUpdated : 0

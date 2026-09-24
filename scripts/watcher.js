@@ -139,7 +139,7 @@ function startPaneObserver(settings = paneModelSettings(), carry = {}) {
   if (!client.available) {
     appendLog(`pane model ${settings.mode} requested but unavailable (${client.reason})`)
   }
-  const observer = createPaneObserver(Object.assign({ client, log: appendLog }, carry, settings))
+  const observer = createPaneObserver(Object.assign({ client, log: appendLog, onReading: tickTimer.wake }, carry, settings))
   appendLog(`pane model ${settings.mode} client=${client.available ? client.model : client.reason}`)
   return observer
 }
@@ -232,9 +232,41 @@ function pollPaneSettings(pane, deps = {}) {
   }
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+// The wait between ticks, cut short when a pane-model answer lands. Waiting
+// out the full interval instead left every answer unapplied for another second
+// on average after it had already been paid for and received.
+//
+// Never cut shorter than `minMs` after it began: requests started by one tick
+// tend to land together, and one tick applies all of them. Only a wake during
+// a sleep counts — the tick itself is synchronous, so no answer can land while
+// one runs, and one that lands between ticks is drained by the next anyway.
+function createTickTimer() {
+  let wakeUp = null
+  return {
+    wake() {
+      if (wakeUp) wakeUp()
+    },
+    sleep(ms, minMs = 0) {
+      return new Promise(resolve => {
+        const startedAt = Date.now()
+        let timer = setTimeout(finish, ms)
+        function finish() {
+          clearTimeout(timer)
+          wakeUp = null
+          resolve()
+        }
+        wakeUp = () => {
+          wakeUp = null
+          clearTimeout(timer)
+          timer = setTimeout(finish, Math.max(0, Math.min(ms, minMs) - (Date.now() - startedAt)))
+        }
+      })
+    }
+  }
 }
+
+const tickTimer = createTickTimer()
+const WAKE_MIN_GAP_MS = 300
 
 function readLock() {
   const lock = readJson(PID_FILE, null)
@@ -524,7 +556,7 @@ async function runLoop({ requireTmuxOption }) {
     }
 
     const fastIntervalMs = optionSeconds('@scout-watchdog-interval', DEFAULT_FAST_INTERVAL_MS, 1000)
-    await sleep(fastIntervalMs)
+    await tickTimer.sleep(fastIntervalMs, WAKE_MIN_GAP_MS)
   }
 
   appendLog(`stopped pid=${process.pid}`)
@@ -560,7 +592,8 @@ function formatPaneModelStats(stats) {
   const health = stats.available ? 'ready' : `unavailable(${stats.reason})`
   return `pane-model ${stats.mode} ${health} calls=${stats.calls} cacheHits=${stats.cacheHits} hitRate=${hitRate} ` +
     `emitted=${stats.emitted} applied=${stats.lastTickApplied || 0} superseded=${stats.lastTickSuperseded || 0} ` +
-    `stale=${stats.stale || 0} errors=${stats.errors} throttled=${stats.throttled} queued=${stats.queued}`
+    `stale=${stats.stale || 0} errors=${stats.errors} reasks=${stats.reasks || 0} throttled=${stats.throttled} ` +
+    `queued=${stats.queued}`
 }
 
 // Split from the line above rather than appended to it: that one is about
@@ -617,6 +650,7 @@ async function main() {
 }
 
 module.exports = {
+  createTickTimer,
   pollPaneSettings,
   refreshPaneObserver,
   runLoop,

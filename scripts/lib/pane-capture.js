@@ -144,7 +144,10 @@ function capturePaneTail(paneId, lines = DEFAULT_TAIL_LINES) {
 // says whose screen follows. A pane that closed since it was listed ends the
 // sequence — tmux stops at the first command that fails — so the panes after
 // it are read again by another call. A pane missing from the map was not read.
-function capturePanes(paneIds, lines = DEFAULT_TAIL_LINES, run = runTmux) {
+//
+// `memo` (pane -> its previous capture) is read and updated: a pane whose text
+// has not changed gets its previous capture back, not a new one.
+function capturePanes(paneIds, lines = DEFAULT_TAIL_LINES, run = runTmux, memo = null) {
   const captures = new Map()
   let pending = [...new Set((paneIds || []).filter(Boolean).map(String))]
   while (pending.length > 0) {
@@ -162,7 +165,10 @@ function capturePanes(paneIds, lines = DEFAULT_TAIL_LINES, run = runTmux) {
       if (result.status !== 0 && index === segments.length - 1) return
       const newline = segment.indexOf('\n')
       if (newline < 0 || segment.slice(0, newline) !== pending[index]) return
-      captures.set(pending[index], captureFromText(pending[index], segment.slice(newline + 1), lines))
+      const paneId = pending[index]
+      const capture = captureFromText(paneId, segment.slice(newline + 1), lines, memo && memo.get(paneId))
+      captures.set(paneId, capture)
+      if (memo) memo.set(paneId, capture)
     })
     if (result.status === 0 || segments.length === 0) break
     pending = pending.slice(segments.length)
@@ -181,14 +187,18 @@ function runTmux(args) {
 // The pure half of capturePaneTail, for callers that already have the text —
 // jev-eval replays fixtures through it, so what it scores is what production
 // would have sent.
-function captureFromText(paneId, captured, lines = DEFAULT_TAIL_LINES) {
+function captureFromText(paneId, captured, lines = DEFAULT_TAIL_LINES, previous = null) {
   // Trimmed here, once, so the prompt extractor gets the same bottom the
   // classifier does. It locates the composer inside a bottom window of a few
   // lines; with blank rows under it the composer falls outside that window and
   // an unsent draft is read back as the submitted prompt.
   const raw = withoutTrailingBlankRows(captured)
+  // The same text normalizes to the same everything. Normalizing is a dozen
+  // regular expressions over the whole screen, and most screens have not
+  // changed since they were last read.
+  if (previous && previous.paneId === paneId && previous.raw === raw && previous.lines === lines) return previous
   const text = normalizePaneText(lastLines(raw, lines))
-  return { paneId, raw, text, fingerprint: paneFingerprint(text), bottom: bottomFingerprint(text) }
+  return { paneId, raw, lines, text, fingerprint: paneFingerprint(text), bottom: bottomFingerprint(text) }
 }
 
 module.exports = {

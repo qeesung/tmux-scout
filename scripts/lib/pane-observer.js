@@ -129,11 +129,12 @@ function createPaneObserver(options = {}) {
     ? options.captureMany
     : typeof options.capture === 'function'
       ? (paneIds, lines) => new Map(paneIds.map(paneId => [paneId, options.capture(paneId, lines)]))
-      : capturePanes
+      : (paneIds, lines, memo) => capturePanes(paneIds, lines, undefined, memo)
   const now = typeof options.now === 'function' ? options.now : Date.now
   const log = typeof options.log === 'function' ? options.log : null
-  // Told when a paid answer lands. Otherwise it waited for the watcher's next
-  // tick, which on average added a whole second on top of the request itself.
+  // Told when a reading would change a session (see movesSession). Otherwise
+  // it waited for the watcher's next tick, which on average added a whole
+  // second on top of the request itself.
   const onReading = typeof options.onReading === 'function' ? options.onReading : null
   const thresholds = options.thresholds
   // Overridable so tests never touch the real ~/.tmux-scout.
@@ -223,6 +224,15 @@ function createPaneObserver(options = {}) {
 
   let closed = false
   let cachePersistedAt = 0
+  // The claims the last tick read, for scan() to re-read between ticks.
+  let lastBatch = []
+  // Pane -> its last capture. A screen whose text has not changed by a single
+  // character is handed back as the same object instead of being normalized
+  // and hashed again, which is most screens on most reads.
+  const screenMemo = new Map()
+  // Capture -> what the prompt and tool extractors found on it, for the same
+  // reason: an unchanged screen yields the same answer.
+  const extractionMemo = new WeakMap()
 
   // Handed over too: the spend metrics are, and a hit rate or paid share mixing
   // inherited calls with freshly zeroed cache hits reports nonsense.
@@ -331,9 +341,39 @@ function createPaneObserver(options = {}) {
   // `at` is always capture time, never response time. The reading describes the
   // screen as it was when it was read, and both the staleness check in
   // applyPaneEvents and the sweep stand-down depend on saying so honestly.
-  function record(sessionId, session, answers, capturedPane, extracted, at, paid) {
+  function record(sessionId, session, answers, capturedPane, extractedText, at, paid) {
     if (closed) return
-    readings.push({ sessionId, session, answers, capture: capturedPane, extracted, at, paid: paid === true })
+    readings.push({ sessionId, session, answers, capture: capturedPane, extracted: extractedText, at, paid: paid === true })
+    if (onReading && movesSession(sessionId, session, answers, capturedPane, extractedText, at)) onReading()
+  }
+
+  // Whether a reading would change the session it was taken against: the one
+  // kind worth running a tick early for. Waking for every reading had the
+  // watcher running a full tick after every paid answer and every changed
+  // screen, while applying one that changes nothing can wait for the next
+  // tick. Decided by the same function drain() uses, so the guards that keep a
+  // reading from emitting — a never-prompted session, a wait not yet proven
+  // over — keep it from waking anyone too. At most once per screen: a reading
+  // the registry then refuses would otherwise wake every tick for as long as
+  // the screen stayed put.
+  function movesSession(sessionId, session, answers, capturedPane, extractedText, at) {
+    if (mode !== MODES.ON) return false
+    const state = sessionState(sessionId)
+    const fingerprint = capturedPane && capturedPane.fingerprint
+    if (fingerprint && state.wokeFor === fingerprint) return false
+    const interp = interpretPaneAnswers(answers, {
+      agentType: session.agentType,
+      currentPhase: currentPhase(session),
+      thresholds
+    })
+    const moves = paneEventsFromInterpretation(interp, {
+      session,
+      capture: capturedPane,
+      extracted: extractedText,
+      now: at
+    }).length > 0
+    if (moves) state.wokeFor = fingerprint
+    return moves
   }
 
   function request(sessionId, session, state, capturedPane, extracted, agentType, at) {
@@ -387,7 +427,6 @@ function createPaneObserver(options = {}) {
         if (key && cache.set(key, result)) sched.cacheDirty = true
         if (closed) return
         record(sessionId, session, result.answers, capturedPane, extracted, at, true)
-        if (onReading) onReading()
       }, error => {
         sched.inFlight--
         if (state.pendingFingerprint === capturedPane.fingerprint) state.pendingFingerprint = null
@@ -461,23 +500,48 @@ function createPaneObserver(options = {}) {
     const ordered = claims.slice(start).concat(claims.slice(0, start))
     const batch = ordered.slice(0, maxCapturesPerTick)
     counters.captureCapped += ordered.length - batch.length
-    const screens = captureMany(batch.map(claim => claim.session.tmuxPane), tailLines)
+    lastBatch = batch
+    const batchPanes = new Set(batch.map(claim => claim.session.tmuxPane))
+    for (const pane of screenMemo.keys()) if (!batchPanes.has(pane)) screenMemo.delete(pane)
+    readScreens(batch, at, false)
+
+    sched.cursor = (start + Math.max(1, batch.length)) % claims.length
+  }
+
+  // Between ticks. A full tick runs the liveness sweeps, reads status.json and
+  // classifies every pane; this re-reads only the screens the last tick read,
+  // and does anything at all only for one that changed. Everything else is a
+  // string comparison: an unchanged pane is not even normalized again (see
+  // screenMemo). It exists to see a screen change up to a tick sooner — and
+  // to see it settle a tick sooner, which is when a finished turn is read.
+  function scan() {
+    if (closed || mode === MODES.OFF || !client || !client.available || lastBatch.length === 0) return
+    readScreens(lastBatch, now(), true)
+  }
+
+  function readScreens(batch, at, changesOnly) {
+    const screens = captureMany(batch.map(claim => claim.session.tmuxPane), tailLines, screenMemo)
     const wanting = []
 
     for (const { sessionId, session } of batch) {
       const capturedPane = screens.get(session.tmuxPane)
       if (!capturedPane || !hasEnoughContent(capturedPane)) continue
-      counters.captured++
 
       const agentType = String(session.agentType || '').toLowerCase()
       const state = sessionState(sessionId)
-      const key = answerCacheKey(agentType, PANE_QUESTION_SET_VERSION, capturedPane.fingerprint)
       // The same screen twice in a row: it has stopped changing. A working
       // agent's screen keeps moving, while a finished turn, a dialog or a
       // question sits still — so a screen settling is the moment worth reading,
       // whatever the agent. See the interval below.
       const settled = state.lastSeenFingerprint === capturedPane.fingerprint
+      // Between ticks, a screen is only worth anything when it moved or has
+      // just stopped moving; every other one was already read by the last
+      // tick and will be again by the next.
+      if (changesOnly && settled && !state.moving) continue
       state.lastSeenFingerprint = capturedPane.fingerprint
+      state.moving = !settled
+      const key = answerCacheKey(agentType, PANE_QUESTION_SET_VERSION, capturedPane.fingerprint)
+      counters.captured++
 
       // Free and instant: no interval, no budget, no concurrency slot.
       const cached = key ? cache.get(key) : null
@@ -534,16 +598,18 @@ function createPaneObserver(options = {}) {
       request(sessionId, session, state, capturedPane, extractFor(capturedPane, agentType), agentType, at)
     }
 
-    sched.cursor = (start + Math.max(1, batch.length)) % claims.length
   }
 
   function extractFor(capturedPane, agentType) {
     // Shadow compares phases only; the prompt, title and tool are never used.
     if (mode === MODES.SHADOW) return undefined
-    const extracted = extractPromptAndTitle(capturedPane.raw, agentType) || {}
+    const known = extractionMemo.get(capturedPane)
+    if (known && known.agentType === agentType) return known.value
+    const value = extractPromptAndTitle(capturedPane.raw, agentType) || {}
     const tool = extractToolLine(capturedPane.raw, agentType)
-    if (tool && tool.details) extracted.pendingDetails = tool.details
-    return extracted
+    if (tool && tool.details) value.pendingDetails = tool.details
+    extractionMemo.set(capturedPane, { agentType, value })
+    return value
   }
 
   // Shadow mode records what the model concluded without letting it act, and
@@ -800,6 +866,7 @@ function createPaneObserver(options = {}) {
     mode,
     dispatch,
     drain,
+    scan,
     // What a replacement observer should inherit when settings change at
     // runtime. The cache is the expensive part — rebuilding without it re-buys
     // every screen currently on the wall — and resetting the spend report on a

@@ -4619,17 +4619,108 @@ test('an unreadable screen is not asked again', async () => {
   h.cleanup()
 })
 
-test('a paid answer landing wakes the watcher; a cached one does not', async () => {
+test('a reading wakes the watcher only when it would change the session, once per screen', async () => {
+  // Waking for every answer ran a full tick after each one; one that agrees
+  // with the session changes nothing and can wait for the next tick.
   let woken = 0
-  const h = observerHarness({ observer: { onReading: () => woken++ } })
-  await h.tick(paneStatus())
-  assert.strictEqual(woken, 1)
-  h.advance(40000)
-  await h.tick(paneStatus())
-  assert.strictEqual(h.calls.length, 1, 'the same screen is answered from cache')
-  assert.strictEqual(woken, 1)
+  const agreeing = observerHarness({ answers: [sampleAnswers('working')], observer: { onReading: () => woken++ } })
+  await agreeing.tick(paneStatus())
+  assert.strictEqual(agreeing.calls.length, 1)
+  assert.strictEqual(woken, 0, 'working on a running session changes nothing')
+  agreeing.cleanup()
+
+  const finishing = observerHarness({ answers: [sampleAnswers('idle_ready')], observer: { onReading: () => woken++ } })
+  await finishing.tick(paneStatus())
+  assert.strictEqual(woken, 1, 'a finished turn on a running session does')
+  finishing.advance(40000)
+  finishing.observer.dispatch(paneStatus(), new Map())
+  assert.strictEqual(finishing.calls.length, 1, 'the same screen is answered from cache')
+  assert.strictEqual(woken, 1, 'and does not wake again for it')
+  finishing.cleanup()
+})
+
+test('between ticks an unchanged screen costs nothing, and a settling one is read at once', async () => {
+  // The scan re-reads screens every second between two full ticks. A screen
+  // that has not changed is skipped outright; one that has just stopped
+  // changing is the moment a finished turn is read, a whole tick sooner.
+  let body = 'body 0'
+  let n = 0
+  const capture = paneId => {
+    const text = `${body}\nline two\nline three\ncomposer`
+    return { paneId, raw: text, text, fingerprint: `fp:${text}`, bottom: 'composer' }
+  }
+  const h = observerHarness({ observer: { capture, intervalMs: 2000 } })
+  h.observer.scan()
+  assert.strictEqual(h.observer.stats().captured, 0, 'nothing to scan before the first tick')
+  // A working streak that backs the session off.
+  for (let i = 0; i < 5; i++) {
+    body = `body ${++n}`
+    h.advance(40000)
+    await h.tick(paneStatus())
+  }
+  assert.strictEqual(h.calls.length, 5)
+  // The tick saw a new screen, so the first scan is the one that sees it
+  // settle — answered from cache, since the tick already paid for it.
+  h.advance(1000)
+  h.observer.scan()
+  assert.strictEqual(h.calls.length, 5)
+  h.observer.drain()
+  const captured = h.observer.stats().captured
+  h.advance(1000)
+  h.observer.scan()
+  assert.strictEqual(h.observer.stats().captured, captured, 'after that, an unchanged screen is skipped')
+  assert.strictEqual(h.observer.drain().length, 0, 'and records nothing')
+
+  body = 'Worked for <dur> · done'
+  h.advance(1000)
+  h.observer.scan()
+  assert.strictEqual(h.calls.length, 5, 'first sight of the new screen: it might still be moving')
+  h.advance(1000)
+  h.observer.scan()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.strictEqual(h.calls.length, 6, 'seen twice: read without waiting for the tick')
+  h.advance(1000)
+  h.observer.scan()
+  assert.strictEqual(h.calls.length, 6, 'and not again once it has settled')
   h.cleanup()
 })
+
+test('capturePanes hands back the previous capture for a screen that has not changed', () => {
+  const { capturePanes } = require('../scripts/lib/pane-capture')
+  let text = 'one\ntwo\n'
+  const run = args => ({ status: 0, stdout: `${args[4].replace('#{pane_id}', args[3])}\n${text}` })
+  const memo = new Map()
+  const first = capturePanes(['%1'], 40, run, memo).get('%1')
+  assert.strictEqual(capturePanes(['%1'], 40, run, memo).get('%1'), first, 'not normalized again')
+  assert.notStrictEqual(capturePanes(['%1'], 30, run, memo).get('%1'), first, 'a different tail is a different capture')
+  text = 'one\nthree\n'
+  const changed = capturePanes(['%1'], 30, run, memo).get('%1')
+  assert.strictEqual(changed.raw, 'one\nthree')
+  assert.notStrictEqual(changed.fingerprint, first.fingerprint)
+})
+
+test('between two ticks the screens are scanned, unless a reading is waiting', async () => {
+  const { waitForNextTick } = require('../scripts/watcher')
+  const sleeps = []
+  let scans = 0
+  const observer = { scan: () => scans++ }
+  const timer = wakeAt => ({ sleep: async ms => { sleeps.push(ms); return sleeps.length === wakeAt } })
+  await waitForNextTick(timer(0), observer, 2000, 1000)
+  assert.deepStrictEqual(sleeps, [1000, 1000])
+  assert.strictEqual(scans, 1)
+
+  sleeps.length = 0
+  scans = 0
+  await waitForNextTick(timer(1), observer, 2000, 1000)
+  assert.deepStrictEqual(sleeps, [1000], 'woken: straight to the next tick')
+  assert.strictEqual(scans, 0)
+
+  // A scan that throws never ends the loop it runs in.
+  const logged = []
+  await waitForNextTick(timer(0), { scan() { throw new Error('boom') } }, 2000, 1000, line => logged.push(line))
+  assert.ok(logged[0].includes('boom'))
+})
+
 
 test('every pane a tick reads is captured in one call', async () => {
   const batches = []
@@ -4690,11 +4781,15 @@ test('the tick timer wakes early on a landed answer, but not sooner than its min
   const early = Date.now() - started
   assert.ok(early >= 55 && early < 1000, `woke after ${early}ms`)
 
-  // A wake between sleeps is not carried into the next one.
+  // A wake while no sleep runs — a reading recorded by a tick or a scan — cuts
+  // the next one short instead of being lost.
   timer.wake()
   started = Date.now()
-  await timer.sleep(150, 10)
-  assert.ok(Date.now() - started >= 140, 'a sleep nobody wakes runs its full length')
+  assert.strictEqual(await timer.sleep(2000, 30), true)
+  assert.ok(Date.now() - started < 1000, 'the next sleep is cut short')
+  started = Date.now()
+  assert.strictEqual(await timer.sleep(150, 10), false)
+  assert.ok(Date.now() - started >= 140, 'and only that one')
 })
 
 test('a cached answer with a different verdict ends the backoff', async () => {

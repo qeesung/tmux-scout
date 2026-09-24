@@ -232,33 +232,44 @@ function pollPaneSettings(pane, deps = {}) {
   }
 }
 
-// The wait between ticks, cut short when a pane-model answer lands. Waiting
-// out the full interval instead left every answer unapplied for another second
+// The wait between ticks, cut short when a reading would change a session.
+// Waiting out the full interval instead left it unapplied for another second
 // on average after it had already been paid for and received.
 //
 // Never cut shorter than `minMs` after it began: requests started by one tick
-// tend to land together, and one tick applies all of them. Only a wake during
-// a sleep counts — the tick itself is synchronous, so no answer can land while
-// one runs, and one that lands between ticks is drained by the next anyway.
+// tend to land together, and one tick applies all of them. A wake that comes
+// while no sleep is running is kept for the next one — a screen that changed
+// is read by a tick or by a scan, both synchronous, and a reading one of them
+// records must not then wait out a whole interval to be applied.
+//
+// sleep() resolves true when it was cut short.
 function createTickTimer() {
   let wakeUp = null
+  let pending = false
   return {
     wake() {
       if (wakeUp) wakeUp()
+      else pending = true
     },
     sleep(ms, minMs = 0) {
       return new Promise(resolve => {
         const startedAt = Date.now()
+        let woken = false
         let timer = setTimeout(finish, ms)
         function finish() {
           clearTimeout(timer)
           wakeUp = null
-          resolve()
+          resolve(woken)
         }
         wakeUp = () => {
           wakeUp = null
+          woken = true
           clearTimeout(timer)
           timer = setTimeout(finish, Math.max(0, Math.min(ms, minMs) - (Date.now() - startedAt)))
+        }
+        if (pending) {
+          pending = false
+          wakeUp()
         }
       })
     }
@@ -267,6 +278,28 @@ function createTickTimer() {
 
 const tickTimer = createTickTimer()
 const WAKE_MIN_GAP_MS = 300
+// How often screens are re-read between two full ticks. A finished turn is
+// read once its screen has been seen twice unchanged, so this spacing, not the
+// tick's, is what that waits on. One tmux call for every agent pane, and an
+// unchanged screen is a string comparison: about 1% of a core.
+const SCAN_INTERVAL_MS = 1000
+
+// Sleeps until the next full tick, re-reading screens every scanMs on the way.
+// Returns early when woken: a reading worth applying is waiting.
+async function waitForNextTick(timer, observer, intervalMs, scanMs = SCAN_INTERVAL_MS, log = appendLog) {
+  let left = intervalMs
+  while (left > scanMs) {
+    if (await timer.sleep(scanMs, WAKE_MIN_GAP_MS)) return
+    left -= scanMs
+    if (!observer) continue
+    try {
+      observer.scan()
+    } catch (error) {
+      log(`pane scan failed: ${error && error.message ? error.message : String(error)}`)
+    }
+  }
+  await timer.sleep(left, WAKE_MIN_GAP_MS)
+}
 
 function readLock() {
   const lock = readJson(PID_FILE, null)
@@ -494,6 +527,9 @@ async function runLoop({ requireTmuxOption }) {
     observer: startPaneObserver(initialSettings)
   }
   let settingsCheckedAt = Date.now()
+  // Read with the pane settings, not every tick: each read is a tmux process,
+  // and two of them every two seconds cost more than reading every screen.
+  let tickIntervalMs = optionSeconds('@scout-watchdog-interval', DEFAULT_FAST_INTERVAL_MS, 1000)
   const shutdown = () => {
     bridge.close()
     transcriptWatchManager.close()
@@ -535,11 +571,11 @@ async function runLoop({ requireTmuxOption }) {
   }
 
   while (true) {
-    if (requireTmuxOption && !watchdogEnabled()) break
-
     const at = Date.now()
     if (at - settingsCheckedAt >= SETTINGS_POLL_MS) {
       settingsCheckedAt = at
+      if (requireTmuxOption && !watchdogEnabled()) break
+      tickIntervalMs = optionSeconds('@scout-watchdog-interval', DEFAULT_FAST_INTERVAL_MS, 1000)
       const before = pane.observer
       pane = pollPaneSettings(pane)
       if (pane.observer !== before) state.paneModel = pane.observer ? pane.observer.stats() : undefined
@@ -555,8 +591,7 @@ async function runLoop({ requireTmuxOption }) {
       appendLog(`tick error: ${state.lastError}`)
     }
 
-    const fastIntervalMs = optionSeconds('@scout-watchdog-interval', DEFAULT_FAST_INTERVAL_MS, 1000)
-    await tickTimer.sleep(fastIntervalMs, WAKE_MIN_GAP_MS)
+    await waitForNextTick(tickTimer, pane.observer, tickIntervalMs)
   }
 
   appendLog(`stopped pid=${process.pid}`)
@@ -651,6 +686,7 @@ async function main() {
 
 module.exports = {
   createTickTimer,
+  waitForNextTick,
   pollPaneSettings,
   refreshPaneObserver,
   runLoop,

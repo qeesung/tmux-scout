@@ -5213,6 +5213,33 @@ test('an empty call log is not reported as the pane model being off', () => {
   }
 })
 
+test('a wait whose pane was closed does not wait forever', () => {
+  // The exit was refused on every pass — a wait only ends on its matching
+  // resolution, and nothing is left to send one. The status bar counted it as
+  // WAIT for days while the picker, which asks tmux, showed nothing.
+  const panes = new Map()
+  panes.tmuxAvailable = true
+  for (const [phase, pending] of [['waitingForAnswer', 'question'], ['waitingForApproval', 'approval']]) {
+    const session = {
+      sessionId: 'w1', agentType: 'codex', phase, status: 'working', tmuxPane: '%15',
+      pendingInteraction: { type: pending, phase }, stateEvidence: []
+    }
+    sync.sweepVanishedPanes({ version: 1, sessions: { w1: session } }, panes, sync.createStats())
+    assert.strictEqual(currentPhase(session), 'stale', phase)
+  }
+})
+
+test('a wait whose process died does not wait forever', () => {
+  const panes = new Map([['%15', { paneId: '%15', panePid: 4194303, paneDead: false }]])
+  panes.tmuxAvailable = true
+  const session = {
+    sessionId: 'w1', agentType: 'claude', phase: 'waitingForApproval', status: 'working', tmuxPane: '%15',
+    pid: 4194305, pendingInteraction: { type: 'approval', phase: 'waitingForApproval' }, stateEvidence: []
+  }
+  sync.sweepDeadProcesses({ version: 1, sessions: { w1: session } }, panes, processTableOf([]), sync.createStats())
+  assert.strictEqual(currentPhase(session), 'interrupted')
+})
+
 test('the state source is either hooks or the pane model, never both', () => {
   const { STATE_SOURCES, stateSource } = require('../scripts/lib/state-source')
   // Unset means hooks: that is what every install predating this option had.

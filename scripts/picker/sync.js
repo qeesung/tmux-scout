@@ -637,6 +637,30 @@ function sweepPidBindings(status, panes, processTable, stats) {
   }
 }
 
+// A wait ends only on its matching resolution, which only the agent — or the
+// screen — can send, and once the pane or the process is gone neither ever
+// will. Without this the exit that follows is refused on every pass, and a
+// session whose terminal was closed keeps asking for an answer indefinitely:
+// counted as WAIT by the status bar, which does not ask tmux which panes
+// exist, while the picker, which does, shows nothing. The resolver states
+// only what the vanished pane or process proves — the wait is over — and the
+// exit event then records why.
+function endOrphanedWait(status, sessionId, session, reason, source, now, stats) {
+  const phase = currentPhase(session)
+  const type = phase === 'waitingForApproval' ? AGENT_EVENTS.PERMISSION_RESOLVED
+    : phase === 'waitingForAnswer' ? AGENT_EVENTS.QUESTION_ANSWERED
+      : null
+  if (!type) return false
+  return applySessionUpdate(status, sessionId, session, {
+    type,
+    source,
+    rawEventName: `${source}_wait_orphaned`,
+    timestamp: now,
+    reason,
+    details: reason
+  }, stats)
+}
+
 function exitEventForSession(session, reason, source, now) {
   const phase = currentPhase(session)
   const active = phase === 'running' || phase === 'waitingForApproval' || phase === 'waitingForAnswer'
@@ -702,6 +726,7 @@ function sweepDeadProcesses(status, panes, processTable, stats) {
     }
 
     const reason = `pid ${session.pid} exited while pane ${session.tmuxPane} remained open`
+    changed = endOrphanedWait(status, sessionId, session, reason, 'pid', now, stats) || changed
     const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pid', now), stats)
     if (updated && stats) stats.reconcile.processExits++
     changed = updated || changed
@@ -725,6 +750,7 @@ function sweepVanishedPanes(status, panes, stats) {
     if (panes.has(session.tmuxPane)) continue
 
     const reason = `pane ${session.tmuxPane} no longer exists`
+    changed = endOrphanedWait(status, sessionId, session, reason, 'pane', now, stats) || changed
     const updated = applySessionUpdate(status, sessionId, session, exitEventForSession(session, reason, 'pane', now), stats)
     if (updated && stats) stats.reconcile.paneVanished++
     changed = updated || changed

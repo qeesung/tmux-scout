@@ -235,6 +235,19 @@ const EVENT_FOR_PHASE = Object.freeze({
 // Phases that claim a turn happened, which a never-prompted session has not had.
 const NO_TURN_WITHOUT_PROMPT = new Set([SESSION_PHASES.COMPLETED, SESSION_PHASES.INTERRUPTED])
 
+// How long after an agent starts its screen may still be a startup screen.
+// MCP servers usually boot in seconds; this leaves room for a slow one, and
+// costs only a delay in the one case it gets in the way of.
+const STARTUP_SCREEN_MS = 120000
+
+// A discovered session's startedAt is its agent process's start time, a hooked
+// one's is its SessionStart. Without either there is no telling, so the
+// startup guard stays up.
+function mayBeStartingUp(session, now) {
+  const started = Number(session.startedAt)
+  return !Number.isFinite(started) || now - started < STARTUP_SCREEN_MS
+}
+
 const RESOLVER_FOR_WAIT = Object.freeze({
   [SESSION_PHASES.WAITING_FOR_APPROVAL]: AGENT_EVENTS.PERMISSION_RESOLVED,
   [SESSION_PHASES.WAITING_FOR_ANSWER]: AGENT_EVENTS.QUESTION_ANSWERED
@@ -297,8 +310,13 @@ function paneEventsFromInterpretation(interp, options = {}) {
   // when the composer was found with no prompt echo above it — where the
   // extractor cannot find a composer at all, an absent prompt proves nothing,
   // and refusing there would keep a real first turn from ever showing.
+  //
+  // And only while the agent is young enough to be starting up. A session first
+  // seen mid-turn — discovered while the watcher was down — has no prompt on
+  // record, and its prompt echo has long scrolled away; refused for good, it
+  // showed IDLE through a turn that ran for as long as it ran.
   if (current === SESSION_PHASES.IDLE && neverPrompted && interp.phase === SESSION_PHASES.RUNNING &&
-    extracted && extracted.composer === true) return []
+    extracted && extracted.composer === true && mayBeStartingUp(session, now)) return []
 
   const targetIsWait = PENDING_INTERACTION_PHASES.has(interp.phase)
   const phaseDiffers = current !== interp.phase

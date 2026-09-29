@@ -5319,6 +5319,24 @@ test('a startup screen does not start a turn in a session never prompted', () =>
     .map(event => event.type), [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE])
 })
 
+test('a session first seen mid-turn is not held at idle once past startup', () => {
+  // Discovered while the watcher was down: no prompt on record, its echo long
+  // scrolled away, and a turn plainly running. Refused for good, it showed IDLE
+  // for as long as the turn ran.
+  const base = { sessionId: 's1', agentType: 'codex', phase: 'idle', status: 'idle', stateEvidence: [] }
+  const noEcho = { confidence: 'none', composer: true }
+  const now = 10 * 60 * 1000
+  const running = Object.assign({ startedAt: now - 5 * 60 * 1000 }, base)
+  assert.deepStrictEqual(paneEvents(confidently('working'), running, { options: { extracted: noEcho, now } })
+    .map(event => event.type), [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE])
+  // Seconds after the agent started, the same screen may be MCP servers booting.
+  const booting = Object.assign({ startedAt: now - 10 * 1000 }, base)
+  assert.deepStrictEqual(paneEvents(confidently('working'), booting, { options: { extracted: noEcho, now } }), [])
+  // Age says nothing about whether a turn happened: an empty composer still
+  // does not complete one nobody sent.
+  assert.deepStrictEqual(paneEvents(confidently('idle_ready'), running, { options: { extracted: noEcho, now } }), [])
+})
+
 test('the extractor reports whether it found the composer', () => {
   const { extractPromptAndTitle: extract } = require('../scripts/lib/pane-text-extract')
   assert.strictEqual(extract(['  Booting MCP server: github', '› Ask Codex to do anything', '  gpt · repo'].join('\n'), 'codex').composer, true)

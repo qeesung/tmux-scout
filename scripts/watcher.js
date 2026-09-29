@@ -508,6 +508,23 @@ async function startOptionalBridge(start = startBridgeServer, log = appendLog) {
   }
 }
 
+// Whether an unhandled rejection is the leftover of a request that was already
+// aborted and answered for, rather than something wrong in the watcher.
+//
+// The TypeSafe SDK aborts a request on its own timeout. When that lands after
+// the response headers but before the body, Node's fetch cancels the body
+// stream it has just errored and rethrows the AbortError from a promise nobody
+// can reach — the SDK has already rejected the call as a timeout, the observer
+// has handled that, and nothing is left undone. Treated as fatal, one slow
+// response took the watcher down, and in jev mode every session froze until
+// tmux next loaded its config.
+//
+// Only AbortError: nothing in the watcher aborts anything but a request, and
+// every other rejection may be a loop that has actually stopped.
+function isAbortedRequestLeftover(reason) {
+  return Boolean(reason) && reason.name === 'AbortError'
+}
+
 async function runLoop({ requireTmuxOption }) {
   ensureDir()
 
@@ -554,7 +571,13 @@ async function runLoop({ requireTmuxOption }) {
     process.exit(1)
   }
   process.on('uncaughtException', fatal('uncaught exception'))
-  process.on('unhandledRejection', fatal('unhandled rejection'))
+  process.on('unhandledRejection', reason => {
+    if (isAbortedRequestLeftover(reason)) {
+      appendLog(`ignored an aborted request's leftover rejection: ${reason.message}`)
+      return
+    }
+    fatal('unhandled rejection')(reason)
+  })
 
   appendLog(`started pid=${process.pid}`)
   const state = loadState()
@@ -693,6 +716,7 @@ module.exports = {
   runTick,
   startOptionalBridge,
   formatPaneModelStats,
+  isAbortedRequestLeftover,
   paneModelSettings,
   optionEnabled,
   watchdogEnabled

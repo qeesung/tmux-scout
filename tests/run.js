@@ -5478,6 +5478,53 @@ test('a screen the API refused is not re-sent until it changes', async () => {
   assert.strictEqual(h.calls.length, 2)
 })
 
+test('an aborted request\'s leftover rejection does not stop the watcher', () => {
+  const { isAbortedRequestLeftover } = require('../scripts/watcher')
+  assert.strictEqual(isAbortedRequestLeftover(new DOMException('This operation was aborted', 'AbortError')), true)
+  // Anything else may be a loop that has actually stopped, and stays fatal.
+  assert.strictEqual(isAbortedRequestLeftover(new Error('boom')), false)
+  assert.strictEqual(isAbortedRequestLeftover(new TypeError('x is undefined')), false)
+  assert.strictEqual(isAbortedRequestLeftover(undefined), false)
+})
+
+test('the TypeSafe SDK\'s leftover from a body cut off by its timeout is recognized', () => {
+  // The crash as it happened: headers arrive, the body stalls past the SDK's
+  // timeout, the call is rejected as a timeout — and a second, unreachable
+  // AbortError is left over. Through the real SDK, so a change in what it
+  // leaves behind shows up here rather than as a dead watcher.
+  let sdkPresent = true
+  try { require.resolve('@typesafe-ai/sdk') } catch (_) { sdkPresent = false }
+  const nodeMajor = Number.parseInt(String(process.versions.node).split('.')[0], 10)
+  if (!sdkPresent || nodeMajor < 20) return
+
+  const script = `
+    const http = require('http')
+    const { createJevClient } = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'jev-client'))})
+    const { isAbortedRequestLeftover } = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'watcher'))})
+    process.on('unhandledRejection', reason => {
+      console.log('leftover=' + isAbortedRequestLeftover(reason))
+      process.exit(0)
+    })
+    const server = http.createServer((request, response) => {
+      request.resume()
+      request.on('end', () => {
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.write('{"answers":')
+      })
+    })
+    server.listen(0, '127.0.0.1', async () => {
+      process.env.TYPESAFE_BASE_URL = 'http://127.0.0.1:' + server.address().port
+      const questions = { q: { type: 'noul', instructions: 'Is it?' } }
+      const result = await createJevClient({ apiKey: 'test-key', timeoutMs: 200 }).classify('screen', questions)
+      console.log('classify=' + result.errorKind)
+      setTimeout(() => { console.log('no-leftover'); process.exit(0) }, 1000)
+    })
+  `
+  const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf-8', timeout: 10000 })
+  assert.ok(/classify=timeout/.test(out), out)
+  assert.ok(!/leftover=false/.test(out), `a leftover the watcher would still die of:\n${out}`)
+})
+
 test('the watcher logs why it stopped', async () => {
   // Run under tmux run-shell -b, its stderr goes nowhere: a signal or an
   // uncaught error used to leave a clean exit and no trace in the log.

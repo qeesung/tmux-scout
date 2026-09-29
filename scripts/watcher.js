@@ -10,6 +10,7 @@ const sync = require('./picker/sync')
 const { ClaudeTranscriptWatchManager } = require('./lib/claude-transcript-watcher')
 const { startBridgeServer } = require('./lib/bridge-server')
 const { createPaneObserver, normalizeMode, toAgentSet, DEFAULTS: PANE_DEFAULTS } = require('./lib/pane-observer')
+const { clearStopped, markStopped } = require('./lib/watcher-revive')
 const {
   effectivePaneMode,
   paneModelAgents,
@@ -534,6 +535,8 @@ async function runLoop({ requireTmuxOption }) {
   if (existing && existing.pid !== process.pid && isPidAlive(existing.pid)) return
 
   writeLock()
+  // Whoever stopped the last watcher on purpose is overruled by starting one.
+  clearStopped(STATUS_DIR)
   process.env.TMUX_SCOUT_BRIDGE_SERVER = '1'
   const bridge = await startOptionalBridge()
   const transcriptWatchManager = new ClaudeTranscriptWatchManager(STATUS_FILE, appendLog)
@@ -671,6 +674,9 @@ function formatJevStats(stats) {
 }
 
 function stop(quiet) {
+  // Before anything else, so the status bar does not revive what is being
+  // stopped, even when there turns out to be nothing to stop.
+  markStopped(STATUS_DIR)
   const lock = readLock()
   if (!lock || !isPidAlive(lock.pid)) {
     if (!quiet) console.log('stopped')

@@ -143,6 +143,9 @@ function renderStatusBar(counts, fmt, clickOption, clickStyle) {
 }
 
 function main() {
+  // The widget runs every status-interval, which makes it the one thing that
+  // notices a dead watcher in time. It cannot fail here; see reviveWatcher.
+  require(path.join(__dirname, 'lib', 'watcher-revive')).reviveWatcher({ by: 'status bar' })
   const status = readJson(STATUS_FILE, null)
   if (!status) process.exit(0)
 

@@ -5525,6 +5525,97 @@ test('the TypeSafe SDK\'s leftover from a body cut off by its timeout is recogni
   assert.ok(!/leftover=false/.test(out), `a leftover the watcher would still die of:\n${out}`)
 })
 
+test('a dead watcher is revived once it has been gone a while, and not more than once a minute', () => {
+  const { REVIVE_GRACE_MS, REVIVE_INTERVAL_MS, reviveWatcher } = require('../scripts/lib/watcher-revive')
+  const dir = tempDir()
+  const starts = []
+  let clock = 1_000_000
+  const revive = (overrides = {}) => reviveWatcher(Object.assign({
+    dir,
+    now: clock,
+    by: 'test',
+    isAlive: () => false,
+    readOption: () => '',
+    start: script => starts.push(script)
+  }, overrides))
+  fs.writeFileSync(path.join(dir, 'watcher.pid'), JSON.stringify({ pid: 424242 }))
+
+  // Alive: nothing to do, and no tmux call made to find that out.
+  assert.strictEqual(revive({ isAlive: () => true, readOption: () => { throw new Error('asked tmux') } }), 'running')
+
+  // Gone: not at once — tmux starting the plugin starts one too, and racing it
+  // could leave two.
+  assert.strictEqual(revive(), 'pending')
+  clock += REVIVE_GRACE_MS - 1
+  assert.strictEqual(revive(), 'pending')
+  clock += 1
+  assert.strictEqual(revive(), 'revived')
+  assert.strictEqual(starts.length, 1)
+  assert.ok(starts[0].endsWith(path.join('scripts', 'watcher.js')))
+  assert.ok(/revived by test: pid=424242 was gone/.test(fs.readFileSync(path.join(dir, 'watcher.log'), 'utf-8')))
+
+  // One that dies again straight away is not respawned every few seconds.
+  clock += REVIVE_GRACE_MS
+  assert.strictEqual(revive(), 'pending')
+  clock += REVIVE_GRACE_MS
+  assert.strictEqual(revive(), 'throttled')
+  clock += REVIVE_INTERVAL_MS
+  assert.strictEqual(revive(), 'revived')
+  assert.strictEqual(starts.length, 2)
+
+  // Seen alive, the grace period starts over the next time it is gone.
+  assert.strictEqual(revive({ isAlive: () => true }), 'running')
+  clock += REVIVE_INTERVAL_MS
+  assert.strictEqual(revive(), 'pending')
+})
+
+test('a watcher stopped on purpose, switched off, or outside tmux is not revived', () => {
+  const { REVIVE_GRACE_MS, markStopped, clearStopped, reviveWatcher } = require('../scripts/lib/watcher-revive')
+  const dir = tempDir()
+  const starts = []
+  const revive = (now, overrides = {}) => reviveWatcher(Object.assign({
+    dir, now, isAlive: () => false, readOption: () => '', start: () => starts.push(now)
+  }, overrides))
+
+  markStopped(dir)
+  assert.strictEqual(revive(0), 'stopped')
+  assert.strictEqual(revive(REVIVE_GRACE_MS * 2), 'stopped')
+  clearStopped(dir)
+
+  assert.strictEqual(revive(0, { readOption: () => 'off' }), 'disabled')
+  // tmux unreachable is how tests and scripts outside a server look; nothing
+  // may be written there either.
+  assert.strictEqual(revive(0, { readOption: () => { throw new Error('no server') } }), 'no-tmux')
+  assert.deepStrictEqual(fs.readdirSync(dir), [])
+  assert.strictEqual(starts.length, 0)
+})
+
+test('watcher stop leaves the marker that keeps it stopped, and a start clears it', async () => {
+  const home = tempDir()
+  const marker = path.join(home, '.tmux-scout', 'watcher.stopped')
+  const watcher = path.join(__dirname, '..', 'scripts', 'watcher.js')
+  const env = fakeTmuxEnv(home, {})
+
+  // Even with nothing running: stopping is a statement about what the user wants.
+  execFileSync(process.execPath, [watcher, 'stop', '--quiet'], { env })
+  assert.ok(fs.existsSync(marker))
+
+  const child = spawn(process.execPath, [watcher, 'run'], { env, stdio: 'ignore' })
+  const logFile = path.join(home, '.tmux-scout', 'watcher.log')
+  const started = Date.now()
+  while (Date.now() - started < 10000) {
+    if (fs.existsSync(logFile) && /started pid=/.test(fs.readFileSync(logFile, 'utf-8'))) break
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  try {
+    assert.ok(!fs.existsSync(marker), 'a watcher that starts overrules the last stop')
+  } finally {
+    execFileSync(process.execPath, [watcher, 'stop', '--quiet'], { env })
+    await new Promise(resolve => child.on('exit', resolve))
+  }
+  assert.ok(fs.existsSync(marker))
+})
+
 test('the watcher logs why it stopped', async () => {
   // Run under tmux run-shell -b, its stderr goes nowhere: a signal or an
   // uncaught error used to leave a clean exit and no trace in the log.

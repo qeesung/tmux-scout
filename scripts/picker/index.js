@@ -10,6 +10,8 @@ let cached
 try {
   const sync = require('./sync')
   const watcherRunning = sync.isWatcherRunning()
+  // For whoever has no status bar widget: opening the picker brings it back.
+  if (!watcherRunning) require('../lib/watcher-revive').reviveWatcher({ by: 'picker' })
   // When the watcher owns reconciliation, the picker must not run the sweeps
   // that force a session to a terminal state. idleComplete belongs with the
   // others: only the watcher can see which sessions the pane model is currently

@@ -197,7 +197,7 @@ set -g @scout-status-format '{W}/{B}/{D}'         # 自定义分隔符
 set -g @scout-status-format '{W} wait {B} busy'   # 带标签
 ```
 
-占位符：`{W}` 等待，`{B}` 工作中，`{D}` 已完成，`{I}` 空闲，`{A}` 审批等待，`{Q}` 问题/回答等待，`{P}` 计划确认等待，`{T}` 活跃会话总数。
+占位符：`{W}` 等待，`{B}` 工作中，`{D}` 已完成，`{I}` 空闲，`{A}` 审批等待，`{Q}` 问题/回答等待，`{P}` 计划确认等待，`{T}` 活跃会话总数，`{J}` 读屏失效时的警告（见[从屏幕读取状态](#从屏幕读取状态可选默认关闭)）。格式里没写 `{J}` 时，警告也会显示在最前面。
 
 状态栏点击行为：
 
@@ -344,6 +344,20 @@ tmux set -g @scout-jev-log-calls on
 node scripts/debug.js jev-metrics --since 24h
 node scripts/debug.js classify %39 --state
 ```
+
+**读屏失效时。** 以屏幕为状态来源时，读屏拿不到答案，所有会话就会一直停在最后显示的状态。所以读屏失效期间，状态栏最前面会显示红色的 `⚠ jev <代码>`，picker 的标题行会直接说明出了什么问题：
+
+| 代码 | 含义 |
+|---|---|
+| `451` | API 拒绝当前网络（所在地区不可用） |
+| `401` | API key 被拒绝 |
+| `429` | API 在限流 |
+| `offline` / `timeout` | 连不上 API，或者 API 没有及时响应 |
+| `503` 等状态码 | API 返回了这个 HTTP 错误 |
+| `no key` / `no sdk` / `node` | 客户端无法创建：见上面的前置条件 |
+| `down` / `stopped` | watchdog 没有在运行，没有任何东西在读屏 |
+
+单次请求失败不算：要连续失败 3 次、中间没有一次成功才会报，只要成功一次就恢复。某张画面单独被拒绝不计入。只有 `@scout-state-source jev` 时才会报；`shadow` 模式下状态仍由 hook 驱动。`watcher status` 里也会显示为 `failing(<代码>)`。
 
 **局限。**
 

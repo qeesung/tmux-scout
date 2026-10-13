@@ -101,6 +101,9 @@ function errorKindFor(error) {
   // was answered with the same key. Counted as `auth`, it read as a broken key
   // and flagged the whole client for a rebuild over one screen.
   if (name === 'PermissionDeniedError' || status === 403) return 'forbidden'
+  // The service refusing this network, not this request: every call from here
+  // gets the same answer until the network changes.
+  if (status === 451) return 'region'
   if (Number.isFinite(status)) return 'http'
   return 'unknown'
 }

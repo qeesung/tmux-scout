@@ -11,6 +11,7 @@ const { ClaudeTranscriptWatchManager } = require('./lib/claude-transcript-watche
 const { startBridgeServer } = require('./lib/bridge-server')
 const { createPaneObserver, normalizeMode, toAgentSet, DEFAULTS: PANE_DEFAULTS } = require('./lib/pane-observer')
 const { clearStopped, markStopped } = require('./lib/watcher-revive')
+const { describe: describePaneHealth, writePaneHealth } = require('./lib/pane-health')
 const {
   effectivePaneMode,
   paneModelAgents,
@@ -582,6 +583,18 @@ async function runLoop({ requireTmuxOption }) {
     fatal('unhandled rejection')(reason)
   })
 
+  // Written when the verdict changes, and once at start so a report left by a
+  // watcher that died is replaced by this one's.
+  let healthSignature = null
+  const reportHealth = health => {
+    const signature = JSON.stringify([health.mode, health.ok, health.kind, health.status, health.since])
+    if (signature === healthSignature) return
+    if (!writePaneHealth(Object.assign({ at: Date.now(), pid: process.pid }, health))) return
+    healthSignature = signature
+    const problem = describePaneHealth(health)
+    appendLog(problem ? `screen reading failing: ${problem.text}` : `screen reading ${health.mode === 'on' ? 'healthy' : health.mode}`)
+  }
+
   appendLog(`started pid=${process.pid}`)
   const state = loadState()
   // loadState() restores whatever the previous watcher persisted. With the
@@ -616,6 +629,7 @@ async function runLoop({ requireTmuxOption }) {
       try { writeJsonAtomic(STATE_FILE, state) } catch (_) {}
       appendLog(`tick error: ${state.lastError}`)
     }
+    reportHealth(pane.observer ? pane.observer.health() : { mode: 'off', ok: true })
 
     await waitForNextTick(tickTimer, pane.observer, tickIntervalMs)
   }
@@ -650,7 +664,8 @@ function status() {
 function formatPaneModelStats(stats) {
   if (!stats || !stats.mode || stats.mode === 'off') return ''
   const hitRate = Number.isFinite(stats.hitRate) ? `${Math.round(stats.hitRate * 100)}%` : 'n/a'
-  const health = stats.available ? 'ready' : `unavailable(${stats.reason})`
+  const problem = describePaneHealth(stats.health)
+  const health = !stats.available ? `unavailable(${stats.reason})` : problem ? `failing(${problem.code})` : 'ready'
   return `pane-model ${stats.mode} ${health} calls=${stats.calls} cacheHits=${stats.cacheHits} hitRate=${hitRate} ` +
     `emitted=${stats.emitted} applied=${stats.lastTickApplied || 0} superseded=${stats.lastTickSuperseded || 0} ` +
     `stale=${stats.stale || 0} errors=${stats.errors} reasks=${stats.reasks || 0} throttled=${stats.throttled} ` +

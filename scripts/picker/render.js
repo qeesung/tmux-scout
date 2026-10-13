@@ -11,6 +11,7 @@ const { AGENT_EVENTS } = require('../lib/agent-events')
 const { isVisibleInPicker } = require('../lib/session-contract')
 const { lastTouchedAt } = require('../lib/session-registry')
 const { readAccessTimes } = require('../lib/access-history')
+const { healthSentence, readPaneHealth } = require('../lib/pane-health')
 
 let statusFile = process.argv[2] || ''
 let currentPane = process.argv[3] || ''
@@ -373,6 +374,19 @@ function formatLine(session, now, currentPane) {
   return `${paneId}\t${cur} ${tag} ${agent} ${window} ${project} ${title}${detail}\t${sessionId}`
 }
 
+// The fzf header row. While screen reading is failing it says so instead of
+// naming the columns: the states in those columns are what it makes stale,
+// and the header is the one line the picker re-reads on every refresh and
+// always shows, whatever fzf version draws it.
+function headerLine(problem) {
+  if (problem) return `_\t\x1b[1;31m⚠ ${healthSentence(problem)}\x1b[0m\t_`
+  const hStatus = 'STATUS'.padEnd(STATUS_WIDTH)
+  const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)
+  const hWindow = 'WINDOW'.padEnd(WINDOW_WIDTH)
+  const hProject = 'PROJECT'.padEnd(PROJECT_WIDTH)
+  return `_\t  ${hStatus} ${hAgent} ${hWindow} ${hProject} TITLE\t_`
+}
+
 function run(file, pane, cached) {
   if (file) statusFile = file
   if (pane !== undefined) currentPane = pane
@@ -389,11 +403,7 @@ function run(file, pane, cached) {
   const accessTimes = readAccessTimes()
   active.sort((left, right) => compareSessions(left, right, { accessTimes }))
 
-  const hStatus = 'STATUS'.padEnd(STATUS_WIDTH)
-  const hAgent = 'AGENT'.padEnd(AGENT_WIDTH)
-  const hWindow = 'WINDOW'.padEnd(WINDOW_WIDTH)
-  const hProject = 'PROJECT'.padEnd(PROJECT_WIDTH)
-  console.log(`_\t  ${hStatus} ${hAgent} ${hWindow} ${hProject} TITLE\t_`)
+  console.log(headerLine(readPaneHealth()))
 
   if (active.length === 0) {
     console.log('NONE\tNo active sessions found.\t')
@@ -405,7 +415,7 @@ function run(file, pane, cached) {
   }
 }
 
-module.exports = { run, getActiveSessions, compareSessions, formatLine, subagentDetail, evidenceDetail, waitCode }
+module.exports = { run, getActiveSessions, compareSessions, formatLine, headerLine, subagentDetail, evidenceDetail, waitCode }
 
 if (require.main === module) {
   if (!statusFile) process.exit(1)

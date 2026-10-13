@@ -5634,6 +5634,173 @@ test('watcher stop leaves the marker that keeps it stopped, and a start clears i
   assert.ok(fs.existsSync(marker))
 })
 
+// --- screen reading health ---
+
+function failingClient(results) {
+  const calls = []
+  return {
+    calls,
+    client: {
+      available: true,
+      reason: null,
+      async classify(state) {
+        calls.push(state)
+        return results[Math.min(calls.length - 1, results.length - 1)]
+      }
+    }
+  }
+}
+
+const REGION_BLOCKED = { ok: false, errorKind: 'region', status: 451, error: 'Typesafe is not available in your region.' }
+const ANSWERED = { ok: true, answers: sampleAnswers('working'), usage: { input_tokens: 10 }, model: 'jev-1.13.0' }
+
+test('a 451 is the service refusing this network, not a generic HTTP failure', async () => {
+  const client = createJevClient({
+    apiKey: 'test-key',
+    sdk: { TypeSafeClient: class { async systemOne() { throw Object.assign(new Error('not available in your region'), { status: 451 }) } } }
+  })
+  const result = await client.classify({}, {})
+  assert.strictEqual(result.errorKind, 'region')
+  assert.strictEqual(result.status, 451)
+})
+
+test('screen reading is reported failing after three failed requests in a row, and healthy after one success', async () => {
+  const fake = failingClient([REGION_BLOCKED, REGION_BLOCKED, REGION_BLOCKED, ANSWERED])
+  const h = observerHarness({ observer: { client: fake.client } })
+  assert.deepStrictEqual(h.observer.health(), { mode: 'on', ok: true })
+
+  const firstFailureAt = h.now()
+  await h.tick(paneStatus())
+  for (let i = 0; i < 2; i++) {
+    // One timeout is noise; two failures are not yet an outage.
+    assert.strictEqual(h.observer.health().ok, true)
+    h.advance(61000)
+    await h.tick(paneStatus())
+  }
+  assert.strictEqual(fake.calls.length, 3)
+  assert.deepStrictEqual(h.observer.health(), { mode: 'on', ok: false, kind: 'region', status: 451, since: firstFailureAt })
+  assert.ok(/failing\(451\)/.test(require('../scripts/watcher').formatPaneModelStats(Object.assign({
+    calls: 3, cacheHits: 0, emitted: 0, errors: 3, throttled: 0, queued: 0
+  }, h.observer.stats()))))
+
+  // The streak lives on the schedule: a settings rebuild mid-outage keeps it.
+  const rebuilt = observerHarness({ store: h.storeDir, observer: Object.assign(h.observer.handoff(), { client: fake.client }) })
+  h.observer.close()
+  assert.strictEqual(rebuilt.observer.health().ok, false)
+
+  // The rebuilt harness keeps its own clock; carry it past the old one's backoff.
+  rebuilt.advance(h.now() - rebuilt.now() + 61000)
+  await rebuilt.tick(paneStatus())
+  assert.strictEqual(fake.calls.length, 4)
+  assert.deepStrictEqual(rebuilt.observer.health(), { mode: 'on', ok: true })
+})
+
+test('refusals of one screen and shadow mode never report screen reading as failing', async () => {
+  const refused = observerHarness({ answers: [new Error('forbidden')] })
+  for (let i = 0; i < 4; i++) {
+    refused.screens.set('%1', `screen ${i}\nline two\nline three`)
+    refused.advance(61000)
+    await refused.tick(paneStatus())
+  }
+  assert.strictEqual(refused.calls.length, 4)
+  assert.strictEqual(refused.observer.health().ok, true, 'a 403 is about what was on one screen')
+
+  const fake = failingClient([REGION_BLOCKED])
+  const shadow = observerHarness({ observer: { mode: 'shadow', client: fake.client } })
+  for (let i = 0; i < 4; i++) {
+    shadow.advance(61000)
+    await shadow.tick(paneStatus())
+  }
+  assert.strictEqual(fake.calls.length, 4)
+  assert.deepStrictEqual(shadow.observer.health(), { mode: 'shadow', ok: true }, 'in shadow the hooks drive state')
+
+  const keyless = observerHarness({ observer: { client: { available: false, reason: 'no-key', classify: async () => ({ ok: false }) } } })
+  assert.strictEqual(keyless.observer.health().kind, 'no-key')
+})
+
+test('the health report names the problem, and a dead watcher is the problem itself', () => {
+  const { HEALTH_FILE_NAME, healthSentence, readPaneHealth, writePaneHealth } = require('../scripts/lib/pane-health')
+  const dir = tempDir()
+  const read = alive => readPaneHealth({ dir, isAlive: () => alive })
+  fs.writeFileSync(path.join(dir, 'watcher.pid'), JSON.stringify({ pid: 4242 }))
+
+  assert.strictEqual(read(true), null, 'no report, nothing to say')
+  writePaneHealth({ mode: 'on', ok: true, at: 1 }, dir)
+  assert.strictEqual(read(true), null)
+  writePaneHealth({ mode: 'off', ok: true, at: 1 }, dir)
+  assert.strictEqual(read(false), null, 'with hooks in charge a dead watcher freezes nothing')
+
+  const since = new Date(2026, 9, 13, 10, 12).getTime()
+  writePaneHealth({ mode: 'on', ok: false, kind: 'region', status: 451, since, at: since }, dir)
+  const problem = read(true)
+  assert.strictEqual(problem.code, '451')
+  assert.ok(/not available in your region/.test(healthSentence(problem)))
+  assert.ok(/since 10:12/.test(healthSentence(problem)))
+  assert.ok(/may be stale/.test(healthSentence(problem)))
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, HEALTH_FILE_NAME), 'utf-8')).kind, 'region')
+
+  // Whatever the report said, a watcher that is gone reads no screens at all.
+  writePaneHealth({ mode: 'on', ok: true, at: since }, dir)
+  assert.strictEqual(read(false).code, 'down')
+  fs.writeFileSync(path.join(dir, 'watcher.stopped'), '1\n')
+  assert.strictEqual(read(false).code, 'stopped')
+
+  writePaneHealth({ mode: 'on', ok: false, kind: 'http', status: 503, at: 1 }, dir)
+  assert.strictEqual(read(true).code, '503')
+})
+
+test('the status bar leads with the problem while screen reading is failing', () => {
+  const problem = { code: '451', text: 'the API refuses this network', since: null }
+  const counts = statusBar.summarizeSessions([{ phase: 'running' }, { phase: 'completed' }])
+  const healthy = statusBar.renderStatusBar(counts, '', 'off', '')
+  const failing = statusBar.renderStatusBar(counts, '', 'off', '', problem)
+  assert.ok(!/jev/.test(healthy), healthy)
+  assert.strictEqual(failing, `#[fg=#e06c75,bold]⚠ jev 451#[default] ${healthy}`)
+
+  // With nothing to count, the warning still shows: new sessions would not be read either.
+  assert.strictEqual(statusBar.renderStatusBar(statusBar.summarizeSessions([]), '', 'off', '', problem),
+    '#[fg=#e06c75,bold]⚠ jev 451#[default] ')
+  // A custom format places it with {J}, and cannot drop it by leaving {J} out.
+  assert.strictEqual(statusBar.renderStatusBar(counts, '{B}/{D}{J}', 'off', '', problem), '1/1#[fg=#e06c75,bold]⚠ jev 451#[default] ')
+  assert.strictEqual(statusBar.renderStatusBar(counts, '{B}/{D}', 'off', '', problem), '#[fg=#e06c75,bold]⚠ jev 451#[default] 1/1')
+  assert.strictEqual(statusBar.renderStatusBar(counts, '{B}/{D}{J}', 'off', ''), '1/1')
+})
+
+test('the picker header says screen reading is failing instead of naming the columns', () => {
+  const { headerLine } = require('../scripts/picker/render')
+  const { healthSentence } = require('../scripts/lib/pane-health')
+  assert.ok(/STATUS .*TITLE/.test(headerLine(null)))
+  const problem = { code: '401', text: 'the API key was rejected (401)', since: null }
+  const line = headerLine(problem)
+  const [left, text, right] = line.split('\t')
+  assert.deepStrictEqual([left, right], ['_', '_'], 'still fzf\'s header row: the same three fields')
+  assert.ok(text.includes(healthSentence(problem)), text)
+  assert.ok(text.startsWith('\x1b[1;31m⚠ '), 'drawn in red; the picker runs fzf --ansi')
+})
+
+test('the watcher reports screen reading health as soon as it starts', async () => {
+  const home = tempDir()
+  const healthFile = path.join(home, '.tmux-scout', 'pane-health.json')
+  fs.mkdirSync(path.join(home, '.tmux-scout'), { recursive: true })
+  // Left by a watcher that died failing: the new one must replace it.
+  fs.writeFileSync(healthFile, JSON.stringify({ mode: 'on', ok: false, kind: 'region', status: 451 }))
+  const watcher = path.join(__dirname, '..', 'scripts', 'watcher.js')
+  const env = fakeTmuxEnv(home, {})
+  const child = spawn(process.execPath, [watcher, 'run'], { env, stdio: 'ignore' })
+  const started = Date.now()
+  let report = null
+  while (Date.now() - started < 10000) {
+    try { report = JSON.parse(fs.readFileSync(healthFile, 'utf-8')) } catch (_) {}
+    if (report && report.pid === child.pid) break
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  execFileSync(process.execPath, [watcher, 'stop', '--quiet'], { env })
+  await new Promise(resolve => child.on('exit', resolve))
+  assert.strictEqual(report && report.pid, child.pid, JSON.stringify(report))
+  assert.strictEqual(report.mode, 'off')
+  assert.strictEqual(report.ok, true)
+})
+
 test('the watcher logs why it stopped', async () => {
   // Run under tmux run-shell -b, its stderr goes nowhere: a signal or an
   // uncaught error used to leave a clean exit and no trace in the log.

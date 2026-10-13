@@ -72,8 +72,14 @@ const DEFAULTS = Object.freeze({
   maxCapturesPerTick: 64,
   // How many more times a screen whose answer the gate rejected is sent again.
   // See dispatch().
-  maxReasks: 2
+  maxReasks: 2,
+  // Requests in a row that must fail before screen reading is reported as
+  // broken; see noteOutcome().
+  failureStreak: 3
 })
+
+// Refused for what was on one screen, not because the service is failing.
+const SCREEN_REFUSALS = new Set(['forbidden'])
 
 // Normalizes here rather than at each call site: this is the one place that
 // decides what a tmux option string means, and three callers were each doing
@@ -185,7 +191,11 @@ function createPaneObserver(options = {}) {
     // Pane -> the session instance last read there; see ownPrompt().
     paneIdentity: new Map(),
     // Whether the newest response was an authentication failure; see stats().
-    authFailing: false
+    authFailing: false,
+    // The current run of failed requests; see noteOutcome().
+    failures: 0,
+    failingSince: null,
+    lastFailure: null
   }
   // Per-session scheduling state. Keyed by sessionId, pruned with the registry.
   const sessions = sched.sessions
@@ -223,6 +233,7 @@ function createPaneObserver(options = {}) {
   const readings = Array.isArray(options.readings) ? options.readings : []
 
   let closed = false
+  const createdAt = now()
   let cachePersistedAt = 0
   // The claims the last tick read, for scan() to re-read between ticks.
   let lastBatch = []
@@ -394,6 +405,7 @@ function createPaneObserver(options = {}) {
         // last few calls of every watcher generation is a cost report that
         // undercounts by design.
         metrics.recordCall(result, { sessionId, agentType })
+        noteOutcome(result, now())
         if (!result || !result.ok) {
           // Pacing state is shared with any replacement observer, so a 429 that
           // lands after a rebuild still pauses the one now running.
@@ -431,6 +443,7 @@ function createPaneObserver(options = {}) {
         sched.inFlight--
         if (state.pendingFingerprint === capturedPane.fingerprint) state.pendingFingerprint = null
         metrics.recordCall({ ok: false, errorKind: 'threw' }, { sessionId, agentType })
+        noteOutcome({ ok: false, errorKind: 'threw' }, now())
         counters.errors++
         state.retryAfter = now() + DEFAULTS.errorBackoffMs
         if (log) log(`pane classify threw for ${sessionId}: ${error && error.message}`)
@@ -805,6 +818,42 @@ function createPaneObserver(options = {}) {
     for (const [pane, id] of owners) if (!live.has(id)) owners.delete(pane)
   }
 
+  // Requests that failed because of the service rather than the screen sent to
+  // it, in a row. One timeout is noise; several with no success in between is
+  // the service being unusable from here, and one success ends it. Kept on the
+  // schedule, so a settings rebuild in the middle of an outage still knows.
+  function noteOutcome(result, at) {
+    if (result && result.ok) {
+      sched.failures = 0
+      sched.failingSince = null
+      sched.lastFailure = null
+      return
+    }
+    const kind = (result && result.errorKind) || 'unknown'
+    if (SCREEN_REFUSALS.has(kind)) return
+    if (sched.failures === 0) sched.failingSince = at
+    sched.failures++
+    sched.lastFailure = { kind, status: result && Number.isFinite(result.status) ? result.status : undefined }
+  }
+
+  // Whether screen reading can be trusted right now, for the status bar and
+  // the picker (see pane-health). Only `on` is ever unhealthy: in shadow the
+  // hooks drive state, and nothing anyone sees depends on the answers.
+  function health() {
+    if (mode !== MODES.ON) return { mode, ok: true }
+    if (!client || !client.available) {
+      return { mode, ok: false, kind: client ? client.reason : 'no-client', since: createdAt }
+    }
+    if (sched.failures < DEFAULTS.failureStreak || !sched.lastFailure) return { mode, ok: true }
+    return {
+      mode,
+      ok: false,
+      kind: sched.lastFailure.kind,
+      status: sched.lastFailure.status,
+      since: sched.failingSince
+    }
+  }
+
   function stats() {
     return Object.assign({
       mode,
@@ -824,7 +873,8 @@ function createPaneObserver(options = {}) {
       hitRate: counters.cacheHits + counters.calls > 0
         ? counters.cacheHits / (counters.cacheHits + counters.calls)
         : null,
-      jev: metrics.snapshot({ cacheHits: counters.cacheHits })
+      jev: metrics.snapshot({ cacheHits: counters.cacheHits }),
+      health: health()
     }, counters)
   }
 
@@ -874,6 +924,7 @@ function createPaneObserver(options = {}) {
     handoff() {
       return { cache, metrics, schedule: sched, readings, counters, observed }
     },
+    health,
     observedAt,
     persist,
     prune,

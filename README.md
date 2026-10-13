@@ -199,7 +199,7 @@ set -g @scout-status-format '{W}/{B}/{D}'         # custom separators
 set -g @scout-status-format '{W} wait {B} busy'   # with labels
 ```
 
-Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle, `{A}` approval waits, `{Q}` question/answer waits, `{P}` plan waits, `{T}` total active sessions.
+Placeholders: `{W}` wait, `{B}` busy, `{D}` done, `{I}` idle, `{A}` approval waits, `{Q}` question/answer waits, `{P}` plan waits, `{T}` total active sessions, `{J}` a warning while screen reading is failing (see [Pane state from the screen](#pane-state-from-the-screen-optional-off-by-default)). A format without `{J}` still gets the warning, in front.
 
 Status click behavior:
 
@@ -346,6 +346,20 @@ tmux set -g @scout-jev-log-calls on
 node scripts/debug.js jev-metrics --since 24h
 node scripts/debug.js classify %39 --state
 ```
+
+**When it stops working.** With the screen as the state source, a pane model that gets no answers leaves every session showing whatever it last showed. So the status bar leads with a red `⚠ jev <code>` and the picker's header row says what is wrong, for as long as it lasts:
+
+| Code | Meaning |
+|---|---|
+| `451` | the API refuses this network (not available in your region) |
+| `401` | the API key was rejected |
+| `429` | the API is rate limiting |
+| `offline` / `timeout` | the API cannot be reached, or does not answer in time |
+| `503` and other statuses | the API answers with that HTTP error |
+| `no key` / `no sdk` / `node` | the client cannot be built: see the prerequisites above |
+| `down` / `stopped` | the watchdog is not running, so nothing reads the screens |
+
+A request failing is not enough: it takes three in a row with no success between them, and one success clears it. A refusal of one particular screen does not count. Only `@scout-state-source jev` is reported; in `shadow` the hooks still drive state. `watcher status` shows the same as `failing(<code>)`.
 
 **Limits.**
 

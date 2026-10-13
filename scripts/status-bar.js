@@ -3,8 +3,9 @@
 // Called by tmux via #(node .../status-bar.js) every status-interval.
 //
 // Customize via tmux option @scout-status-format using placeholders:
-// {W}=wait, {B}=busy, {D}=done, {I}=idle, {A}=approval, {Q}=question, {P}=plan, {T}=total.
-// Example: set -g @scout-status-format '{W}/{B}/{D}/{I}'
+// {W}=wait, {B}=busy, {D}=done, {I}=idle, {A}=approval, {Q}=question, {P}=plan, {T}=total,
+// {J}=a warning while screen reading (jev) is failing, empty otherwise.
+// Example: set -g @scout-status-format '{J}{W}/{B}/{D}/{I}'
 
 const path = require('path')
 const fs = require('fs')
@@ -16,6 +17,7 @@ const IDLE_FMT = '|#[fg=#61afef]{I}#[default]'
 const CLICK_RANGE_START = '#[range=user|scout]'
 const CLICK_RANGE_END = '#[norange]'
 const DEFAULT_CLICK_STYLE = 'underscore'
+const JEV_WARNING_STYLE = '#[fg=#e06c75,bold]'
 
 // Reuse render logic so counts stay aligned with picker without mutating state.
 const { getActiveSessions, waitCode } = require(path.join(__dirname, 'picker', 'render'))
@@ -103,8 +105,15 @@ function cachedStatusSnapshot(status) {
   return Object.assign({}, status || {}, { sessions })
 }
 
-function applyFormat(fmt, counts) {
+// The {J} text: the problem's short code, e.g. "⚠ jev 451". The picker says
+// what it means.
+function jevWarning(problem) {
+  return problem ? `${JEV_WARNING_STYLE}⚠ jev ${problem.code}#[default] ` : ''
+}
+
+function applyFormat(fmt, counts, problem) {
   return fmt
+    .replace(/\{J\}/g, jevWarning(problem))
     .replace(/\{W\}/g, String(counts.wait))
     .replace(/\{B\}/g, String(counts.busy))
     .replace(/\{D\}/g, String(counts.done))
@@ -121,20 +130,28 @@ function applyClickStyle(output, style) {
   return `#[${normalized}]${output.replace(/#\[default\]/g, `#[default]#[${normalized}]`)}#[default]`
 }
 
-function renderStatusBar(counts, fmt, clickOption, clickStyle) {
-  if (counts.total === 0) return ''
-
+// `problem` is what pane-health reports while screen reading is failing. It is
+// shown even with no sessions to count, and ahead of a custom format that has
+// no {J}: the counts are what it makes untrustworthy, so a format choosing
+// where they go cannot choose to drop it.
+function renderStatusBar(counts, fmt, clickOption, clickStyle, problem) {
+  const warning = jevWarning(problem)
   let output = ''
-  if (fmt) {
-    output = applyFormat(fmt, counts)
+  if (counts.total === 0) {
+    output = warning
+  } else if (fmt) {
+    output = applyFormat(fmt, counts, problem)
+    if (warning && !/\{J\}/.test(fmt)) output = warning + output
+  } else if (counts.wait + counts.busy + counts.done + counts.idle === 0) {
+    output = warning
   } else {
-    if (counts.wait + counts.busy + counts.done + counts.idle === 0) return ''
-    output = applyFormat(BASE_FMT, counts)
+    output = warning + applyFormat(BASE_FMT, counts)
     if (counts.idle > 0) {
       output += applyFormat(IDLE_FMT, counts)
     }
     output += ' '
   }
+  if (!output) return ''
 
   if (output && clickEnabled(clickOption)) {
     return `${CLICK_RANGE_START}${applyClickStyle(output, clickStyle)}${CLICK_RANGE_END}`
@@ -155,7 +172,8 @@ function main() {
     summarizeSessions(active),
     readTmuxOption('@scout-status-format'),
     readTmuxOption('@scout-status-click'),
-    readTmuxOption('@scout-status-click-style')
+    readTmuxOption('@scout-status-click-style'),
+    require(path.join(__dirname, 'lib', 'pane-health')).readPaneHealth()
   )
   if (output) process.stdout.write(output)
 }

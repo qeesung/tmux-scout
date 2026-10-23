@@ -16,7 +16,7 @@ If you prefer a zero-dependency setup without needing a Node.js runtime, check o
 
 ## Features
 
-- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux window names, project names, prompt titles, and live tool details, ordered by most recently visited
+- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux session and window names, project names, and live tool details in [columns you choose](#picker-columns), ordered by most recently visited
 - **Pane preview** — right-side preview panel shows the last 40 lines of each session's tmux pane
 - **Status bar widget** — displays session counts by status (e.g. `0|1|2`) in tmux's status-right, refreshed every 2 seconds
 - **Auto-refresh** — `Ctrl-T` toggles automatic picker reload every 2 seconds
@@ -111,10 +111,10 @@ Press `prefix + O` (default) to open the session picker.
 | `Ctrl-T` | Toggle auto-refresh (every 2s) |
 | `Esc` | Close picker |
 
-Each line shows:
+Each line shows, by default:
 
 ```
-* BUSY   claude app-window            my-project       "implement the login page"  Bash: npm test
+* BUSY   claude work    app-window my-project Bash: npm test
 ```
 
 - `*` — current pane indicator
@@ -122,10 +122,12 @@ Each line shows:
 - `BUSY` / `DONE` / `IDLE` — session status
 - `INT` / `CRASH` / `STALE` — recently interrupted, crashed, or stale sessions
 - Agent type (claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex)
+- tmux session name
 - tmux window name (`-` when no window is linked)
 - Project directory name
-- Session title (first prompt)
-- Current tool details (for working sessions)
+- Detail: what the session is waiting on, why it ended, its subagents, or the tool it is running
+
+The columns can be changed: see [Picker columns](#picker-columns).
 
 Sessions are ordered by access recency: the session you most recently switched
 to — via the picker, prefix keys, mouse, or window/session switches — floats to
@@ -191,6 +193,30 @@ tmux-scout does not enable mouse mode for you. The clickable segment is subtly u
 ```bash
 set -g @scout-key "O"    # default: O (prefix + O)
 ```
+
+### Picker columns
+
+```bash
+set -g @scout-picker-columns 'status,agent,session,window,project,detail'      # default
+set -g @scout-picker-columns 'status,agent,session:10,window:24,title,detail'  # name:width sets a width
+```
+
+| Column | Up to | Shows |
+|---|---|---|
+| `status` | 6 | `BUSY` / `DONE` / `W:APP` and the other status tags |
+| `agent` | 9 | Agent type |
+| `session` | 40 | tmux session name |
+| `window` | 60 | tmux window name |
+| `project` | 16 | Project directory name |
+| `title` | 50 | Session title (first prompt) |
+| `detail` | 55 | What the session is waiting on, why it ended, its subagents, or the tool it is running |
+| `source` | 40 | Where the latest state came from and how long ago, e.g. `pane-model · 41s · pane_idle_ready` |
+
+Columns appear in the order given. Each is as wide as the widest thing it shows, up to the width above; `name:width` sets a column's width exactly. Text wider than its column is cut with `~`, and the last column is not padded.
+
+When a row is wider than the picker's list, columns give up width in this order: `detail`, `source`, `title`, `project`, `session`, and `window` last, so window names stay whole for as long as anything can. `status` and `agent` are never shrunk, and neither is a column given an explicit width.
+
+Unknown names are ignored, and a value with no known name falls back to the default. The option is read on every refresh, so a change shows up the next time the picker redraws.
 
 ### Status Bar
 

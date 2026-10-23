@@ -64,6 +64,12 @@ height=$((lines + 6))
 ) &
 AUTO_PID=$!
 
+# The lines above are drawn before fzf starts, so without knowing how wide its
+# list is. Reloads run as fzf's children and see its size, so one reload once
+# the first list is shown, and one on every resize, lays the columns out to fit
+# (listWidth in render.js). Not on start: fzf has not laid itself out yet
+# there, and reports a width of 0. The first result unbinds itself, or every
+# reload's result would reload again.
 fzf_output=$(cat "$LINES_FILE" | fzf \
   --listen=$LISTEN_PORT \
   --tmux "center,85%,$height,border-native" \
@@ -77,6 +83,8 @@ fzf_output=$(cat "$LINES_FILE" | fzf \
   --header-lines=1 \
   --bind="double-click:accept" \
   --bind="ctrl-r:reload($RELOAD_CMD)" \
+  --bind="result:unbind(result)+reload($RELOAD_CMD)" \
+  --bind="resize:reload($RELOAD_CMD)" \
   --bind="ctrl-t:execute-silent(if [ -f $AUTO_FLAG ]; then rm -f $AUTO_FLAG; else touch $AUTO_FLAG; fi)+reload($RELOAD_CMD)+transform:if [ -f $AUTO_FLAG ]; then printf \"change-border-label( tmux-scout · auto-refresh \$(date +%H:%M:%S) )\"; else printf 'change-border-label( tmux-scout )'; fi" \
   --preview='tmux capture-pane -pJ -t {1} 2>/dev/null | tail -40' \
   --preview-window=right:50%:wrap:border-left \

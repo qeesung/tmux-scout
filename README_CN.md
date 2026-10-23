@@ -16,7 +16,7 @@
 
 ## 功能特性
 
-- **会话选择器** — `prefix + O` 打开 fzf 弹窗，列出所有活跃的 agent 会话，显示状态标签（`WAIT` / `BUSY` / `DONE` / `IDLE`）、tmux window 名称、项目名、提示标题和实时工具详情，并按最近访问顺序排列
+- **会话选择器** — `prefix + O` 打开 fzf 弹窗，列出所有活跃的 agent 会话，显示状态标签（`WAIT` / `BUSY` / `DONE` / `IDLE`）、tmux session 和 window 名称、项目名和实时工具详情（[显示哪些列可配置](#选择器列)），并按最近访问顺序排列
 - **面板预览** — 右侧预览面板显示每个会话 tmux 面板的最后 40 行内容
 - **状态栏组件** — 在 tmux 的 status-right 中显示按状态分类的会话计数（如 `0|1|2`），每 2 秒刷新
 - **自动刷新** — `Ctrl-T` 切换每 2 秒自动刷新选择器
@@ -111,10 +111,10 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 | `Ctrl-T` | 切换自动刷新（每 2 秒） |
 | `Esc` | 关闭选择器 |
 
-每行显示内容：
+每行默认显示：
 
 ```
-* BUSY   claude app-window            my-project       "implement the login page"  Bash: npm test
+* BUSY   claude work    app-window my-project Bash: npm test
 ```
 
 - `*` — 当前面板指示器
@@ -122,10 +122,12 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 - `BUSY` / `DONE` / `IDLE` — 会话状态
 - `INT` / `CRASH` / `STALE` — 最近被打断、异常退出或过期的会话
 - Agent 类型（claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex）
+- tmux session 名称
 - tmux window 名称（未关联 window 时显示 `-`）
 - 项目目录名
-- 会话标题（首条提示）
-- 当前工具详情（工作中的会话）
+- 详情：会话在等什么、为什么结束、它的 subagent，或正在运行的工具
+
+显示哪些列可以修改，见[选择器列](#选择器列)。
 
 会话按访问顺序排列：最近一次切换过去的会话置顶（无论是通过 picker、prefix 快捷键、鼠标，还是 window/session 切换），其次是次近的，依此类推；
 尚未访问过的会话排在下方，按最近活跃时间排序。每行上方的状态标签仍会照常显示。
@@ -189,6 +191,30 @@ tmux-scout 不会主动替你开启鼠标模式。可点击片段默认会有轻
 ```bash
 set -g @scout-key "O"    # 默认: O (prefix + O)
 ```
+
+### 选择器列
+
+```bash
+set -g @scout-picker-columns 'status,agent,session,window,project,detail'      # 默认
+set -g @scout-picker-columns 'status,agent,session:10,window:24,title,detail'  # 名字:宽度 设置列宽
+```
+
+| 列 | 最大宽度 | 显示内容 |
+|---|---|---|
+| `status` | 6 | `BUSY` / `DONE` / `W:APP` 等状态标签 |
+| `agent` | 9 | Agent 类型 |
+| `session` | 40 | tmux session 名称 |
+| `window` | 60 | tmux window 名称 |
+| `project` | 16 | 项目目录名 |
+| `title` | 50 | 会话标题（首条提示） |
+| `detail` | 55 | 会话在等什么、为什么结束、它的 subagent，或正在运行的工具 |
+| `source` | 40 | 最近一次状态来自哪里、多久之前，例如 `pane-model · 41s · pane_idle_ready` |
+
+列按书写顺序显示。每列的宽度跟着该列最长的内容走，不超过上表的最大宽度；用 `名字:宽度` 可以把某列固定成指定宽度。超出列宽的文字以 `~` 截断，最后一列不补空格。
+
+一行比 picker 的列表区还宽时，各列按这个顺序让出宽度：`detail`、`source`、`title`、`project`、`session`，最后才是 `window`，所以 window 名会尽可能保持完整。`status` 和 `agent` 不会被压缩，显式指定了宽度的列也不会。
+
+不认识的列名会被忽略，一个都不认识时使用默认值。每次刷新都会重新读取这个选项，改完后 picker 下次重绘就会生效。
 
 ### 状态栏
 

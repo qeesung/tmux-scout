@@ -5831,7 +5831,7 @@ test('the status bar leads with the problem while screen reading is failing', ()
 test('the picker header says screen reading is failing instead of naming the columns', () => {
   const { headerLine } = require('../scripts/picker/render')
   const { healthSentence } = require('../scripts/lib/pane-health')
-  assert.ok(/STATUS .*TITLE/.test(headerLine(null)))
+  assert.ok(/STATUS .*DETAIL/.test(headerLine(null)))
   const problem = { code: '401', text: 'the API key was rejected (401)', since: null }
   const line = headerLine(problem)
   const [left, text, right] = line.split('\t')
@@ -6129,9 +6129,154 @@ test('picker rows keep display text unchanged while carrying hidden session id',
   const fields = line.split('\t')
 
   assert.strictEqual(fields[0], '%1')
-  assert.ok(fields[1].includes('visible title'), fields[1])
+  assert.ok(fields[1].includes('main'), fields[1])
+  assert.ok(fields[1].includes('demo'), fields[1])
   assert.ok(!fields[1].includes('session-hidden-id'), fields[1])
   assert.strictEqual(fields[2], 'session-hidden-id')
+})
+
+test('picker rows show the tmux session and no title by default', () => {
+  const { headerLine } = require('../scripts/picker/render')
+  const session = {
+    sessionId: 'session-default-columns',
+    agentType: 'claude',
+    phase: 'completed',
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    sessionTitle: 'a prompt nobody reads here',
+    stateEvidence: [{ source: 'pane-model', rawEventName: 'pane_idle_ready', timestamp: Date.now() - 41000 }],
+    _tmuxPaneSnapshot: { windowName: 'main', sessionName: 'work' }
+  }
+  assert.strictEqual(stripAnsi(headerLine(null)).split('\t')[1].replace(/ +/g, ' '),
+    ' STATUS AGENT SESSION WINDOW PROJECT DETAIL')
+  const row = stripAnsi(formatLine(session, Date.now(), '%9')).split('\t')[1]
+  assert.ok(/DONE +claude +work +main +demo$/.test(row), row)
+  // Where the state came from is the source column's, which is not a default one.
+  assert.ok(!row.includes('pane-model'), row)
+
+  // Bound before this snapshot was taken: the session's own record of it.
+  const unseen = Object.assign({}, session, { tmuxSessionName: 'recorded', _tmuxPaneSnapshot: { windowName: 'main' } })
+  assert.ok(stripAnsi(formatLine(unseen, Date.now(), '%9')).includes(' recorded '))
+})
+
+test('picker columns come from @scout-picker-columns, widths and all', () => {
+  const { headerLine, parseColumns } = require('../scripts/picker/render')
+  const session = {
+    sessionId: 'session-configured-columns',
+    agentType: 'codex',
+    phase: 'running',
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    sessionTitle: 'fix the login page',
+    stateEvidence: [{ source: 'hook', rawEventName: 'PreToolUse', timestamp: Date.now() - 5000 }],
+    _tmuxPaneSnapshot: { windowName: 'main', sessionName: 'work' }
+  }
+  // An unknown name is skipped, not a broken picker.
+  const columns = parseColumns(' Agent, title:12 status:8,bogus source')
+  assert.deepStrictEqual(columns.map(column => [column.name, column.width]),
+    [['agent', 9], ['title', 12], ['status', 8], ['source', 40]])
+  assert.strictEqual(stripAnsi(headerLine(null, columns)).split('\t')[1], '  AGENT     TITLE        STATUS   SOURCE')
+  const row = stripAnsi(formatLine(session, Date.now(), '%9', columns)).split('\t')[1]
+  assert.strictEqual(row, '  codex     "fix the lo~ BUSY     hook · 5s · PreToolUse')
+
+  // The last column is cut to its width but not padded: nothing follows it.
+  const short = stripAnsi(formatLine(session, Date.now(), '%9', parseColumns('agent,status'))).split('\t')[1]
+  assert.strictEqual(short, '  codex     BUSY')
+
+  for (const value of ['', '   ', 'nothing,known', ':5', 'constructor,__proto__']) {
+    assert.deepStrictEqual(parseColumns(value), parseColumns('status,agent,session,window,project,detail'), JSON.stringify(value))
+  }
+  assert.strictEqual(parseColumns('window:0')[0].width, 60, 'a width that is no width keeps the default')
+  assert.strictEqual(parseColumns('window:9999')[0].width, 200)
+})
+
+test('picker columns line up past wide characters', () => {
+  // Counted as one column each, a Chinese window name pushed everything after
+  // it out of line with the rows above and below.
+  const { layoutColumns, parseColumns } = require('../scripts/picker/render')
+  const now = Date.now()
+  const session = windowName => ({
+    sessionId: `session-${windowName}`,
+    agentType: 'claude',
+    phase: 'completed',
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    _tmuxPaneSnapshot: { windowName, sessionName: 'work' }
+  })
+  const width = text => Array.from(text).reduce((sum, char) => sum + (/[\u3000-\u9fff\uff00-\uff60]/.test(char) ? 2 : 1), 0)
+  const projectAt = text => width(text.slice(0, text.lastIndexOf('demo')))
+  const names = ['main', '评审窗口', '一个很长很长很长很长的中文窗口名字', '混合 mixed 窗口']
+  const sessions = names.map(session)
+
+  for (const spec of ['status,agent,session,window,project,detail', 'status,window:20,project']) {
+    const columns = layoutColumns(parseColumns(spec), sessions, now)
+    const rows = sessions.map(item => stripAnsi(formatLine(item, now, '%9', columns)).split('\t')[1])
+    for (const row of rows) assert.strictEqual(projectAt(row), projectAt(rows[0]), `${spec}\n${rows.join('\n')}`)
+  }
+  // Sized to it, the longest name is whole; held to 20, it is cut on a
+  // character, not through one.
+  const fitted = layoutColumns(parseColumns('window,project'), sessions, now)
+  assert.strictEqual(fitted[0].width, 34)
+  assert.ok(stripAnsi(formatLine(sessions[2], now, '%9', fitted)).includes(names[2]))
+  const held = stripAnsi(formatLine(sessions[2], now, '%9', parseColumns('window:20,project'))).split('\t')[1]
+  assert.ok(held.includes('一个很长很长很长很~ '), held)
+})
+
+test('picker columns fit what they show, and give up width least important first', () => {
+  const { headerLine, layoutColumns, parseColumns } = require('../scripts/picker/render')
+  const now = Date.now()
+  const sessions = [
+    ['cosy-track-any-branch', 'cosy-track-any-branch-review2', '/src/vecode-dgit'],
+    ['mew-do', 'mew-do-dev', '/src/mew-do']
+  ].map(([sessionName, windowName, workingDirectory], index) => ({
+    sessionId: `session-fit-${index}`,
+    agentType: 'claude',
+    phase: 'waitingForApproval',
+    needsAttention: 'waiting for approval',
+    pendingInteraction: { type: 'approval', reason: 'waiting for approval', details: 'Bash: npm test' },
+    tmuxPane: `%${index + 1}`,
+    workingDirectory,
+    _tmuxPaneSnapshot: { windowName, sessionName }
+  }))
+  const widths = (spec, available) => Object.fromEntries(
+    layoutColumns(parseColumns(spec), sessions, now, available).map(column => [column.name, column.width]))
+  const spec = 'status,agent,session,window,project,detail'
+
+  // With room, nothing is cut: cosy-track-any-branch was cosy-track-an~, and
+  // its window cosy-track-any-bran~, at fixed widths of 14 and 20.
+  assert.deepStrictEqual(widths(spec), { status: 6, agent: 6, session: 21, window: 29, project: 11, detail: 36 })
+  const rows = sessions.map(item => stripAnsi(formatLine(item, now, '%9', layoutColumns(parseColumns(spec), sessions, now))))
+  assert.ok(rows[0].includes('cosy-track-any-branch cosy-track-any-branch-review2 vecode-dgit'), rows[0])
+
+  // Short of room: the detail goes first, then the project down to a few
+  // columns, then the session; the window name last of all.
+  const full = 2 + 6 + 6 + 21 + 29 + 11 + 36 + 5
+  assert.deepStrictEqual(widths(spec, full - 36), { status: 6, agent: 6, session: 21, window: 29, project: 11, detail: 0 })
+  assert.deepStrictEqual(widths(spec, full - 36 - 7), { status: 6, agent: 6, session: 21, window: 29, project: 4, detail: 0 })
+  assert.deepStrictEqual(widths(spec, full - 36 - 7 - 17), { status: 6, agent: 6, session: 4, window: 29, project: 4, detail: 0 })
+  assert.deepStrictEqual(widths(spec, full - 36 - 7 - 17 - 10), { status: 6, agent: 6, session: 4, window: 19, project: 4, detail: 0 })
+
+  // A width the option gives is kept, room or not.
+  assert.deepStrictEqual(widths('status,agent,session,window,project:16,detail:30', 40),
+    { status: 6, agent: 6, session: 4, window: 4, project: 16, detail: 30 })
+
+  // The header is laid out with the rows, so it lines up with them.
+  const columns = layoutColumns(parseColumns(spec), sessions, now, full - 36 - 7 - 17)
+  const header = stripAnsi(headerLine(null, columns)).split('\t')[1]
+  const row = stripAnsi(formatLine(sessions[0], now, '%9', columns)).split('\t')[1]
+  assert.strictEqual(header.indexOf('WINDOW'), row.indexOf('cosy-track-any-branch-review2'), `${header}\n${row}`)
+  assert.ok(row.length <= full - 36 - 7 - 17, row)
+})
+
+test('the picker knows how wide its list is only from fzf', () => {
+  const { listWidth } = require('../scripts/picker/render')
+  // Measured in fzf 0.65 with the options picker.sh passes: 164 columns of
+  // text with the preview hidden, 81 with it shown; one spare for a scrollbar.
+  assert.strictEqual(listWidth({ FZF_COLUMNS: '166' }), 163)
+  assert.strictEqual(listWidth({ FZF_COLUMNS: '166', FZF_PREVIEW_LEFT: '88', FZF_PREVIEW_COLUMNS: '80' }), 80)
+  // Before fzf starts, and on fzf's own start event, there is no width to go by.
+  assert.strictEqual(listWidth({}), Infinity)
+  assert.strictEqual(listWidth({ FZF_COLUMNS: '0' }), Infinity)
 })
 
 test('picker rows prefer pending interaction detail for waits', () => {

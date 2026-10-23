@@ -5587,6 +5587,39 @@ test('a dead watcher is revived once it has been gone a while, and not more than
   assert.strictEqual(revive(), 'pending')
 })
 
+test('of the status bars that find the watcher gone at once, only one revives it', async () => {
+  // Every attached client draws its status bar at the same moment. One claim
+  // taken over by deleting it and creating it again let two of eight through
+  // in about one round in ten, and each started a watcher.
+  const { REVIVE_GRACE_MS, REVIVE_INTERVAL_MS, reviveWatcher } = require('../scripts/lib/watcher-revive')
+  const script = `
+    const { reviveWatcher } = require(${JSON.stringify(path.join(__dirname, '..', 'scripts', 'lib', 'watcher-revive'))})
+    process.stdout.write(reviveWatcher({
+      dir: process.argv[1], now: Number(process.argv[2]),
+      isAlive: () => false, readOption: () => '', start: () => {}
+    }))
+  `
+  const race = (dir, now) => new Promise(resolve => {
+    const child = spawn(process.execPath, ['-e', script, dir, String(now)])
+    let out = ''
+    child.stdout.on('data', chunk => { out += chunk })
+    child.on('close', () => resolve(out))
+  })
+  for (let round = 0; round < 20; round++) {
+    const dir = tempDir()
+    const now = Date.now()
+    const revive = at => reviveWatcher({ dir, now: at, isAlive: () => false, readOption: () => '', start: () => {} })
+    // Revived once long ago, and found gone again long enough to revive.
+    const before = now - 2 * REVIVE_INTERVAL_MS
+    assert.strictEqual(revive(before - REVIVE_GRACE_MS), 'pending')
+    assert.strictEqual(revive(before), 'revived')
+    assert.strictEqual(revive(now - REVIVE_GRACE_MS), 'pending')
+
+    const results = await Promise.all(Array.from({ length: 8 }, () => race(dir, now)))
+    assert.strictEqual(results.filter(result => result === 'revived').length, 1, results.join(' '))
+  }
+})
+
 test('a watcher stopped on purpose, switched off, or outside tmux is not revived', () => {
   const { REVIVE_GRACE_MS, markStopped, clearStopped, reviveWatcher } = require('../scripts/lib/watcher-revive')
   const dir = tempDir()
@@ -5632,6 +5665,35 @@ test('watcher stop leaves the marker that keeps it stopped, and a start clears i
     await new Promise(resolve => child.on('exit', resolve))
   }
   assert.ok(fs.existsSync(marker))
+})
+
+test('of two watchers started at once, the one whose lock was overwritten leaves', async () => {
+  // Both can find the lock free and both write it; neither ever noticed the
+  // other, and two ran for good. Here the other writes while this one settles.
+  const home = tempDir()
+  const lockFile = path.join(home, '.tmux-scout', 'watcher.pid')
+  const logFile = path.join(home, '.tmux-scout', 'watcher.log')
+  const watcher = path.join(__dirname, '..', 'scripts', 'watcher.js')
+  const child = spawn(process.execPath, [watcher, 'run'], { env: fakeTmuxEnv(home, {}), stdio: 'ignore' })
+  const exited = new Promise(resolve => child.on('exit', resolve))
+  const started = Date.now()
+  let locked = false
+  while (!locked && Date.now() - started < 10000) {
+    try { locked = JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid === child.pid } catch (_) {}
+    if (!locked) await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.ok(locked, 'the watcher wrote its lock')
+  // The test runner stands in for the other watcher: alive, and not this one.
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: Date.now() }))
+
+  const timer = setTimeout(() => child.kill('SIGKILL'), 10000)
+  const code = await exited
+  clearTimeout(timer)
+  assert.strictEqual(code, 0, 'left on its own')
+  const log = fs.readFileSync(logFile, 'utf-8')
+  assert.ok(log.includes(`not started pid=${child.pid}: the lock is held by pid=${process.pid} now`), log)
+  assert.ok(!/started pid=|bridge listening/.test(log.replace(/not started pid=/g, '')), 'left before binding anything')
+  assert.strictEqual(JSON.parse(fs.readFileSync(lockFile, 'utf-8')).pid, process.pid, 'and left the other its lock')
 })
 
 // --- screen reading health ---

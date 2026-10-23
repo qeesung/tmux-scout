@@ -29,6 +29,15 @@ const BRIDGE_SOCKET = path.join(STATUS_DIR, 'run', 'bridge.sock')
 
 const DEFAULT_FAST_INTERVAL_MS = 2000
 
+// How long a starting watcher waits after writing its lock before reading it
+// back. The lock is not taken atomically: two watchers started at once can both
+// find it free and both write it, and neither would ever notice the other —
+// twice the screen reads, two writers to the status file, and `watcher stop`
+// reaching only one. But each writes straight after finding the lock free, so
+// two that race write within moments of each other, and once this has passed
+// the file names the one that wrote last. The other leaves.
+const LOCK_SETTLE_MS = 500
+
 function ensureDir() {
   fs.mkdirSync(STATUS_DIR, { recursive: true })
 }
@@ -536,6 +545,14 @@ async function runLoop({ requireTmuxOption }) {
   if (existing && existing.pid !== process.pid && isPidAlive(existing.pid)) return
 
   writeLock()
+  // Before the bridge socket is bound or a screen read, so the one that leaves
+  // takes nothing from the one that stays.
+  await new Promise(resolve => setTimeout(resolve, LOCK_SETTLE_MS))
+  const owner = readLock()
+  if (!owner || owner.pid !== process.pid) {
+    appendLog(`not started pid=${process.pid}: the lock is held by ${owner ? `pid=${owner.pid}` : 'no one'} now`)
+    return
+  }
   // Whoever stopped the last watcher on purpose is overruled by starting one.
   clearStopped(STATUS_DIR)
   process.env.TMUX_SCOUT_BRIDGE_SERVER = '1'

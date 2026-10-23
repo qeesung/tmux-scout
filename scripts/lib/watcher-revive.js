@@ -15,7 +15,7 @@
 // Not revived:
 //   * until it has been gone for a grace period — tmux loading the plugin
 //     starts a watcher too, the status bar is drawn in the same moment, and
-//     the watcher's lock is not taken atomically, so racing it could leave two
+//     racing it starts a second only for one of the two to step aside again
 //   * a watcher stopped on purpose — `watcher stop` leaves a marker, and any
 //     watcher that starts clears it
 //   * with @scout-watchdog off
@@ -37,7 +37,6 @@ function pathsFor(dir) {
     pid: path.join(dir, 'watcher.pid'),
     stopped: path.join(dir, 'watcher.stopped'),
     missing: path.join(dir, 'watcher-missing.since'),
-    claim: path.join(dir, 'watcher-revive.claim'),
     log: path.join(dir, 'watcher.log')
   }
 }
@@ -76,22 +75,40 @@ function clearStopped(dir = defaultDir()) {
   try { fs.unlinkSync(pathsFor(dir).stopped) } catch (_) {}
 }
 
+const CLAIM_FILE = /^watcher-revive\.(-?\d+)\.claim$/
+
+function claimFile(dir, slot) {
+  return path.join(dir, `watcher-revive.${slot}.claim`)
+}
+
 // At most one reviver per interval, across processes: the status bar of every
-// attached client and the picker can all find the watcher gone at once. The
-// file is created exclusively, so of several racing for an expired claim only
-// one gets it.
-function claim(file, now, intervalMs) {
+// attached client and the picker can all find the watcher gone at once.
+//
+// Each interval-long slot of the clock has its own claim, created exclusively,
+// so of several racing in one slot only one gets it. One claim taken over once
+// it expired — deleted, then created again — let two through: a racer that had
+// read the expired claim deleted the fresh one another had just made in its
+// place, and made its own. The slot before is still read, so a revival early
+// in a slot keeps its distance from one late in the last.
+function claim(dir, now, intervalMs) {
+  const slot = Math.floor(now / intervalMs)
   try {
-    const at = Number.parseInt(fs.readFileSync(file, 'utf-8'), 10)
+    const at = Number.parseInt(fs.readFileSync(claimFile(dir, slot - 1), 'utf-8'), 10)
     if (Number.isFinite(at) && now - at < intervalMs && now >= at) return false
-    fs.unlinkSync(file)
   } catch (_) {}
   try {
-    fs.writeFileSync(file, `${now}\n`, { flag: 'wx' })
-    return true
+    fs.writeFileSync(claimFile(dir, slot), `${now}\n`, { flag: 'wx' })
   } catch (_) {
     return false
   }
+  // Only the slot before is ever read again.
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      const match = CLAIM_FILE.exec(name)
+      if (match && Number(match[1]) < slot - 1) forget(path.join(dir, name))
+    }
+  } catch (_) {}
+  return true
 }
 
 // When the watcher was first found gone, recorded by whoever found it.
@@ -149,7 +166,7 @@ function reviveWatcher(options = {}) {
     }
     if (watchdogDisabled(watchdog)) return 'disabled'
     if (now - missingSince(files.missing, now) < REVIVE_GRACE_MS) return 'pending'
-    if (!claim(files.claim, now, REVIVE_INTERVAL_MS)) return 'throttled'
+    if (!claim(dir, now, REVIVE_INTERVAL_MS)) return 'throttled'
 
     start(options.watcherScript || path.join(__dirname, '..', 'watcher.js'))
     forget(files.missing)

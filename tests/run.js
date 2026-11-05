@@ -6148,9 +6148,9 @@ test('picker rows show the tmux session and no title by default', () => {
     _tmuxPaneSnapshot: { windowName: 'main', sessionName: 'work' }
   }
   assert.strictEqual(stripAnsi(headerLine(null)).split('\t')[1].replace(/ +/g, ' '),
-    ' STATUS AGENT SESSION WINDOW PROJECT DETAIL')
+    ' STATUS AGENT WINDOW SESSION PROJECT DETAIL')
   const row = stripAnsi(formatLine(session, Date.now(), '%9')).split('\t')[1]
-  assert.ok(/DONE +claude +work +main +demo$/.test(row), row)
+  assert.ok(/DONE +claude +main +work +demo$/.test(row), row)
   // Where the state came from is the source column's, which is not a default one.
   assert.ok(!row.includes('pane-model'), row)
 
@@ -6184,7 +6184,7 @@ test('picker columns come from @scout-picker-columns, widths and all', () => {
   assert.strictEqual(short, '  codex     BUSY')
 
   for (const value of ['', '   ', 'nothing,known', ':5', 'constructor,__proto__']) {
-    assert.deepStrictEqual(parseColumns(value), parseColumns('status,agent,session,window,project,detail'), JSON.stringify(value))
+    assert.deepStrictEqual(parseColumns(value), parseColumns('status,agent,window,session,project,detail'), JSON.stringify(value))
   }
   assert.strictEqual(parseColumns('window:0')[0].width, 60, 'a width that is no width keeps the default')
   assert.strictEqual(parseColumns('window:9999')[0].width, 200)

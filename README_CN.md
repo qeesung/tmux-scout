@@ -16,7 +16,7 @@
 
 ## 功能特性
 
-- **会话选择器** — `prefix + O` 打开 fzf 弹窗，列出所有活跃的 agent 会话，显示状态标签（`WAIT` / `BUSY` / `DONE` / `IDLE`）、tmux session 和 window 名称、项目名和实时工具详情（[显示哪些列可配置](#选择器列)），并按最近访问顺序排列
+- **会话选择器** — `prefix + O` 打开 fzf 弹窗，列出所有活跃的 agent 会话，显示状态标签（`WAIT` / `BUSY` / `DONE` / `IDLE`）、tmux window 和 session 名称、项目名和实时工具详情（[显示哪些列可配置](#选择器列)），并按最近访问顺序排列
 - **面板预览** — 右侧预览面板显示每个会话 tmux 面板的最后 40 行内容
 - **状态栏组件** — 在 tmux 的 status-right 中显示按状态分类的会话计数（如 `0|1|2`），每 2 秒刷新
 - **自动刷新** — `Ctrl-T` 切换每 2 秒自动刷新选择器
@@ -114,7 +114,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 每行默认显示：
 
 ```
-* BUSY   claude work    app-window my-project Bash: npm test
+* BUSY   claude app-window work    my-project Bash: npm test
 ```
 
 - `*` — 当前面板指示器
@@ -122,8 +122,8 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 - `BUSY` / `DONE` / `IDLE` — 会话状态
 - `INT` / `CRASH` / `STALE` — 最近被打断、异常退出或过期的会话
 - Agent 类型（claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex）
-- tmux session 名称
 - tmux window 名称（未关联 window 时显示 `-`）
+- tmux session 名称
 - 项目目录名
 - 详情：会话在等什么、为什么结束、它的 subagent，或正在运行的工具
 
@@ -195,16 +195,16 @@ set -g @scout-key "O"    # 默认: O (prefix + O)
 ### 选择器列
 
 ```bash
-set -g @scout-picker-columns 'status,agent,session,window,project,detail'      # 默认
-set -g @scout-picker-columns 'status,agent,session:10,window:24,title,detail'  # 名字:宽度 设置列宽
+set -g @scout-picker-columns 'status,agent,window,session,project,detail'      # 默认
+set -g @scout-picker-columns 'status,agent,window:24,session:10,title,detail'  # 名字:宽度 设置列宽
 ```
 
 | 列 | 最大宽度 | 显示内容 |
 |---|---|---|
 | `status` | 6 | `BUSY` / `DONE` / `W:APP` 等状态标签 |
 | `agent` | 9 | Agent 类型 |
-| `session` | 40 | tmux session 名称 |
 | `window` | 60 | tmux window 名称 |
+| `session` | 40 | tmux session 名称 |
 | `project` | 16 | 项目目录名 |
 | `title` | 50 | 会话标题（首条提示） |
 | `detail` | 55 | 会话在等什么、为什么结束、它的 subagent，或正在运行的工具 |

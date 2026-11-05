@@ -19,7 +19,7 @@ let currentPane = process.argv[3] || ''
 
 const pidStateCache = new Map()
 const COLUMNS_OPTION = '@scout-picker-columns'
-const DEFAULT_COLUMNS = 'status,agent,session,window,project,detail'
+const DEFAULT_COLUMNS = 'status,agent,window,session,project,detail'
 const MAX_COLUMN_WIDTH = 200
 // The least a column other than the last is shrunk to; the last can go to
 // nothing, since nothing after it needs lining up.

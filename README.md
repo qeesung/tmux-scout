@@ -16,7 +16,7 @@ If you prefer a zero-dependency setup without needing a Node.js runtime, check o
 
 ## Features
 
-- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux session and window names, project names, and live tool details in [columns you choose](#picker-columns), ordered by most recently visited
+- **Session picker** — `prefix + O` opens an fzf popup listing all active agent sessions with status tags (`WAIT` / `BUSY` / `DONE` / `IDLE`), tmux window and session names, project names, and live tool details in [columns you choose](#picker-columns), ordered by most recently visited
 - **Pane preview** — right-side preview panel shows the last 40 lines of each session's tmux pane
 - **Status bar widget** — displays session counts by status (e.g. `0|1|2`) in tmux's status-right, refreshed every 2 seconds
 - **Auto-refresh** — `Ctrl-T` toggles automatic picker reload every 2 seconds
@@ -114,7 +114,7 @@ Press `prefix + O` (default) to open the session picker.
 Each line shows, by default:
 
 ```
-* BUSY   claude work    app-window my-project Bash: npm test
+* BUSY   claude app-window work    my-project Bash: npm test
 ```
 
 - `*` — current pane indicator
@@ -122,8 +122,8 @@ Each line shows, by default:
 - `BUSY` / `DONE` / `IDLE` — session status
 - `INT` / `CRASH` / `STALE` — recently interrupted, crashed, or stale sessions
 - Agent type (claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex)
-- tmux session name
 - tmux window name (`-` when no window is linked)
+- tmux session name
 - Project directory name
 - Detail: what the session is waiting on, why it ended, its subagents, or the tool it is running
 
@@ -197,16 +197,16 @@ set -g @scout-key "O"    # default: O (prefix + O)
 ### Picker columns
 
 ```bash
-set -g @scout-picker-columns 'status,agent,session,window,project,detail'      # default
-set -g @scout-picker-columns 'status,agent,session:10,window:24,title,detail'  # name:width sets a width
+set -g @scout-picker-columns 'status,agent,window,session,project,detail'      # default
+set -g @scout-picker-columns 'status,agent,window:24,session:10,title,detail'  # name:width sets a width
 ```
 
 | Column | Up to | Shows |
 |---|---|---|
 | `status` | 6 | `BUSY` / `DONE` / `W:APP` and the other status tags |
 | `agent` | 9 | Agent type |
-| `session` | 40 | tmux session name |
 | `window` | 60 | tmux window name |
+| `session` | 40 | tmux session name |
 | `project` | 16 | Project directory name |
 | `title` | 50 | Session title (first prompt) |
 | `detail` | 55 | What the session is waiting on, why it ended, its subagents, or the tool it is running |

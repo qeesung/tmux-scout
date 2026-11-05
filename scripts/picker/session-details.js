@@ -120,6 +120,7 @@ function currentActivity(session) {
   if (waiting && session.pendingToolUse && session.pendingToolUse.details) return session.pendingToolUse.details
   if (session.activeTool && session.pendingToolUse && session.pendingToolUse.details) return session.pendingToolUse.details
   if (session.activeTool) return session.activeTool
+  if (phase === 'running' && session.backgroundWork) return session.backgroundWork
   if (session.currentActivity) return session.currentActivity
   if (session.lastEvent && session.lastEvent.details) return session.lastEvent.details
   if (session.stateReason) return session.stateReason

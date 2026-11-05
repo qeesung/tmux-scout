@@ -391,6 +391,8 @@ function detailCell(session, now) {
   if (phaseForSession(session) === 'running' && session.activeTool && session.pendingToolUse && session.pendingToolUse.details) {
     return { text: session.pendingToolUse.details, color: '36' }
   }
+  // A turn that ended with work left running: why a finished-looking screen is BUSY.
+  if (phaseForSession(session) === 'running' && session.backgroundWork) return { text: session.backgroundWork, color: '36' }
   return null
 }
 

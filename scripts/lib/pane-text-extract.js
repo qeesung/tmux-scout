@@ -38,7 +38,14 @@ const PANE_PATTERNS = Object.freeze({
     composerRules: true,
     toolLine: /^\s*[⏺●]\s*([A-Z][A-Za-z]*)\((.*)\)\s*$/,
     // Every message starts with one, prose and tool calls alike.
-    bullet: /^\s*[⏺●]\s/
+    bullet: /^\s*[⏺●]\s/,
+    // See extractBackgroundWork().
+    background: {
+      statusLine: /^\s*[✻✽✶✳✢✺·∙*]\s+\S/,
+      finished: /\sfor\s.*·\s*done\b/,
+      stillRunning: /·\s*([^·]*?\S)\s+still running\s*$/,
+      footer: /·\s*(\d+\s+shells?)(?=\s*(?:·|$))/
+    }
   },
   codex: {
     markers: ['»', '›'],
@@ -211,7 +218,63 @@ function extractToolLine(raw, agentType) {
   return {}
 }
 
+// How many lines above the composer the newest status line may sit. A
+// "※ recap:" summary or a "/goal active" note can come between the two.
+const STATUS_SEARCH_LINES = 12
+// Claude writes the session's name or branch into the rule above its composer
+// ("───── example-branch ─"), so here a rule only has to start like one.
+const LABELLED_RULE_LINE = /^[─━]{10,}/
+
+// What a finished turn left running: background shells or agents, which report
+// back when they end and start the agent on a turn of its own. Claude Code says
+// so in two places around its composer:
+//
+//   * the status line of the newest turn, as in "✻ Cooked for 1m 27s · done
+//     7:19 PM · 1 shell still running". Only the newest: every finished turn's
+//     line stays in the transcript, and an older one says what was running when
+//     that turn ended, not now. Found as the first status line above the
+//     composer, short of a message bullet or a prompt echo, which belong to an
+//     earlier turn — and a working turn's spinner line is a status line too, so
+//     a turn under way never reads the finished line above it.
+//   * the footer under the composer, as in "⏵⏵ bypass permissions on · 1 shell",
+//     which counts the shells still running whatever the status line said.
+//
+// "← 3 agents" in the same footer is neither: it is on every pane, finished
+// turns and running ones alike, and says nothing about what is running.
+//
+// Returns what is running, such as "1 shell still running"; null when the
+// composer was found and nothing is; undefined when there is no telling.
+function extractBackgroundWork(raw, agentType) {
+  const patterns = patternsFor(agentType)
+  const background = patterns.background
+  if (!raw || !background) return undefined
+  const lines = withoutTrailingBlankRows(raw).split('\n')
+  const composer = findComposerIndex(lines, patterns, DEFAULT_COMPOSER_WINDOW)
+  if (composer < 0) return undefined
+
+  // The status line first: it names agents as well as shells.
+  const floor = Math.max(0, composer - 1 - STATUS_SEARCH_LINES)
+  for (let i = composer - 1; i >= floor; i--) {
+    const line = cleanLine(lines[i])
+    if (LABELLED_RULE_LINE.test(line.trim())) continue
+    if (patterns.bullet.test(line) || promptContent(line, patterns.markers) !== null) break
+    if (!background.statusLine.test(line)) continue
+    const match = background.finished.test(line) && line.match(background.stillRunning)
+    if (match) return `${match[1]} still running`
+    break
+  }
+
+  let lower = composer + 1
+  while (lower < lines.length && !LABELLED_RULE_LINE.test(cleanLine(lines[lower]).trim())) lower++
+  for (let i = lower + 1; i < lines.length; i++) {
+    const match = cleanLine(lines[i]).match(background.footer)
+    if (match) return `${match[1]} still running`
+  }
+  return null
+}
+
 module.exports = {
+  extractBackgroundWork,
   extractPromptAndTitle,
   extractToolLine
 }

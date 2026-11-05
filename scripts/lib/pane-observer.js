@@ -26,7 +26,7 @@
 
 const { capturePanes, DEFAULT_TAIL_LINES } = require('./pane-capture')
 const { answerCacheKey, createAnswerCache } = require('./pane-answer-cache')
-const { extractPromptAndTitle, extractToolLine } = require('./pane-text-extract')
+const { extractBackgroundWork, extractPromptAndTitle, extractToolLine } = require('./pane-text-extract')
 const {
   PANE_QUESTION_SET_VERSION,
   buildPaneState,
@@ -621,6 +621,7 @@ function createPaneObserver(options = {}) {
     const value = extractPromptAndTitle(capturedPane.raw, agentType) || {}
     const tool = extractToolLine(capturedPane.raw, agentType)
     if (tool && tool.details) value.pendingDetails = tool.details
+    value.backgroundWork = extractBackgroundWork(capturedPane.raw, agentType)
     extractionMemo.set(capturedPane, { agentType, value })
     return value
   }

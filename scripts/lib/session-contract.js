@@ -71,6 +71,7 @@ const SESSION_CONTRACT_VERSION = 1
  * @property {{tool?: string, details?: string, timestamp?: number}|null=} pendingToolUse
  * @property {PendingInteraction|null=} pendingInteraction
  * @property {string|null=} activeTool
+ * @property {string|null=} backgroundWork  what a finished turn left running, e.g. "1 shell still running"
  * @property {boolean=} isRalphLoopIteration
  * @property {{active?: boolean, iteration?: number, maxIterations?: number, completionPromise?: string|null, updatedAt?: number}=} ralphLoop
  * @property {StateEvidence[]=} stateEvidence
@@ -218,6 +219,7 @@ const SESSION_SNAPSHOT_SCHEMA = Object.freeze({
     pendingToolUse: FIELD_TYPES.OBJECT,
     pendingInteraction: FIELD_TYPES.OBJECT,
     activeTool: FIELD_TYPES.STRING,
+    backgroundWork: FIELD_TYPES.STRING,
     currentTurnId: FIELD_TYPES.STRING,
     turnStartedAt: FIELD_TYPES.NUMBER,
     turnEndedAt: FIELD_TYPES.NUMBER,

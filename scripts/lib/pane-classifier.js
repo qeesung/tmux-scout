@@ -205,13 +205,32 @@ function displayFieldsChanged(session, interp, extracted) {
   // Not compared for a wait: the event deliberately omits activeTool so that
   // sameWaitRefresh() holds, so the session's value can never converge on the
   // reading's and this would report a change on every single tick.
-  if (!PENDING_INTERACTION_PHASES.has(interp.phase) &&
-    (session.activeTool || null) !== (interp.activeTool || null)) return true
+  const inWait = PENDING_INTERACTION_PHASES.has(interp.phase)
+  if (!inWait && (session.activeTool || null) !== (interp.activeTool || null)) return true
   if (extracted) {
     if (extracted.lastUserPrompt && session.lastUserPrompt !== extracted.lastUserPrompt) return true
     if (extracted.sessionTitle && session.sessionTitle !== extracted.sessionTitle) return true
+    // Not for a wait either, for the same reason: a wait's event carries none.
+    if (!inWait && extracted.backgroundWork !== undefined &&
+      (session.backgroundWork || null) !== (extracted.backgroundWork || null)) return true
   }
   return pendingInteractionChanged(session, interp, extracted)
+}
+
+// A turn that ended with a shell or an agent still running in the background
+// is not over: when that work ends it reports back, and the agent takes up a
+// turn of its own without anyone typing. The model reads such a screen as
+// idle_ready — the composer is up and the status line is past tense — and is
+// right about the screen; the session is running all the same. What is still
+// running is read off the same line by the extractor, not asked of the model,
+// so the question set and its cached answers are untouched.
+function withBackgroundWork(interp, extracted) {
+  if (interp.phase !== SESSION_PHASES.COMPLETED || !extracted || !extracted.backgroundWork) return interp
+  return Object.assign({}, interp, {
+    phase: SESSION_PHASES.RUNNING,
+    activeTool: null,
+    backgroundWork: extracted.backgroundWork
+  })
 }
 
 // Which canonical event announces a given phase. This is the whole point of the
@@ -263,7 +282,9 @@ function baseEvent(type, interp, options, now) {
     rawEventName: `pane_${interp.verdict}`,
     timestamp: now,
     confidence: interp.confidence,
-    reason: `pane read as ${interp.verdict}`,
+    reason: interp.backgroundWork
+      ? `pane read as ${interp.verdict}, ${interp.backgroundWork}`
+      : `pane read as ${interp.verdict}`,
     tmuxPane: (capture && capture.paneId) || session.tmuxPane
   }
 }
@@ -276,13 +297,14 @@ function baseEvent(type, interp, options, now) {
 //
 // Leaving a WAIT takes two events, because the reducer models it as two facts:
 // the user acted (the resolver), and the screen now shows something else.
-function paneEventsFromInterpretation(interp, options = {}) {
+function paneEventsFromInterpretation(reading, options = {}) {
   const session = options.session || {}
   const extracted = options.extracted
   const now = Number.isFinite(options.now) ? options.now : Date.now()
   const current = currentPhase(session)
 
-  if (interp.gate !== 'accept') return []
+  if (reading.gate !== 'accept') return []
+  const interp = withBackgroundWork(reading, extracted)
 
   const inWait = PENDING_INTERACTION_PHASES.has(current)
 
@@ -360,6 +382,12 @@ function stateEvent(type, interp, options, now) {
     // screen, so the prompt echo is usually readable only right after it is sent.
     updates.lastUserPrompt = extracted.lastUserPrompt
     updates.sessionTitle = extracted.sessionTitle
+    // null clears it: the work it named has ended. Not sent with a wait, whose
+    // dialog hides the composer it is read around.
+    if (!PENDING_INTERACTION_PHASES.has(interp.phase)) {
+      const background = extracted.backgroundWork
+      updates.backgroundWork = background || (background === null && session.backgroundWork ? null : undefined)
+    }
   }
   if (Object.keys(updates).length > 0) event.updates = updates
 

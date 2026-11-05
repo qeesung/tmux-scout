@@ -52,7 +52,7 @@ const { loadPaneFixtures } = require('../scripts/lib/pane-fixtures')
 const { answerCacheKey, createAnswerCache } = require('../scripts/lib/pane-answer-cache')
 const { readShadow } = require('../scripts/lib/pane-store')
 const { createPaneMetrics, readMetrics } = require('../scripts/lib/pane-metrics')
-const { extractPromptAndTitle, extractToolLine } = require('../scripts/lib/pane-text-extract')
+const { extractBackgroundWork, extractPromptAndTitle, extractToolLine } = require('../scripts/lib/pane-text-extract')
 const {
   interpretPaneAnswers,
   paneEventsFromInterpretation
@@ -2296,6 +2296,65 @@ test('extractToolLine reads the most recent codex tool invocation', () => {
   assert.deepStrictEqual(extractToolLine('  nothing here', 'codex'), {})
 })
 
+// Claude's chrome around a finished turn, with what the status line and the
+// footer say left as the parts a test fills in.
+function claudeFinishedPane({ status = '✻ Cooked for 1m 27s · done 7:19 PM', footer = '', above = [], rule = '─'.repeat(40) } = {}) {
+  return [
+    '❯ start the stub generator and tell me when it is done',
+    '',
+    '⏺ gostub is still running; the background task will tell me when it ends.',
+    '',
+    ...above,
+    status,
+    '',
+    rule,
+    '❯ ',
+    '─'.repeat(40),
+    '  󰉋 example-repo 󰘬 main  Opus 5 ctx:58%',
+    `  -- INSERT -- ⏵⏵ bypass permissions on${footer} · ← 3 agents`
+  ].join('\n')
+}
+
+test('extractBackgroundWork reads what a finished turn left running', () => {
+  assert.strictEqual(
+    extractBackgroundWork(claudeFinishedPane({ status: '✻ Cooked for 1m 27s · done 7:19 PM · 1 shell still running' }), 'claude'),
+    '1 shell still running')
+  assert.strictEqual(
+    extractBackgroundWork(claudeFinishedPane({ status: '✻ Brewed for 3m · done 7:40 PM · 1 shell, 2 agents still running' }), 'claude'),
+    '1 shell, 2 agents still running')
+  // The footer counts shells live, and the rule above the composer may carry the
+  // session's name.
+  assert.strictEqual(
+    extractBackgroundWork(claudeFinishedPane({ footer: ' · 2 shells', rule: `${'─'.repeat(30)} bytees-dev ─` }), 'claude'),
+    '2 shells still running')
+  // A recap or a /goal note may sit between the status line and the composer.
+  assert.strictEqual(
+    extractBackgroundWork(claudeFinishedPane({
+      status: '✻ Cooked for 1m 27s · done 7:19 PM · 1 shell still running'
+    }).replace('\n\n─', '\n※ recap: the generator is still pulling kitex_gen.\n◎ /goal active (31m)\n─'), 'claude'),
+    '1 shell still running')
+})
+
+test('extractBackgroundWork finds nothing running where nothing is', () => {
+  // Every pane has "← 3 agents" in its footer, finished or not.
+  assert.strictEqual(extractBackgroundWork(claudeFinishedPane(), 'claude'), null)
+  // An earlier turn's line stays in the transcript; only the newest one counts.
+  const older = claudeFinishedPane({
+    above: ['✻ Sautéed for 3m 40s · done 7:10 PM · 1 shell still running', '', '❯ go on', '', '⏺ Done.', '']
+  })
+  assert.strictEqual(extractBackgroundWork(older, 'claude'), null)
+  // A turn under way shows its spinner line, not the finished one above it.
+  const working = claudeFinishedPane({ status: '✻ Cooking… (12s · ↓ 1.2k tokens)' })
+  assert.strictEqual(extractBackgroundWork(working, 'claude'), null)
+  // No composer — a dialog in its place — is no telling, not "nothing".
+  assert.strictEqual(extractBackgroundWork('╭────╮\n│ Do you want to proceed?\n│ ❯ 1. Yes\n╰────╯', 'claude'), undefined)
+  assert.strictEqual(extractBackgroundWork(claudeFinishedPane(), 'codex'), undefined)
+  assert.strictEqual(extractBackgroundWork('', 'claude'), undefined)
+
+  const fixture = loadPaneFixtures().find(item => item.id === 'claude/done-after-tool')
+  assert.strictEqual(extractBackgroundWork(fixture.text, 'claude'), '1 shell still running')
+})
+
 function paneAnswers(overrides = {}) {
   const base = {
     screen_state: { type: 'choice', choice: 'working', confidence: 0.9 },
@@ -2484,6 +2543,60 @@ test('the transition table maps every reading onto events hooks already speak', 
     )
     for (const event of events) assert.strictEqual(event.stateSource, 'pane-model')
   }
+})
+
+test('a finished turn with work still running in the background stays running', () => {
+  const finished = confidently('idle_ready', { is_running: { noul: 0.05 } })
+  const background = { extracted: { composer: true, backgroundWork: '1 shell still running' } }
+
+  // The turn that started the shell is still the session's turn: nothing to say
+  // beyond what is running.
+  const running = { sessionId: 's1', agentType: 'claude', phase: 'running', status: 'working', lastUserPrompt: 'go' }
+  const events = paneEvents(finished, running, { options: background })
+  assert.deepStrictEqual(events.map(event => event.type), [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE])
+  assert.strictEqual(events[0].updates.backgroundWork, '1 shell still running')
+  assert.strictEqual(events[0].reason, 'pane read as idle_ready, 1 shell still running')
+  applySessionEvent(running, events[0])
+  assert.strictEqual(currentPhase(running), 'running')
+  assert.strictEqual(running.backgroundWork, '1 shell still running')
+  // Read again unchanged, it changes nothing.
+  assert.deepStrictEqual(paneEvents(finished, running, { options: background }), [])
+
+  // A session already marked done is reopened.
+  const done = { sessionId: 's1', agentType: 'claude', phase: 'completed', status: 'completed', lastUserPrompt: 'go' }
+  assert.deepStrictEqual(paneEvents(finished, done, { options: background }).map(event => event.type),
+    [AGENT_EVENTS.ASSISTANT_MESSAGE_UPDATE])
+
+  // The work ends, the agent takes up its own turn, and that one finishes clean.
+  const after = paneEvents(finished, running, { options: { extracted: { composer: true, backgroundWork: null } } })
+  assert.deepStrictEqual(after.map(event => event.type), [AGENT_EVENTS.TURN_COMPLETE])
+  assert.strictEqual(after[0].updates.backgroundWork, null)
+  applySessionEvent(running, after[0])
+  assert.strictEqual(currentPhase(running), 'completed')
+  assert.strictEqual(running.backgroundWork, null)
+
+  // A session that never ran anything in the background is not given the field.
+  const plain = { sessionId: 's2', agentType: 'claude', phase: 'running', status: 'working', lastUserPrompt: 'go' }
+  const clean = paneEvents(finished, plain, { options: { extracted: { composer: true, backgroundWork: null } } })
+  assert.ok(!('backgroundWork' in clean[0].updates) || clean[0].updates.backgroundWork === undefined)
+})
+
+test('the picker says what a running session left running', () => {
+  const session = {
+    sessionId: 'session-background',
+    agentType: 'claude',
+    phase: 'running',
+    status: 'working',
+    tmuxPane: '%1',
+    workingDirectory: '/tmp/demo',
+    backgroundWork: '1 shell still running',
+    _tmuxPaneSnapshot: { windowName: 'main', sessionName: 'work' }
+  }
+  const row = stripAnsi(formatLine(session, Date.now(), '%9')).split('\t')[1]
+  assert.ok(/BUSY +claude +main +work +demo +1 shell still running$/.test(row), row)
+  // Left over on a session that has since finished, it is not shown.
+  const finished = Object.assign({}, session, { phase: 'completed', status: 'completed' })
+  assert.ok(!stripAnsi(formatLine(finished, Date.now(), '%9')).includes('still running'))
 })
 
 test('leaving a wait takes a resolver first, then the state it moved to', () => {

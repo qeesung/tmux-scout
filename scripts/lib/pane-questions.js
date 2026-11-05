@@ -117,6 +117,10 @@ const HINT_SLOTS = Object.freeze([
   'chrome'
 ])
 
+// Claude's `finished` hint calls a turn that left "1 shell still running" over,
+// and as a reading of the screen it is: the composer is up. That the session is
+// still busy is decided in code, from the same line (see withBackgroundWork in
+// pane-classifier.js), so no wording here has to carry it.
 const AGENT_SCREENS = Object.freeze({
   claude: {
     composer:

@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 finished on a message that asks a question",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

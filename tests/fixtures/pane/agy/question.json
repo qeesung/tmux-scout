@@ -1,0 +1,9 @@
+{
+  "name": "agy 1.5.17 question dialog with numbered choices",
+  "agent": "agy",
+  "expect": {
+    "choice": "awaiting_answer",
+    "phase": "waitingForAnswer",
+    "pendingInteractionType": "question"
+  }
+}

@@ -1,0 +1,29 @@
+
+  Read a.txt. Its contents:                                                                        
+
+    alpha                  
+
+────────────────────────────────────────────────────────────
+> Reply with exactly this sentence and nothing else: Should I also add tests for this?
+
+  Should I also add tests for this?
+
+────────────────────────────────────────────────────────────
+> 请在终端运行 `sleep 15 && ls`，然后告诉我输出。
+
+● Ran (sleep 15 && ls) (ctrl+o to expand)
+
+Command                                                                               
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   sleep 15 && ls                                           
+
+Run this command?
+> 1. Yes, run command                        
+  2. Yes, and always allow in this conversation for commands that start with 'sleep'                
+  3. Yes, and always allow for commands that start with 'sleep' (Persist to settings.json)          
+  4. No, cancel                                                                                     
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command                                             
+esc to cancel                                                                 Gemini Pro · high

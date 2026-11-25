@@ -1,0 +1,29 @@
+
+Resume with -c (or command below):                   
+agy --conversation=00000000-0000-0000-0000-000000000000
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.17
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo
+  ▄▀▀      ▀▀▄
+
+> /model
+  ⎿  Model set to Gemini Pro (High)
+
+────────────────────────────────────────────────────────────
+> Run `sleep 30 && echo finished` in the shell and wait for it.
+
+○ Thought for 30.0s (The `run_command` tool is designed for both synchronous and asynchronous e...)
+● Ran (sleep 30 && echo finished) (ctrl+o to expand)
+
+  ⎿  Interrupted · What should Antigravity CLI do instead?
+────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Resume with -c (or command below):
+agy --conversation=00000000-0000-0000-0000-000000000000
+user@host example-repo $ 
+

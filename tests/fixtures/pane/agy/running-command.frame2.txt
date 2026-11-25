@@ -1,0 +1,29 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.17             
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo                                                                
+  ▄▀▀      ▀▀▄
+
+> /model                                                                                            
+  ⎿  Model set to Gemini Pro (High)
+
+────────────────────────────────────────────────────────────                                        
+> Run `sleep 30 && echo finished` in the shell and wait for it.
+
+○ Thought for 30.0s (The `run_command` tool is designed for both synchronous and asynchronous e...) 
+○ Running (sleep 30 && echo finished) (ctrl+o to expand)
+⢿  Running command... 6s                                                                            
+────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● [16:17:05] sleep 30 && echo finished running                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                            Gemini Pro · high · 1 task(s) · /tasks
+
+
+
+
+
+
+

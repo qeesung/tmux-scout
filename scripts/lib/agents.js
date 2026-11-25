@@ -92,6 +92,18 @@ const AGENTS = [
     color: '38;5;48',
     processNames: ['traex'],
     commandIncludes: ['traex-cli', /\/traex\b/]
+  },
+  {
+    // Google Antigravity CLI: a single Go binary. No `antigravity` alias: aliases
+    // score as substrings, and the desktop app's "Antigravity Helper" processes
+    // would then read as this agent. The anchored needle also skips argv such
+    // as `agy-favicon`.
+    id: 'agy',
+    label: 'agy',
+    brandColor: '#dbb131',
+    color: '38;5;220',
+    processNames: ['agy'],
+    commandIncludes: [/(^|\/)agy(\s|$)/]
   }
 ]
 

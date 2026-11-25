@@ -7,7 +7,7 @@ const { createHookContext, readStdin, liveSessionState, isMeaningfulSubagentActi
 const { AGENT_EVENTS } = require('../lib/agent-events')
 const { internalPromptReason } = require('../lib/codex-session-classifier')
 const { notificationText } = require('../lib/notification-intent')
-const { safeSessionId } = require('../lib/session-registry')
+const { currentPhase, safeSessionId } = require('../lib/session-registry')
 
 function argValue(names) {
   const args = process.argv.slice(2)
@@ -660,7 +660,7 @@ function handleCopilot(data, sessionId, eventName, now) {
   if (eventName === 'sessionEnd') return sessionEnd(data, sessionId, now)
 }
 
-function openCodeTerminalKey(data, now) {
+function terminalKey(data, now) {
   const runtime = baseUpdates(data, now)
   const tmuxPane = nonEmptyString(runtime.tmuxPane)
   if (tmuxPane) return `pane:${tmuxPane}`
@@ -671,23 +671,30 @@ function openCodeTerminalKey(data, now) {
   return null
 }
 
-function openCodeTerminalMarkerPath(key) {
-  return path.join(hookContext.paths.runDir, 'opencode-hooks', 'terminal-sessions', `${encodeURIComponent(key)}.json`)
+// The conversation a terminal last started, per agent. A CLI that starts a new
+// conversation in the same pane (OpenCode, agy's /clear) sends no end for the
+// old one, which would otherwise stay on whatever phase it last had.
+function terminalMarkerDir(markerDir) {
+  return path.join(hookContext.paths.runDir, markerDir, 'terminal-sessions')
 }
 
-function readOpenCodeTerminalSession(key) {
+function terminalMarkerPath(markerDir, key) {
+  return path.join(terminalMarkerDir(markerDir), `${encodeURIComponent(key)}.json`)
+}
+
+function readTerminalSession(markerDir, key) {
   if (!key) return null
   try {
-    const value = JSON.parse(fs.readFileSync(openCodeTerminalMarkerPath(key), 'utf-8'))
+    const value = JSON.parse(fs.readFileSync(terminalMarkerPath(markerDir, key), 'utf-8'))
     return value && value.sessionId ? value.sessionId : null
   } catch (_) {
     return null
   }
 }
 
-function writeOpenCodeTerminalSession(key, sessionId) {
+function writeTerminalSession(markerDir, key, sessionId) {
   if (!key) return
-  const filePath = openCodeTerminalMarkerPath(key)
+  const filePath = terminalMarkerPath(markerDir, key)
   const tempPath = `${filePath}.tmp.${process.pid}`
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
   try {
@@ -699,8 +706,8 @@ function writeOpenCodeTerminalSession(key, sessionId) {
   }
 }
 
-function clearOpenCodeTerminalSession(sessionId) {
-  const dir = path.join(hookContext.paths.runDir, 'opencode-hooks', 'terminal-sessions')
+function clearTerminalSession(markerDir, sessionId) {
+  const dir = terminalMarkerDir(markerDir)
   try {
     for (const name of fs.readdirSync(dir)) {
       const filePath = path.join(dir, name)
@@ -712,23 +719,29 @@ function clearOpenCodeTerminalSession(sessionId) {
   } catch (_) {}
 }
 
+// Completes the conversation this terminal started before `sessionId`, then
+// records `sessionId` as the terminal's current one.
+function supersedeTerminalSession(markerDir, data, sessionId, now, details) {
+  const key = terminalKey(data, now)
+  const previousSessionId = readTerminalSession(markerDir, key)
+  if (previousSessionId && previousSessionId !== sessionId) {
+    updateSession(previousSessionId, {
+      status: 'completed',
+      needsAttention: null,
+      pendingToolUse: null,
+      activeTool: null,
+      lastEvent: { type: AGENT_EVENTS.SESSION_END, timestamp: now, details }
+    })
+  }
+  writeTerminalSession(markerDir, key, sessionId)
+}
+
 function handleOpenCode(data, sessionId, eventName, now) {
   // The reference implementation ignores every OpenCode child-agent hook. These payloads reuse the
   // parent's session_id, so processing them would corrupt the parent phase.
   if (data.agent_id) return
   if (eventName === 'SessionStart') {
-    const terminalKey = openCodeTerminalKey(data, now)
-    const previousSessionId = readOpenCodeTerminalSession(terminalKey)
-    if (previousSessionId && previousSessionId !== sessionId) {
-      updateSession(previousSessionId, {
-        status: 'completed',
-        needsAttention: null,
-        pendingToolUse: null,
-        activeTool: null,
-        lastEvent: { type: AGENT_EVENTS.SESSION_END, timestamp: now, details: 'newer OpenCode session in terminal' }
-      })
-    }
-    writeOpenCodeTerminalSession(terminalKey, sessionId)
+    supersedeTerminalSession('opencode-hooks', data, sessionId, now, 'newer OpenCode session in terminal')
     return sessionStart(data, sessionId, now, data.session_title)
   }
   if (eventName === 'UserPromptSubmit') return promptSubmit(data, sessionId, now, data.prompt)
@@ -760,7 +773,7 @@ function handleOpenCode(data, sessionId, eventName, now) {
     }), sessionId, now, false)
   }
   if (eventName === 'SessionEnd') {
-    clearOpenCodeTerminalSession(sessionId)
+    clearTerminalSession('opencode-hooks', sessionId)
     return sessionEnd(data, sessionId, now)
   }
 }
@@ -1592,7 +1605,119 @@ function handleHermes(data, sessionId, eventName, now) {
   }
 }
 
+// Antigravity CLI (agy). Verified against agy 1.5.17.
+//
+// Its payload is camelCase and nests the tool call (`toolCall: {id, name,
+// args}`, args in PascalCase such as `CommandLine`), so it is reshaped into the
+// fields the shared helpers read before anything else looks at it.
+//
+// What its six events can and cannot say:
+//   * SessionStart fires with a conversation's first message, not at launch,
+//     and again for the first message after /clear, under a new conversationId.
+//   * PreInvocation fires before every model call; invocationNum restarts at 0
+//     with each message the person sends, which is what marks a turn.
+//   * There is no approval, notification or session-end event, and PreToolUse
+//     runs before the permission decision: hooks never see an approval wait.
+//   * Esc and a declined approval end the turn without a Stop, so the turn
+//     stays running here until the next message. Reading the screen sees both.
+const AGY_TOOL_ARG_KEYS = Object.freeze({
+  CommandLine: 'command',
+  AbsolutePath: 'file_path',
+  TargetFile: 'file_path',
+  Path: 'file_path',
+  Url: 'url',
+  Query: 'query'
+})
+const AGY_FAILED_STOPS = new Set(['ERROR', 'MAX_INVOCATIONS', 'MAX_FORCED_INVOCATIONS', 'MAX_TOKEN_BUDGET_EXCEEDED'])
+
+function agyToolInput(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return args
+  const input = Object.assign({}, args)
+  for (const [from, to] of Object.entries(AGY_TOOL_ARG_KEYS)) {
+    if (input[to] === undefined && typeof args[from] === 'string' && args[from]) input[to] = args[from]
+  }
+  return input
+}
+
+// ~/.gemini/config/hooks.json is read by the desktop app and the IDE as well,
+// and an IDE started from tmux carries TMUX_PANE. Their transcripts live under
+// antigravity/ and antigravity-ide/ rather than antigravity-cli/.
+function isAgyCliPayload(data) {
+  const product = String(data.transcriptPath || data.artifactDirectoryPath || '')
+  return !product || product.includes('/antigravity-cli/')
+}
+
+function normalizeAgyPayload(data) {
+  const call = data.toolCall && typeof data.toolCall === 'object' ? data.toolCall : null
+  const normalized = Object.assign({}, data, {
+    session_id: data.conversationId,
+    hook_event_name: data.hookEventName || data.hook_event_name,
+    // Hooks run in the directory holding hooks.json, so process.cwd() is never
+    // the project.
+    cwd: data.cwd || (Array.isArray(data.workspacePaths) ? data.workspacePaths[0] : undefined),
+    // Not a format stop() can read, and it would read the whole file each turn.
+    transcriptPath: undefined
+  })
+  if (call) {
+    normalized.tool_name = call.name
+    normalized.tool_call_id = call.id
+    normalized.tool_input = agyToolInput(call.args)
+  }
+  return normalized
+}
+
+function interrupted(data, sessionId, now) {
+  resolvePendingInteraction(sessionId, data, now, 'turn cancelled')
+  updateSession(sessionId, Object.assign(baseUpdates(data, now), {
+    status: 'completed',
+    needsAttention: null,
+    pendingToolUse: null,
+    activeTool: null,
+    lastEvent: { type: AGENT_EVENTS.INTERRUPTED, timestamp: now, details: 'turn cancelled' }
+  }))
+}
+
+function handleAgy(data, sessionId, eventName, now) {
+  if (eventName === 'SessionStart') {
+    supersedeTerminalSession('agy-hooks', data, sessionId, now, 'newer agy conversation in terminal')
+    return sessionStart(data, sessionId, now, titleFromPrompt(data.lastUserInput))
+  }
+  if (eventName === 'PreInvocation') {
+    // Every model call blocks on this hook, so a call inside a running turn
+    // writes nothing. A turn starts at invocation 0; any later call that finds
+    // the turn no longer running (a background task reporting back) reopens it.
+    const session = hookContext.readSession(sessionId)
+    const turnStart = !(Number(data.invocationNum) > 0)
+    if (!turnStart && session && currentPhase(session) === 'running') return
+    return promptSubmit(data, sessionId, now, data.lastUserInput || (session && session.lastUserPrompt))
+  }
+  if (eventName === 'PreToolUse') {
+    const question = data.tool_name === 'ask_question' ? structuredQuestionText(data.tool_input) : null
+    if (question) return permissionRequest(data, sessionId, now, question)
+    return toolUse(data, sessionId, now)
+  }
+  if (eventName === 'PostToolUse') {
+    // `error` is "" on success. Ends an ask_question wait like any other tool.
+    const failure = Boolean(data.error)
+    postToolUse(data, sessionId, now, failure)
+    return updateActivity(data, sessionId, now, toolCompletionActivity(data, failure))
+  }
+  if (eventName === 'Stop') {
+    const reason = String(data.terminationReason || '')
+    if (reason === 'USER_CANCELED') return interrupted(data, sessionId, now)
+    if (AGY_FAILED_STOPS.has(reason)) {
+      const error = data.error || reason
+      return stop(Object.assign({}, data, { error, error_message: error }), sessionId, now, true, { resolvePending: true })
+    }
+    return stop(data, sessionId, now, false, { resolvePending: true })
+  }
+}
+
 function handlePayload(data) {
+  if (agentType === 'agy') {
+    if (!nonEmptyString(data.conversationId) || !isAgyCliPayload(data)) return
+    data = normalizeAgyPayload(data)
+  }
   const eventName = getEventName(data)
   const now = Date.now()
   // The reference TraexCliAdapter ACKs payloads without the protocol session_id. A cwd
@@ -1619,6 +1744,7 @@ function handlePayload(data) {
   if (agentType === 'cursor') return handleCursor(data, sessionId, eventName, now)
   if (agentType === 'coco' || agentType === 'trae') return handleCoco(data, sessionId, eventName, now)
   if (agentType === 'traex') return handleTraex(data, sessionId, eventName, now)
+  if (agentType === 'agy') return handleAgy(data, sessionId, eventName, now)
   if (agentType === 'hermes') {
     if (routeHermesChildEvent(data, sessionId, eventName, now)) return
     return handleHermes(data, sessionId, eventName, now)

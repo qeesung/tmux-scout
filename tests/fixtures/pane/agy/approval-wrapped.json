@@ -1,0 +1,9 @@
+{
+  "name": "agy 1.5.17 command approval whose long options wrap",
+  "agent": "agy",
+  "expect": {
+    "choice": "awaiting_approval",
+    "phase": "waitingForApproval",
+    "pendingInteractionType": "approval"
+  }
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // tmux-scout unified hook setup
-// Usage: node setup.js <install|uninstall|status> [--claude|--codex|--gemini|--kimi|--copilot-cli|--opencode|--cursor|--hermes|--trae|--traex] [--quiet] [--any]
+// Usage: node setup.js <install|uninstall|status> [--claude|--codex|--gemini|--kimi|--copilot-cli|--opencode|--cursor|--hermes|--trae|--traex|--agy] [--quiet] [--any]
 
 const path = require('path')
 const { spawnSync } = require('child_process')
@@ -323,7 +323,7 @@ function doDebug() {
 
 // Main dispatch
 if (!command || !['install', 'uninstall', 'status', 'doctor', 'debug', 'watcher', 'watchdog'].includes(command)) {
-  console.log('Usage: node setup.js <install|uninstall|status|doctor|debug|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--trae] [--traex] [--quiet] [--any]')
+  console.log('Usage: node setup.js <install|uninstall|status|doctor|debug|watcher> [--claude] [--codex] [--gemini] [--kimi] [--copilot-cli] [--opencode] [--cursor] [--hermes] [--trae] [--traex] [--agy] [--quiet] [--any]')
   console.log('       node setup.js watcher <status|stop|once|run> [--full] [--quiet]')
   console.log('       node setup.js debug <list|show|evidence|inject|replay> [...]')
   process.exit(command ? 1 : 0)

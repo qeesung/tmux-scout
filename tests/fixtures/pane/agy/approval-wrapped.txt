@@ -1,0 +1,29 @@
+○ Thought for 11.9s (A short echo command is enough here; its output will be reported back ...)
+● Ran (echo hello) (ctrl+o to expand)
+
+  Ran echo hello (exit code 0). Output:               
+
+    hello
+
+────────────────────────────────────────────────────────────
+> Fetch https://example.com and tell me the page title.
+
+○ Thought for 15.1s (The available tools lack a direct URL fetching capability; `run_command` s...)
+● Ran (curl -sL --max-time 15 https://example.com) (ctrl+o to expand)
+
+Command                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   curl -sL --max-time 15 https://example.com
+
+Run this command?                                           
+> 1. Yes, run command                                  
+  2. Yes, and always allow in this conversation for commands that start with 'curl -sL --max-time 15
+https://example.com'                                                                               
+  3. Yes, and always allow for commands that start with 'curl -sL --max-time 15 https://example.com'
+(Persist to settings.json)                                                                          
+  4. No, cancel                                                                                     
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command                                             
+esc to cancel                                                                 Gemini Pro · high

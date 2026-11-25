@@ -1,0 +1,29 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.17
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Run `sleep 12 && echo alt` in the shell and wait for it.
+
+○ Thought for 41.4s (The task involves running a command that sleeps for 12 seconds and then ec...)
+● Running (sleep 12 && echo alt) (ctrl+o to expand)                                                
+
+
+
+
+
+
+
+
+
+
+
+⣽  Running command... 6s                                                                            
+└ Tip: Use /help to see all commands.                                                     
+────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                 Gemini Pro · high

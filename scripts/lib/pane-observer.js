@@ -26,7 +26,7 @@
 
 const { capturePanes, DEFAULT_TAIL_LINES } = require('./pane-capture')
 const { answerCacheKey, createAnswerCache } = require('./pane-answer-cache')
-const { extractBackgroundWork, extractPromptAndTitle, extractToolLine } = require('./pane-text-extract')
+const { extractBackgroundWork, extractBusyStatus, extractPromptAndTitle, extractToolLine } = require('./pane-text-extract')
 const {
   PANE_QUESTION_SET_VERSION,
   buildPaneState,
@@ -622,6 +622,7 @@ function createPaneObserver(options = {}) {
     const tool = extractToolLine(capturedPane.raw, agentType)
     if (tool && tool.details) value.pendingDetails = tool.details
     value.backgroundWork = extractBackgroundWork(capturedPane.raw, agentType)
+    value.busyStatus = extractBusyStatus(capturedPane.raw, agentType)
     extractionMemo.set(capturedPane, { agentType, value })
     return value
   }
@@ -726,6 +727,15 @@ function createPaneObserver(options = {}) {
       // not itself pass — a rejected 0.1 followed by a 0.99 was a "streak of
       // two" before, and cleared a WAIT on one trusted reading. Only readings
       // taken while the session is in the wait count toward leaving it.
+      // A status line the extractor found (see extractBusyStatus) is drawn only
+      // once a dialog has handed the composer back, so it grades as strictly as
+      // a confident reading — whatever the model made of the words on it. Low
+      // readings of "Working..." and "Loading..." otherwise kept resetting the
+      // evidence, and an answered question stayed WAIT for half a minute.
+      if (PENDING_INTERACTION_PHASES.has(phaseNow) && reading.extracted && reading.extracted.busyStatus &&
+        !(interp.gate === 'accept' && PENDING_INTERACTION_PHASES.has(interp.phase))) {
+        interp.exitGrade = 'strict'
+      }
       if (PENDING_INTERACTION_PHASES.has(phaseNow) && interp.exitGrade !== null) {
         state.exitStreak = interp.exitGrade === 'strict' ? state.exitStreak + 1 : 0
         if (state.exitSince === null) state.exitSince = reading.at

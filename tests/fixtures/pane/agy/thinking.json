@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 generating, braille spinner over the composer",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

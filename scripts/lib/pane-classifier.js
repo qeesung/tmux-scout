@@ -233,6 +233,31 @@ function withBackgroundWork(interp, extracted) {
   })
 }
 
+// A turn whose status line is on screen is running, whatever the model made of
+// the words on it (see extractBusyStatus). Covers a reading that says the turn
+// is over and one the gate rejected; a reading that the agent is waiting, or of
+// a shell prompt, stands. In a wait it applies only once the evidence for
+// leaving it is in (`resolvesWait`, which the observer builds up over
+// readings, counting the status line as strict evidence): one frame is never
+// enough to dismiss a dialog.
+const OVER_PHASES = new Set([SESSION_PHASES.COMPLETED, SESSION_PHASES.INTERRUPTED])
+
+function withBusyStatus(reading, extracted, current) {
+  if (!extracted || !extracted.busyStatus) return reading
+  if (reading.gate === 'accept' && !OVER_PHASES.has(reading.phase)) return reading
+  const inWait = PENDING_INTERACTION_PHASES.has(current)
+  if (inWait && reading.resolvesWait !== true) return reading
+  return Object.assign({}, reading, {
+    phase: SESSION_PHASES.RUNNING,
+    interactionType: null,
+    activeTool: null,
+    gate: 'accept',
+    exitGrade: inWait ? 'strict' : null,
+    resolvesWait: inWait,
+    busyStatus: extracted.busyStatus
+  })
+}
+
 // Which canonical event announces a given phase. This is the whole point of the
 // design: the classifier speaks the vocabulary hooks already speak, so every
 // guard in phaseDecision() applies to a screen reading unchanged and no
@@ -284,7 +309,9 @@ function baseEvent(type, interp, options, now) {
     confidence: interp.confidence,
     reason: interp.backgroundWork
       ? `pane read as ${interp.verdict}, ${interp.backgroundWork}`
-      : `pane read as ${interp.verdict}`,
+      : interp.busyStatus
+        ? `pane read as ${interp.verdict}, but its status line reads "${interp.busyStatus}"`
+        : `pane read as ${interp.verdict}`,
     tmuxPane: (capture && capture.paneId) || session.tmuxPane
   }
 }
@@ -303,8 +330,8 @@ function paneEventsFromInterpretation(reading, options = {}) {
   const now = Number.isFinite(options.now) ? options.now : Date.now()
   const current = currentPhase(session)
 
-  if (reading.gate !== 'accept') return []
-  const interp = withBackgroundWork(reading, extracted)
+  const interp = withBackgroundWork(withBusyStatus(reading, extracted, current), extracted)
+  if (interp.gate !== 'accept') return []
 
   const inWait = PENDING_INTERACTION_PHASES.has(current)
 
@@ -417,5 +444,6 @@ module.exports = {
   VERDICTS,
   interpretPaneAnswers,
   paneEventsFromInterpretation,
-  waitExitReached
+  waitExitReached,
+  withBusyStatus
 }

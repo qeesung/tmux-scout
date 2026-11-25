@@ -1,0 +1,29 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.17
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+> /model
+────────────────────────────────────────────────────────────────────────────────────────────────────
+> /model  Set a model, or run a single prompt on another model                                      
+
+  ↑/↓ Navigate · enter Select · tab Complete               
+esc to cancel                                                                 Gemini Pro · high
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

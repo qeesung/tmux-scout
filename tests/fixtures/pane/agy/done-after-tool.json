@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 finished after reading a file",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

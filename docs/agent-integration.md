@@ -144,7 +144,7 @@ tmux-scout currently ships first-class metadata, setup manager registration, and
 hook/runtime mapping for:
 
 Claude Code, Codex, Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode,
-Cursor Agent, Hermes, Trae CLI, and Traex CLI.
+Cursor Agent, Hermes, Trae CLI, Traex CLI, and Antigravity CLI (`agy`).
 
 ## Contributor Checklist
 
@@ -152,5 +152,13 @@ Cursor Agent, Hermes, Trae CLI, and Traex CLI.
 2. Add or update a setup manager and register it in `scripts/setup/managers.js`.
 3. Add hook adapter logic that emits canonical events.
 4. Add at least one flow fixture covering the highest-risk lifecycle.
-5. Run `npm run check` and `npm test`.
-6. Update README setup tables if the user-visible agent list changes.
+5. For screen reading: capture real panes into `tests/fixtures/pane/<agent>/`
+   (scrubbed of accounts, paths and ids), describe the screen in
+   `AGENT_SCREENS` (`scripts/lib/pane-questions.js`) quoting only text those
+   captures show after normalization, give `PANE_PATTERNS`
+   (`scripts/lib/pane-text-extract.js`) the composer, placeholders and anything
+   else that starts a line the way a prompt echo does, and add the agent to
+   `DEFAULT_PANE_AGENTS` only once `npm run jev-eval -- --agent <agent>` gets
+   every fixture right with no confidently wrong answer.
+6. Run `npm run check` and `npm test`.
+7. Update README setup tables if the user-visible agent list changes.

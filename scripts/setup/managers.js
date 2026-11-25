@@ -10,6 +10,7 @@ const cursor = require('./cursor')
 const hermes = require('./hermes')
 const coco = require('./coco')
 const traex = require('./traex')
+const agy = require('./agy')
 
 const HOOK_MANAGERS = [
   {
@@ -82,6 +83,14 @@ const HOOK_MANAGERS = [
     label: 'Traex CLI',
     detail: '(~/.trae/traecli.toml)',
     module: traex
+  },
+  {
+    id: 'agy',
+    flag: '--agy',
+    aliases: ['--antigravity'],
+    label: 'Antigravity CLI',
+    detail: '(~/.gemini/config/hooks.json)',
+    module: agy
   }
 ]
 

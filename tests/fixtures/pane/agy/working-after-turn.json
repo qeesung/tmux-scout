@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 \"Working...\" right after a new message, last turn's answer above",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

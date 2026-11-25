@@ -2,7 +2,7 @@
 
 ![tmux-scout feature overview](https://github.com/user-attachments/assets/d08bc43d-9fbe-40fa-a391-ec9654f9f0d3)
 
-A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, Trae CLI, and Traex CLI sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
+A tmux plugin for monitoring and navigating [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, Trae CLI, Traex CLI, and Google Antigravity CLI (`agy`) sessions. Provides a real-time fzf picker to jump between agent panes, a status bar widget showing session counts, and crash detection for dead sessions.
 
 [中文文档](README_CN.md)
 
@@ -74,6 +74,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --hermes   # Hermes only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --trae     # Trae CLI only
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --traex    # Traex CLI only
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --agy      # Antigravity CLI only (alias --antigravity)
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" uninstall          # Remove all hooks
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status             # Check installation status
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor             # Run environment diagnostics
@@ -96,6 +97,7 @@ In [screen-reading mode](#pane-state-from-the-screen-optional-off-by-default), `
 - **Hermes**: Adds command hooks in `~/.hermes/config.yaml` and removes obsolete tmux-scout entries from `~/.hermes/cli-config.yaml`
 - **Trae CLI**: Adds command hooks in `~/.trae/traecli.yaml` or an existing legacy config file
 - **Traex CLI**: Adds managed TOML hook blocks and enables `[features].hooks = true` in `~/.trae/traecli.toml`
+- **Antigravity CLI**: Adds one named hook, `tmux-scout`, to `~/.gemini/config/hooks.json` and leaves every other entry alone. The desktop Antigravity app and the IDE read the same file; the hook does nothing outside tmux and ignores their events. agy's hooks have no approval or notification event, and Esc or a declined approval sends no `Stop`, so with hooks an agy session never shows `WAIT` for an approval and stays `BUSY` after a cancelled turn until the next message. [Screen reading](#pane-state-from-the-screen-optional-off-by-default) sees both, and reads agy by default.
 
 ## Usage
 
@@ -121,7 +123,7 @@ Each line shows, by default:
 - `W:APP` / `W:ANS` / `W:PLAN` — waiting for approval, answer, or plan confirmation
 - `BUSY` / `DONE` / `IDLE` — session status
 - `INT` / `CRASH` / `STALE` — recently interrupted, crashed, or stale sessions
-- Agent type (claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex)
+- Agent type (claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex / agy)
 - tmux window name (`-` when no window is linked)
 - tmux session name
 - Project directory name
@@ -151,6 +153,7 @@ Run `npm run agent-colors` to preview the same colors in your terminal.
 | Hermes | `hermes` | `--hermes` | ![#d7af87](docs/agent-colors/hermes.svg) sand (`#d7af87`) |
 | Trae CLI | `trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) bright green (`#5fff87`) |
 | Traex CLI | `traex` | `--traex` | ![#00ff87](docs/agent-colors/traex.svg) mint (`#00ff87`) |
+| Antigravity CLI | `agy` | `--agy` | ![#ffd700](docs/agent-colors/agy.svg) gold (`#ffd700`) |
 
 ### Status Bar
 
@@ -340,7 +343,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 
    ```bash
    set -g @scout-state-source jev    # hook (default) | jev
-   scripts/setup.sh uninstall --claude --codex --gemini
+   scripts/setup.sh uninstall --claude --codex --gemini --agy
    ```
 
    The switch is **either/or per agent**, not a blend: the agents in `@scout-pane-model-agents` are read from the screen, every other agent keeps its hooks. `setup.sh install` skips hooks for the screen-read agents, and `doctor` warns if it finds some anyway. Settings changes reach a running watchdog within 15 seconds; no restart is needed.
@@ -348,7 +351,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 **Options.**
 
 ```bash
-set -g @scout-pane-model-agents claude,codex,gemini # which CLIs to read from the screen
+set -g @scout-pane-model-agents claude,codex,gemini,agy # which CLIs to read from the screen
 set -g @scout-pane-model-confidence 0.55            # below this the model is ignored
 set -g @scout-pane-model-interval 6                 # seconds between paid calls per session while its screen
                                                     # keeps changing; backs off to 30s on a repeated verdict
@@ -390,7 +393,8 @@ A request failing is not enough: it takes three in a row with no success between
 **Limits.**
 
 - The screen does not show everything a hook payload carries: exact tool arguments, turn and request ids, and the transcript path are given up for the agents read from it. `shadow` exists to measure that trade before you take it.
-- The description of each CLI's screen is written only from real screens. Claude Code and Codex are fully described; Traex's running turn and Gemini CLI's running and finished turns are not yet, so the model falls back on generic criteria for those.
+- The description of each CLI's screen is written only from real screens. Claude Code, Codex and Antigravity CLI are fully described; Traex's running turn and Gemini CLI's running and finished turns are not yet, so the model falls back on generic criteria for those.
+- A CLI update that redraws its screen can make the description stale. The Antigravity CLI description was written against agy 1.5.17.
 
 ### Pane access tracking
 
@@ -443,7 +447,7 @@ Internally, hook, pane, transcript, PID, and stale-timeout observations are redu
 
 For older Codex versions that only support `notify`, tmux-scout still installs and chains the legacy notify hook. In that fallback mode, first-turn discovery may still depend on JSONL polling until Codex emits a completion notification.
 
-Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, Trae CLI, and Traex CLI are tracked through a generic hook adapter. It maps their hook/plugin events onto the same session lifecycle model, so support quality depends on the payloads those CLIs expose for prompts, tool calls, approvals, questions, subagents, and completion.
+Gemini CLI, Kimi CLI, GitHub Copilot CLI, OpenCode, Cursor Agent, Hermes, Trae CLI, Traex CLI, and Antigravity CLI are tracked through a generic hook adapter. It maps their hook/plugin events onto the same session lifecycle model, so support quality depends on the payloads those CLIs expose for prompts, tool calls, approvals, questions, subagents, and completion.
 
 ## Development
 

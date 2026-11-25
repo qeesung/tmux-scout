@@ -1,0 +1,36 @@
+
+○ Thought for 8.5s (The command execution involves `sleep 8 && echo ok`. Considering the asynchronous nature, the `WaitMsBeforeAsy...)
+● Ran (sleep 8 && echo ok) (ctrl+o to expand)
+
+  The command exited with code 0 and produced the following output:
+
+    ok
+
+────────────────────────────────────────────────────────────
+> Run `sleep 40 && echo late` in the shell and wait for it.
+
+○ Thought for 13.4s (The `run_command` documentation indicates that commands exceeding the wait time execute as background tasks,...)
+● Ran (sleep 40 && echo late) (ctrl+o to expand)
+
+────────────────────────────────────────────────────────────
+> Run `sleep 5 && echo again` in the shell.
+
+○ Thought for 41.0s (The user likely sent a new request or canceled the previous one during command execution, given the timing of...)
+● Ran (sleep 5 && echo again) (ctrl+o to expand)
+
+▸ Thought for 32s, 270 tokens
+
+  sleep 5 && echo again exited with code 0 and output:
+
+    again
+
+  (Note: Your earlier background command sleep 40 && echo late also completed with exit code 0 and output late.)
+
+────────────────────────────────────────────────────────────
+> Run `whoami` in the shell.
+⣯  Loading...
+└ Tip: Use /settings to configure your environment.                                                                                    
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>                                                                                                                                      
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                                                    Gemini Pro · high

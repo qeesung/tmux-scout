@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 full-screen mode running a command",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

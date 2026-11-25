@@ -19,7 +19,7 @@ const STATE_SOURCE_OPTION = '@scout-state-source'
 // The agents whose screens the pane model reads unless configured otherwise:
 // the ones whose layouts the question set and the prompt extractor were
 // checked against.
-const DEFAULT_PANE_AGENTS = Object.freeze(['claude', 'codex', 'gemini'])
+const DEFAULT_PANE_AGENTS = Object.freeze(['claude', 'codex', 'gemini', 'agy'])
 
 // Throws when tmux cannot be asked; an unset option is '' (-q suppresses the
 // error for that). For a caller that must not mistake the first for the second.

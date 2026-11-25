@@ -27,6 +27,22 @@
 // (n * maxProbability - 1) / (n - 1): adding or removing an outcome shifts the
 // scale, so thresholds must be re-tuned when the outcome list changes.
 
+// v6: Antigravity CLI (agy) hints, written from live agy 1.5.17 panes. Its
+// approval and question dialogs keep "esc to cancel" in the footer, the same
+// words a running turn shows, so the hints name the status line above the
+// composer as what tells working apart, and say that a dialog wins.
+//
+// Also v6, for every CLI: a cancelled turn and a completion menu are named as
+// idle in awaiting_answer, idle_ready and blocked_on_user. Claude Code and agy
+// both print "Interrupted · What should <agent> do instead?" over an empty
+// composer, which the model read as a question with its answer box below:
+// agy's cancelled turns were accepted as awaiting_answer at 0.74-0.89, and
+// Claude's came back idle_ready at 0.39, below the bar, so neither left BUSY.
+// A "/" menu under the composer, a numbered-looking list the person opened
+// by typing, read as awaiting_answer the same way. shell_prompt now says an
+// exited CLI's whole last frame may sit above the shell prompt: agy and Claude
+// render inline and leave it there, composer included.
+//
 // v5: every CLI's hints fill the same five slots (see HINT_SLOTS). Codex
 // gained what separates its working screen from its idle one — its composer
 // keeps the placeholder while a turn runs — and every quoted example is now in
@@ -60,7 +76,7 @@
 // the confidence scale for every other answer.
 const { lastLines } = require('./pane-capture')
 
-const PANE_QUESTION_SET_VERSION = 5
+const PANE_QUESTION_SET_VERSION = 6
 const BOTTOM_LINES = 8
 
 const AGENT_LABELS = Object.freeze({
@@ -75,7 +91,8 @@ const AGENT_LABELS = Object.freeze({
   hermes: 'Hermes',
   trae: 'Trae CLI',
   coco: 'Trae CLI',
-  traex: 'Traex CLI'
+  traex: 'Traex CLI',
+  agy: 'Antigravity CLI'
 })
 
 // Per-CLI rendering notes. Kept to a few lines and held in the state rather
@@ -171,6 +188,35 @@ const AGENT_SCREENS = Object.freeze({
     chrome:
       'The status line lists the model, the context left, the directory and the branch, such as "Test-O-New high · ' +
       'Context <pct> left · ~/repos/example · main · No changes".'
+  },
+  agy: {
+    composer:
+      'Its composer is a line starting with ">" between two horizontal rules. It stays on screen, empty, for the ' +
+      'whole of a running turn, so on its own it does not mean the agent is idle; empty, it may show a mode hint ' +
+      'such as "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)". A submitted instruction is ' +
+      'echoed in the transcript on a line starting with ">" under a rule. Typing "/" in it opens a command menu ' +
+      'ending in "tab Complete": the person is typing and the agent is idle.',
+    working:
+      'While a turn runs, the line just above the composer\'s upper rule is a status ending in "...": ' +
+      '"Generating...", "Working...", "Loading..." or "Running command... <dur>", sometimes with a "└ Tip:" line ' +
+      'under it. A prompt echo with only that status line under it is a turn that has just started. With no such ' +
+      'line the agent is not working, even though the footer also reads "esc to cancel" while a menu is open.',
+    finished:
+      'A finished turn leaves no status line: the composer is empty and the footer starts with "? for shortcuts". ' +
+      '"* Ran (npm test)" and "▸ Thought for <dur>, <tok>" are history. After the person cancels a turn, a fixed ' +
+      'notice starting "⎿ Interrupted ·" is printed above the empty composer; it is printed on every cancel, asks ' +
+      'nothing, and the agent is idle. A background task under the composer, with "1 task(s) · /tasks" in the ' +
+      'footer, does not make the agent busy.',
+    waiting:
+      'An approval replaces the composer with "Requesting permission for:", the command, "Run this command?" and ' +
+      'options from "> 1. Yes, run command" to "4. No, cancel"; a question replaces it with "Question 1/1:" and ' +
+      'numbered choices over "↑/↓ Navigate · enter Select · esc Skip". Either waits on the person although the ' +
+      'footer still reads "esc to cancel". While the composer itself is on screen, nothing waits.',
+    chrome:
+      'The footer\'s right side names the model and effort, such as "Gemini Pro · high". A plan-mode turn ends ' +
+      'like any other, with "1 artifact · /artifact to review" above the composer. "Resume with -c (or command ' +
+      'below):" is printed only once agy has exited: the frame above it is left over, and the shell prompt under ' +
+      'it is the bottom of the screen.'
   }
 })
 
@@ -207,7 +253,9 @@ const PANE_QUESTIONS = Object.freeze({
         'list to pick from, or an input labelled as the answer to it — in place of the agent\'s normal composer. An ' +
         'empty composer waiting for a brand new instruction is NOT this: choose idle_ready for that. Neither is a ' +
         'question at the end of the agent\'s last message with its normal composer below: that turn is over, so ' +
-        'choose idle_ready.',
+        'choose idle_ready. Nor is a notice that the person cancelled the turn, such as "Interrupted · What should ' +
+        'Claude do instead?", above the normal composer, nor a menu the composer opened to complete what the person ' +
+        'is typing: choose idle_ready for both.',
       working:
         'The agent is producing output or executing something right now. Typical shapes: an animated spinner; a ' +
         'live elapsed-time or token counter; words such as "Thinking", "Working", "Running", "Compacting"; a hint ' +
@@ -218,14 +266,18 @@ const PANE_QUESTIONS = Object.freeze({
         'composer, and the agent is doing nothing while it waits for the person to send a new instruction. The ' +
         'composer may be empty, may show only a greyed-out placeholder hint, OR may contain text the person is ' +
         'still typing and has not sent yet — a half-written instruction sitting in the composer is still this ' +
-        'outcome, because the agent is idle either way. A status line may read "Ready", "done", "Worked for ' +
+        'outcome, because the agent is idle either way, and so is a menu of commands or files the composer opened ' +
+        'to complete it. A turn the person cancelled ends here too, often with a notice such as "Interrupted · What ' +
+        'should Claude do instead?" above the composer. A status line may read "Ready", "done", "Worked for ' +
         '<duration>", or offer to clear the conversation. The previous answer above it is complete, and may end by ' +
         'asking the person something. There is no question prompt drawn in place of the composer, no option list ' +
         'and no running indicator.',
       shell_prompt:
         'The AI agent is not running at all. The bottom of the screen is an ordinary operating-system shell prompt: ' +
         'a line ending in "$", "%" or "#", or showing a username, hostname, directory path or git branch, with ' +
-        'nothing after it but a cursor. Any agent output above it is left over from a process that already exited.',
+        'nothing after it but a cursor. Any agent output above it is left over from a process that already exited, ' +
+        'even when it is the agent\'s whole last frame — its composer, a finished turn or a cancelled one — ' +
+        'with the shell prompt under it.',
       unknown:
         'The snapshot is empty, unreadable, captured mid-redraw, shows an unrelated program such as a text editor, ' +
         'a pager, htop or a log tail, or matches no other outcome well enough to decide.'
@@ -244,8 +296,10 @@ const PANE_QUESTIONS = Object.freeze({
       false:
         'The bottom shows work in progress, streaming output, a spinner or interrupt hint, an ordinary shell ' +
         'prompt, or the agent\'s own composer after a finished turn. A composer counts as false whether it is ' +
-        'empty or holds a half-written instruction the person has not sent: the agent is available, not blocked ' +
-        'on an answer. Only a prompt the AGENT put on screen counts as true.'
+        'empty or holds a half-written instruction the person has not sent, with or without a completion menu ' +
+        'under it, and whether or not a cancellation notice such as "Interrupted · What should Claude do instead?" ' +
+        'sits above it: the agent is available, not blocked on an answer. Only a prompt the AGENT put on screen ' +
+        'counts as true.'
     }
   },
 

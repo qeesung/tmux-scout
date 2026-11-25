@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 running an approved shell command, task listed under the composer",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

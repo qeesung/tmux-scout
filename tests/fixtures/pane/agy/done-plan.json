@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 finished a plan-mode turn",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

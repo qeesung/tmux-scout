@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 exited and left its last frame above the shell prompt",
+  "agent": "agy",
+  "expect": {
+    "choice": "shell_prompt",
+    "phase": null
+  }
+}

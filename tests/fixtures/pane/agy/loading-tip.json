@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 \"Loading...\" with a tip line under it",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

@@ -1,0 +1,29 @@
+────────────────────────────────────────────────────────────
+> Fetch https://example.com and tell me the page title.
+
+○ Thought for 15.1s (The available tools lack a direct URL fetching capability; `run_command` s...)
+● Ran (curl -sL --max-time 15 https://example.com) failed (ctrl+o to expand)
+
+Command                                                     
+  ⎿  User declined the tool call                       
+
+────────────────────────────────────────────────────────────                                       
+> Use your question tool to ask me whether you should read a.txt or b.txt, then read the one I
+  pick.
+
+▸ Thought for 26s, 845 tokens   
+  The prompt requires a specific question to determine the next action. Considered whether to pr...
+
+? Which file should I read?                                                                         
+
+Question
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 1/1: Which file should I read?
+
+> 1. a.txt                                                                                          
+  2. b.txt                                                
+  3. Write-in...                                                                                    
+
+  ↑/↓ Navigate · enter Select · esc Skip                                                            
+esc to cancel                                                                 Gemini Pro · high

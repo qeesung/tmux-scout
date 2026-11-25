@@ -2,7 +2,7 @@
 
 ![tmux-scout 功能总览](https://github.com/user-attachments/assets/4305c4ed-bc1e-4f36-848d-3ebb76cc4dd4)
 
-一个用于监控和导航 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Gemini CLI、Kimi CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Hermes、Trae CLI 和 Traex CLI 会话的 tmux 插件。提供实时 fzf 选择器在 agent 面板间快速跳转，状态栏组件显示会话计数，以及自动检测崩溃的会话。
+一个用于监控和导航 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)、[Codex](https://github.com/openai/codex)、Gemini CLI、Kimi CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Hermes、Trae CLI、Traex CLI 和 Google Antigravity CLI（`agy`）会话的 tmux 插件。提供实时 fzf 选择器在 agent 面板间快速跳转，状态栏组件显示会话计数，以及自动检测崩溃的会话。
 
 [English](README.md)
 
@@ -74,6 +74,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --hermes   # 仅 Hermes
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --trae     # 仅 Trae CLI
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --traex    # 仅 Traex CLI
+eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" install --agy      # 仅 Antigravity CLI（别名 --antigravity）
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" uninstall          # 卸载所有 hook
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" status             # 查看安装状态
 eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor             # 运行环境诊断
@@ -96,6 +97,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 - **Hermes**：在 `~/.hermes/config.yaml` 中添加 command hook，并从 `~/.hermes/cli-config.yaml` 清理旧的 tmux-scout 条目
 - **Trae CLI**：在 `~/.trae/traecli.yaml` 或已有的旧版配置文件中添加 command hook
 - **Traex CLI**：在 `~/.trae/traecli.toml` 中添加受管理的 TOML hook block，并启用 `[features].hooks = true`
+- **Antigravity CLI**：在 `~/.gemini/config/hooks.json` 中添加一个名为 `tmux-scout` 的 hook，不动其他条目。桌面版 Antigravity 和 IDE 也读这个文件；这个 hook 在 tmux 之外什么都不做，也会忽略它们的事件。agy 的 hook 没有批准和通知事件，按 Esc 或拒绝批准也不会发 `Stop`，所以只靠 hook 时，agy 会话不会因为等待批准显示 `WAIT`，取消一个 turn 后会一直显示 `BUSY`，直到下一条消息。[读屏](#从屏幕读取状态可选默认关闭)能看到这两种情况，并且默认就读 agy。
 
 ## 使用方法
 
@@ -121,7 +123,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" doctor    
 - `W:APP` / `W:ANS` / `W:PLAN` — 等待审批、回答或计划确认
 - `BUSY` / `DONE` / `IDLE` — 会话状态
 - `INT` / `CRASH` / `STALE` — 最近被打断、异常退出或过期的会话
-- Agent 类型（claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex）
+- Agent 类型（claude / codex / gemini / kimi / copilot-cli / opencode / cursor / hermes / trae / traex / agy）
 - tmux window 名称（未关联 window 时显示 `-`）
 - tmux session 名称
 - 项目目录名
@@ -149,6 +151,7 @@ tmux-scout 目前支持下表中的 agent CLI。颜色示例是 tmux/fzf 中 age
 | Hermes | `hermes` | `--hermes` | ![#d7af87](docs/agent-colors/hermes.svg) 沙色 (`#d7af87`) |
 | Trae CLI | `trae` | `--trae` | ![#5fff87](docs/agent-colors/trae.svg) 亮绿色 (`#5fff87`) |
 | Traex CLI | `traex` | `--traex` | ![#00ff87](docs/agent-colors/traex.svg) 薄荷色 (`#00ff87`) |
+| Antigravity CLI | `agy` | `--agy` | ![#ffd700](docs/agent-colors/agy.svg) 金色 (`#ffd700`) |
 
 ### 状态栏
 
@@ -338,7 +341,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 
    ```bash
    set -g @scout-state-source jev    # hook（默认）| jev
-   scripts/setup.sh uninstall --claude --codex --gemini
+   scripts/setup.sh uninstall --claude --codex --gemini --agy
    ```
 
    这是**按 agent 二选一**，不是混用：`@scout-pane-model-agents` 里的 agent 由读屏负责，其他 agent 继续用 hook。`setup.sh install` 会跳过读屏 agent 的 hook，`doctor` 发现残留时会提示。配置修改 15 秒内就会生效，不需要重启 watchdog。
@@ -346,7 +349,7 @@ eval "$(tmux show-env -g SCOUT_DIR)" && "$SCOUT_DIR/scripts/setup.sh" watcher st
 **可选配置。**
 
 ```bash
-set -g @scout-pane-model-agents claude,codex,gemini # 哪些 CLI 由读屏负责
+set -g @scout-pane-model-agents claude,codex,gemini,agy # 哪些 CLI 由读屏负责
 set -g @scout-pane-model-confidence 0.55            # 低于这个置信度时忽略模型
 set -g @scout-pane-model-interval 6                 # 画面持续变化时，同一会话两次付费调用的间隔（秒）；
                                                     # 结论一直不变时逐步退避到 30 秒
@@ -388,7 +391,8 @@ node scripts/debug.js classify %39 --state
 **局限。**
 
 - 屏幕上看不到 hook 事件携带的全部信息：对读屏的 agent，精确的工具参数、turn 和 request id、transcript 路径都拿不到了。`shadow` 模式就是用来在切换前衡量这个取舍的。
-- 每个 CLI 的界面说明只根据真实画面来写。Claude Code 和 Codex 已完整描述；Traex 运行中的样子、Gemini CLI 运行中和已完成的样子还没有，这些情况下模型只能依据通用判断标准。
+- 每个 CLI 的界面说明只根据真实画面来写。Claude Code、Codex 和 Antigravity CLI 已完整描述；Traex 运行中的样子、Gemini CLI 运行中和已完成的样子还没有，这些情况下模型只能依据通用判断标准。
+- CLI 升级后如果界面改了，说明可能过时。Antigravity CLI 的说明基于 agy 1.5.17 编写。
 
 ### 面板访问追踪
 
@@ -438,7 +442,7 @@ tmux-scout 现在优先使用 Codex event hook，可以近实时同步会话开�
 
 如果使用的是只支持 `notify` 的旧版 Codex，tmux-scout 仍会安装并串联 legacy notify hook。在该兜底模式下，首轮完成前的新会话发现仍可能依赖 JSONL 轮询。
 
-Gemini CLI、Kimi CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Hermes、Trae CLI 和 Traex CLI 通过 generic hook adapter 接入。它会把各自的 hook/plugin 事件映射到同一套 session lifecycle model，因此支持质量取决于这些 CLI 暴露的 prompt、工具调用、审批、提问、subagent 和完成事件 payload。
+Gemini CLI、Kimi CLI、GitHub Copilot CLI、OpenCode、Cursor Agent、Hermes、Trae CLI、Traex CLI 和 Antigravity CLI 通过 generic hook adapter 接入。它会把各自的 hook/plugin 事件映射到同一套 session lifecycle model，因此支持质量取决于这些 CLI 暴露的 prompt、工具调用、审批、提问、subagent 和完成事件 payload。
 
 ## 开发
 

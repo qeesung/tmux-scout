@@ -1,0 +1,9 @@
+{
+  "name": "agy 1.5.17 asks to run a shell command",
+  "agent": "agy",
+  "expect": {
+    "choice": "awaiting_approval",
+    "phase": "waitingForApproval",
+    "pendingInteractionType": "approval"
+  }
+}

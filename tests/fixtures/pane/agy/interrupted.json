@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 turn cancelled with esc while its command keeps running as a task",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "interrupted"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 loading after a Chinese prompt",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

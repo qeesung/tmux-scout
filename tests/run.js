@@ -52,7 +52,7 @@ const { loadPaneFixtures } = require('../scripts/lib/pane-fixtures')
 const { answerCacheKey, createAnswerCache } = require('../scripts/lib/pane-answer-cache')
 const { readShadow } = require('../scripts/lib/pane-store')
 const { createPaneMetrics, readMetrics } = require('../scripts/lib/pane-metrics')
-const { extractBackgroundWork, extractPromptAndTitle, extractToolLine } = require('../scripts/lib/pane-text-extract')
+const { extractBackgroundWork, extractBusyStatus, extractPromptAndTitle, extractToolLine } = require('../scripts/lib/pane-text-extract')
 const {
   interpretPaneAnswers,
   paneEventsFromInterpretation
@@ -356,7 +356,7 @@ test('hook scripts expose lightweight adapters', () => {
 })
 
 test('setup manager registry selects agent managers by flags', () => {
-  const expectedManagers = ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco', 'traex']
+  const expectedManagers = ['claude', 'codex', 'gemini', 'kimi', 'copilot-cli', 'opencode', 'cursor', 'hermes', 'coco', 'traex', 'agy']
   assert.deepStrictEqual(HOOK_MANAGERS.map(manager => manager.id), expectedManagers)
   assert.deepStrictEqual(selectManagers(new Set()).map(manager => manager.id), expectedManagers)
   assert.deepStrictEqual(selectManagers(new Set(['--claude'])).map(manager => manager.id), ['claude'])
@@ -366,6 +366,8 @@ test('setup manager registry selects agent managers by flags', () => {
   assert.deepStrictEqual(selectManagers(new Set(['--trae'])).map(manager => manager.id), ['coco'])
   assert.deepStrictEqual(selectManagers(new Set(['--coco'])).map(manager => manager.id), ['coco'])
   assert.deepStrictEqual(selectManagers(new Set(['--traex'])).map(manager => manager.id), ['traex'])
+  assert.deepStrictEqual(selectManagers(new Set(['--agy'])).map(manager => manager.id), ['agy'])
+  assert.deepStrictEqual(selectManagers(new Set(['--antigravity'])).map(manager => manager.id), ['agy'])
 })
 
 test('setup commands run from a clean plugin tree without package installation', () => {
@@ -462,6 +464,85 @@ test('Gemini and Copilot setup managers install guarded generic hooks', () => {
     assert.strictEqual(copilotSettings.version, 1)
     assert.ok(copilotSettings.hooks.preToolUse[0].bash.includes('--event'))
     assert.ok(copilotSettings.hooks.preToolUse[0].bash.includes('preToolUse'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy setup owns one named hook in the shared hooks.json', () => {
+  const dir = tempDir()
+  try {
+    const hooksPath = path.join(dir, '.gemini', 'config', 'hooks.json')
+    // Without the CLI there is nothing to hook, and the file belongs to the
+    // desktop app and the IDE as well.
+    assert.match(runScriptOutput('scripts/setup/agy.js', ['install'], dir), /Antigravity CLI not found/)
+    assert.strictEqual(fs.existsSync(hooksPath), false)
+
+    fs.mkdirSync(path.join(dir, '.gemini', 'antigravity-cli'), { recursive: true })
+    fs.mkdirSync(path.dirname(hooksPath), { recursive: true })
+    const theirs = { 'lint-checker': { PostToolUse: [{ matcher: 'run_command', hooks: [{ command: './lint.sh' }] }] } }
+    fs.writeFileSync(hooksPath, JSON.stringify(theirs))
+
+    const agy = require('../scripts/setup/agy')
+    runScript('scripts/setup/agy.js', ['install'], dir)
+    const installed = JSON.parse(fs.readFileSync(hooksPath, 'utf-8'))
+    assert.deepStrictEqual(installed['lint-checker'], theirs['lint-checker'])
+    const spec = installed['tmux-scout']
+    assert.strictEqual(spec.enabled, true)
+    assert.deepStrictEqual(Object.keys(spec).filter(key => key !== 'enabled'), agy.HOOK_EVENTS)
+    // Tool events take matcher groups; the rest take handlers directly.
+    assert.strictEqual(spec.PreToolUse[0].matcher, '*')
+    assert.ok(spec.PreToolUse[0].hooks[0].command.includes("'--event' 'PreToolUse'"))
+    assert.ok(spec.Stop[0].command.includes("'--agent' 'agy'"))
+    assert.strictEqual(spec.Stop[0].timeout, 5)
+    assert.match(runScriptOutput('scripts/setup/agy.js', ['status'], dir), /hook installed/)
+
+    // A moved plugin leaves stale paths behind; install replaces them.
+    spec.Stop[0].command = spec.Stop[0].command.replace(/generic\.js/g, 'old.js')
+    fs.writeFileSync(hooksPath, JSON.stringify(installed))
+    assert.match(runScriptOutput('scripts/setup/agy.js', ['status'], dir), /hook not installed/)
+    runScript('scripts/setup/agy.js', ['install'], dir)
+    assert.match(runScriptOutput('scripts/setup/agy.js', ['status'], dir), /hook installed/)
+
+    runScript('scripts/setup/agy.js', ['uninstall'], dir)
+    assert.deepStrictEqual(JSON.parse(fs.readFileSync(hooksPath, 'utf-8')), theirs)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy setup refuses to overwrite a hooks.json it cannot parse', () => {
+  const dir = tempDir()
+  try {
+    fs.mkdirSync(path.join(dir, '.gemini', 'antigravity-cli'), { recursive: true })
+    const hooksPath = path.join(dir, '.gemini', 'config', 'hooks.json')
+    fs.mkdirSync(path.dirname(hooksPath), { recursive: true })
+    fs.writeFileSync(hooksPath, '{ "mine": ')
+    assert.throws(() => runScript('scripts/setup/agy.js', ['install'], dir))
+    assert.strictEqual(fs.readFileSync(hooksPath, 'utf-8'), '{ "mine": ')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy hook commands always answer agy, and only PreToolUse with nothing', () => {
+  // agy denies a tool call whose PreToolUse hook prints "{}" with no decision,
+  // and expects a JSON object from every other event.
+  const { buildAgyHookCommand } = require('../scripts/lib/hook-command')
+  const dir = tempDir()
+  try {
+    const hookPath = path.join(__dirname, '..', 'scripts', 'hooks', 'generic.js')
+    const payload = JSON.stringify({ conversationId: 'c1', hookEventName: 'Stop', cwd: '/tmp/demo' })
+    const run = (command, env) => execFileSync('sh', ['-c', command], {
+      input: payload,
+      encoding: 'utf-8',
+      env: Object.assign({}, process.env, { HOME: dir, TMUX_PANE: '' }, env)
+    })
+    for (const env of [{ TMUX_PANE: '%9' }, {}]) {
+      assert.strictEqual(run(buildAgyHookCommand(hookPath, 'Stop'), env), '{}')
+      assert.strictEqual(run(buildAgyHookCommand(hookPath, 'PreToolUse'), env), '')
+    }
+    assert.strictEqual(run(buildAgyHookCommand(path.join(dir, 'gone.js'), 'Stop'), { TMUX_PANE: '%9' }), '{}')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -1146,7 +1227,8 @@ test('new setup managers do not report standalone uninstall as installed', () =>
       'scripts/setup/kimi.js',
       'scripts/setup/copilot-cli.js',
       'scripts/setup/opencode.js',
-      'scripts/setup/traex.js'
+      'scripts/setup/traex.js',
+      'scripts/setup/agy.js'
     ]) {
       const output = runScriptOutput(script, ['uninstall'], dir)
       assert.ok(!/hook installed|plugin installed/.test(output), `${script} reported installed after uninstall`)
@@ -2267,6 +2349,43 @@ test('extractPromptAndTitle ignores quoted output that is not at column zero', (
   assert.strictEqual(extractPromptAndTitle(quoted, 'claude').confidence, 'none')
 })
 
+function agyPane(name) {
+  return fs.readFileSync(path.join(__dirname, 'fixtures', 'pane', 'agy', `${name}.txt`), 'utf-8')
+}
+
+test('agy: screens before any turn find the composer and no prompt', () => {
+  // A local command ("> /model" over its "⎿" result), a draft, the "/" menu and
+  // a mode hint all start at column zero with ">"; none may read as a prompt,
+  // or a session never asked anything passes the never-prompted guard.
+  for (const name of ['idle-fresh', 'idle-after-slash', 'draft-in-composer', 'slash-menu']) {
+    const result = extractPromptAndTitle(agyPane(name), 'agy')
+    assert.strictEqual(result.composer, true, name)
+    assert.strictEqual(result.confidence, 'none', name)
+  }
+})
+
+test('agy: the prompt is the echo under a rule, not an answer or a dialog option', () => {
+  const cases = {
+    // "> a.txt" under "? Which file should I read?" is the answer picked.
+    'done-after-tool': 'Use your question tool to ask me whether you should read a.txt or b.txt, then read the one I',
+    // "> 1. Yes, run command" is the dialog's selected option, and the dialog
+    // has replaced the composer.
+    'approval-wrapped': 'Fetch https://example.com and tell me the page title.',
+    'running-cjk': '请在终端运行 `sleep 15 && ls`，然后告诉我输出。',
+    // A slash command that starts a turn is echoed under a rule like any prompt.
+    'done-plan': '/plan Plan how to add a file c.txt containing the word gamma.'
+  }
+  for (const [name, prompt] of Object.entries(cases)) {
+    assert.strictEqual(extractPromptAndTitle(agyPane(name), 'agy').lastUserPrompt, prompt, name)
+  }
+})
+
+test('agy: the rule requirement is agy-only', () => {
+  const pane = ['> /model', '  ⎿  Model set to Example', '', '───────────────', '> ', '───────────────'].join('\n')
+  assert.strictEqual(extractPromptAndTitle(pane, 'agy').confidence, 'none')
+  assert.strictEqual(extractPromptAndTitle(pane, 'gemini').lastUserPrompt, '/model')
+})
+
 test('extractPromptAndTitle reports none rather than guessing', () => {
   // Claude draws on the alternate screen, so once output pushes the echo off
   // the top there is nothing left to read. Callers must fall back, and because
@@ -3382,6 +3501,29 @@ test('pane observer lets a frozen screen accumulate the agreement that leaves a 
   h.cleanup()
 })
 
+test('agy: its status line ends an answered wait even when the model reads it weakly', async () => {
+  // After a question is answered agy shows "Working..." or "Loading...", which
+  // the model reads at 0.45-0.8. Readings below the bar reset the evidence for
+  // leaving the wait, and an answered question stayed WAIT for half a minute.
+  const h = observerHarness({ answers: [{
+    screen_state: { type: 'choice', choice: 'idle_ready', confidence: 0.45 },
+    blocked_on_user: { type: 'noul', noul: 0.05 },
+    is_running: { type: 'noul', noul: 0.4 }
+  }] })
+  h.screens.set('%1', agyPane('loading-after-turn'))
+  const status = paneStatus({
+    agentType: 'agy', phase: 'waitingForAnswer', status: 'waiting', lastUserPrompt: 'pick a file',
+    pendingInteraction: { type: 'question', phase: 'waitingForAnswer', startedAt: h.now() - 10000 }
+  })
+
+  await h.tick(status)
+  assert.deepStrictEqual(await h.tick(status), [], 'one frame does not dismiss a dialog')
+  h.advance(2000)
+  const second = await h.tick(status)
+  assert.strictEqual(second[0] && second[0].event.type, AGENT_EVENTS.QUESTION_ANSWERED)
+  h.cleanup()
+})
+
 test('pane observer stays silent once the session already agrees with the screen', async () => {
   const h = observerHarness({ answers: [{
     screen_state: { type: 'choice', choice: 'working', confidence: 0.95 },
@@ -4230,6 +4372,57 @@ test('a never-prompted session stays idle when its empty composer is read', () =
     options: { extracted: { lastUserPrompt: 'fix the tests' } }
   })
   assert.deepStrictEqual(withPrompt.map(event => event.type), [AGENT_EVENTS.TURN_COMPLETE])
+})
+
+test('an agy session that only ran a slash command stays idle on an idle reading', () => {
+  const fresh = { sessionId: 's1', agentType: 'agy', phase: 'idle', status: 'idle' }
+  const extracted = extractPromptAndTitle(agyPane('idle-after-slash'), 'agy')
+  assert.deepStrictEqual(paneEvents(confidently('idle_ready'), fresh, { options: { extracted } }), [])
+
+  const prompted = extractPromptAndTitle(agyPane('done-asks-question'), 'agy')
+  assert.deepStrictEqual(
+    paneEvents(confidently('idle_ready'), fresh, { options: { extracted: prompted } }).map(event => event.type),
+    [AGENT_EVENTS.TURN_COMPLETE]
+  )
+})
+
+test('agy: the status line over the composer is found only while a turn runs', () => {
+  const busy = {
+    'thinking': 'Generating...',
+    'working-after-turn': 'Working...',
+    'loading-after-turn': 'Loading...',
+    'loading-tip': 'Loading...',
+    'running-command': 'Running command... 4s',
+    'altscreen-running': 'Running command... 4s'
+  }
+  for (const [name, status] of Object.entries(busy)) {
+    assert.strictEqual(extractBusyStatus(agyPane(name), 'agy'), status, name)
+  }
+  // The "/" menu keeps "esc to cancel" in the footer with no status line; an
+  // exited agy leaves its frame above a shell prompt.
+  for (const name of ['idle-fresh', 'slash-menu', 'approval-command', 'question', 'interrupted', 'done-after-tool', 'shell-exited']) {
+    assert.strictEqual(extractBusyStatus(agyPane(name), 'agy'), null, name)
+  }
+  assert.strictEqual(extractBusyStatus(agyPane('loading-after-turn'), 'claude'), undefined)
+})
+
+test('agy: a status line on screen keeps a turn running whatever the reading', () => {
+  const extracted = { busyStatus: 'Loading...', lastUserPrompt: 'list the files' }
+  const toPhase = (answers, phase) => {
+    const session = { sessionId: 's1', agentType: 'agy', phase, status: 'working', lastUserPrompt: 'list the files', stateEvidence: [] }
+    for (const event of paneEvents(answers, session, { options: { extracted } })) applySessionEvent(session, event)
+    return currentPhase(session)
+  }
+  // Read as finished, or not confidently read at all: the line says otherwise.
+  assert.strictEqual(toPhase(confidently('idle_ready'), 'running'), 'running')
+  assert.strictEqual(toPhase(confidently('idle_ready'), 'completed'), 'running')
+  assert.strictEqual(toPhase(confidently('working', { screen_state: { choice: 'idle_ready', confidence: 0.2 } }), 'completed'), 'running')
+  // A wait is the model's to end, with its own evidence.
+  assert.strictEqual(toPhase(confidently('idle_ready'), 'waitingForApproval'), 'waitingForApproval')
+  // Without the line the reading stands.
+  const plain = { sessionId: 's2', agentType: 'agy', phase: 'running', status: 'working', lastUserPrompt: 'x', stateEvidence: [] }
+  for (const event of paneEvents(confidently('idle_ready'), plain, { options: { extracted: { lastUserPrompt: 'x' } } })) applySessionEvent(plain, event)
+  assert.strictEqual(currentPhase(plain), 'completed')
 })
 
 test('a resolver meets the phase it lands on, not the one it was built for', () => {
@@ -5333,6 +5526,9 @@ test('setup status in jev mode checks only the agents the pane model does not re
     // Read from the pane: no hooks on purpose, so nothing is missing.
     const covered = status('--claude', '--codex')
     assert.strictEqual(covered.status, 0, covered.stdout + covered.stderr)
+    // agy included: hooks cannot see its approvals, the screen can.
+    const agy = status('--agy')
+    assert.strictEqual(agy.status, 0, agy.stdout + agy.stderr)
     // Not read from the pane: its hooks are its only source of state.
     const kimi = status('--kimi')
     assert.strictEqual(kimi.status, 1, kimi.stdout)
@@ -6048,6 +6244,19 @@ test('the state source is either hooks or the pane model, never both', () => {
   // A typo falls back to the safe side rather than leaving a system with the
   // hooks uninstalled and nothing reading the screen either.
   assert.strictEqual(stateSource(() => 'typo'), STATE_SOURCES.HOOK)
+})
+
+test('jev reads the screens of the agents its hints were checked against', () => {
+  // Being on this list means `setup install` skips the agent's hooks in jev
+  // mode, so it holds only agents with fixtures that pass jev-eval.
+  const { screenReadAgents } = require('../scripts/lib/state-source')
+  const reader = options => name => options[name] || ''
+  assert.deepStrictEqual([...screenReadAgents(reader({ '@scout-state-source': 'jev' }))], ['claude', 'codex', 'gemini', 'agy'])
+  assert.deepStrictEqual([...screenReadAgents(reader({}))], [])
+  assert.deepStrictEqual(
+    [...screenReadAgents(reader({ '@scout-state-source': 'jev', '@scout-state-agents': 'claude' }))],
+    ['claude']
+  )
 })
 
 test('jev turns the pane model on without needing @scout-pane-model', () => {
@@ -6968,6 +7177,136 @@ test('generic hook tracks Gemini prompt, tool and completion events', () => {
     assert.strictEqual(currentPhase(session), 'completed')
     assert.strictEqual(session.sessionTitle, 'explain the repository')
     assert.strictEqual(session.lastAssistantMessage, 'done')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+function runAgyHook(event, payload, dir, tmuxPane = '%1') {
+  runGenericHook('agy', Object.assign({
+    conversationId: 'agy-conv-1',
+    hookEventName: event,
+    cwd: '/tmp/demo',
+    workspacePaths: ['/tmp/demo'],
+    transcriptPath: '/home/u/.gemini/antigravity-cli/brain/agy-conv-1/.system_generated/logs/transcript_full.jsonl',
+    modelName: 'Gemini Pro',
+    lastUserInput: 'list the files'
+  }, payload), dir, ['--event', event], tmuxPane)
+}
+
+test('agy hooks track a turn from its first message to Stop', () => {
+  const dir = tempDir()
+  try {
+    runAgyHook('SessionStart', {}, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0, initialNumSteps: 1 }, dir)
+    runAgyHook('PreToolUse', { stepIdx: 2, toolCall: { id: 't1', name: 'run_command', args: { CommandLine: 'ls -la', toolSummary: 'List files' } } }, dir)
+    let session = readScoutStatus(dir).sessions['agy-conv-1']
+    assert.strictEqual(session.agentType, 'agy')
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.lastUserPrompt, 'list the files')
+    assert.strictEqual(session.workingDirectory, '/tmp/demo')
+    assert.strictEqual(session.pendingToolUse.details, 'run_command: ls -la')
+
+    runAgyHook('PostToolUse', { stepIdx: 2, error: '', toolCall: { id: 't1', name: 'run_command', args: { CommandLine: 'ls -la' } } }, dir)
+    runAgyHook('PreInvocation', { invocationNum: 1, initialNumSteps: 3 }, dir)
+    runAgyHook('Stop', { executionNum: 0, terminationReason: 'NO_TOOL_CALL', error: '', fullyIdle: true, continuationActive: false }, dir)
+    session = readScoutStatus(dir).sessions['agy-conv-1']
+    assert.strictEqual(currentPhase(session), 'completed')
+    assert.strictEqual(session.sessionTitle, 'list the files')
+    assert.strictEqual(session.lastHookEventName, 'Stop')
+
+    // The next message opens the next turn.
+    runAgyHook('PreInvocation', { invocationNum: 0, initialNumSteps: 5, lastUserInput: 'now count them' }, dir)
+    session = readScoutStatus(dir).sessions['agy-conv-1']
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.lastUserPrompt, 'now count them')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy ask_question waits for an answer until its PostToolUse', () => {
+  const dir = tempDir()
+  try {
+    const call = { id: 'q1', name: 'ask_question', args: { questions: [{ is_multi_select: false, options: ['a.txt', 'b.txt'], question: 'Which file should I read?' }] } }
+    runAgyHook('SessionStart', {}, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0 }, dir)
+    runAgyHook('PreToolUse', { toolCall: call }, dir)
+    let session = readScoutStatus(dir).sessions['agy-conv-1']
+    assert.strictEqual(currentPhase(session), 'waitingForAnswer')
+    assert.strictEqual(session.pendingInteraction.details, 'Which file should I read?')
+
+    runAgyHook('PostToolUse', { error: '', toolCall: call }, dir)
+    session = readScoutStatus(dir).sessions['agy-conv-1']
+    assert.strictEqual(currentPhase(session), 'running')
+    assert.strictEqual(session.pendingInteraction, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy Stop reasons: cancelled is interrupted, errors fail', () => {
+  const dir = tempDir()
+  try {
+    runAgyHook('SessionStart', {}, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0 }, dir)
+    runAgyHook('Stop', { terminationReason: 'USER_CANCELED', fullyIdle: true }, dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions['agy-conv-1']), 'interrupted')
+
+    runAgyHook('PreInvocation', { invocationNum: 0, lastUserInput: 'try again' }, dir)
+    runAgyHook('Stop', { terminationReason: 'MAX_TOKEN_BUDGET_EXCEEDED', error: '', fullyIdle: true }, dir)
+    const session = readScoutStatus(dir).sessions['agy-conv-1']
+    assert.strictEqual(session.error, 'MAX_TOKEN_BUDGET_EXCEEDED')
+    assert.strictEqual(session.lastEvent.type, AGENT_EVENTS.STOP_FAILURE)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy hooks ignore payloads from the desktop app, the IDE, or without a conversation', () => {
+  const dir = tempDir()
+  try {
+    runAgyHook('PreInvocation', { invocationNum: 0, transcriptPath: '/home/u/.gemini/antigravity/brain/x/transcript.jsonl' }, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0, transcriptPath: '/home/u/.gemini/antigravity-ide/brain/x/transcript.jsonl' }, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0, conversationId: '' }, dir)
+    const statusPath = path.join(dir, '.tmux-scout', 'status.json')
+    const sessions = fs.existsSync(statusPath) ? readScoutStatus(dir).sessions : {}
+    assert.deepStrictEqual(Object.keys(sessions), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy: a later model call writes nothing, but reopens a turn that ended', () => {
+  const dir = tempDir()
+  try {
+    runAgyHook('SessionStart', {}, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0 }, dir)
+    const before = readScoutStatus(dir).sessions['agy-conv-1'].lastHookAt
+    runAgyHook('PreInvocation', { invocationNum: 1 }, dir)
+    assert.strictEqual(readScoutStatus(dir).sessions['agy-conv-1'].lastHookAt, before)
+
+    runAgyHook('Stop', { terminationReason: 'NO_TOOL_CALL', fullyIdle: false }, dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions['agy-conv-1']), 'completed')
+    // A background task reporting back starts the model without a new message.
+    runAgyHook('PreInvocation', { invocationNum: 1 }, dir)
+    assert.strictEqual(currentPhase(readScoutStatus(dir).sessions['agy-conv-1']), 'running')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('agy: a new conversation in the same pane ends the previous one', () => {
+  const dir = tempDir()
+  try {
+    runAgyHook('SessionStart', {}, dir)
+    runAgyHook('PreInvocation', { invocationNum: 0 }, dir)
+    // Esc sends no Stop, so the first conversation is still running at /clear.
+    runAgyHook('SessionStart', { conversationId: 'agy-conv-2', lastUserInput: 'start over' }, dir)
+    runAgyHook('PreInvocation', { conversationId: 'agy-conv-2', invocationNum: 0, lastUserInput: 'start over' }, dir)
+    const sessions = readScoutStatus(dir).sessions
+    assert.strictEqual(currentPhase(sessions['agy-conv-1']), 'completed')
+    assert.strictEqual(currentPhase(sessions['agy-conv-2']), 'running')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

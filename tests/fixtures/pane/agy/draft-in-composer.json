@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 with an unsent instruction typed into the composer",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

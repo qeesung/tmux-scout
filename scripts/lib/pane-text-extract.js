@@ -27,8 +27,17 @@ const TITLE_MAX = 100
 // `placeholders` are greyed hint strings shown in an EMPTY composer; matching
 // one means the box is empty, not that the user typed that text.
 //
-// Verified against live panes: claude, codex. The others are extrapolated from
-// the same shape and should be confirmed before being relied on.
+// `promptAfterRule` says a prompt echo always sits directly under a rule. It is
+// how agy's turns are told apart from the other ">" lines in its transcript: a
+// local slash command ("> /model" over its "⎿" result), the answer picked in a
+// question dialog ("> a.txt" under "? Which file…"), and a dialog's selected
+// option ("> 1. Yes, run command") all start at column zero with the same
+// glyph, and none of them follows a rule. Without it any of these would read as
+// the session's prompt, and a session that was never asked anything would
+// pass the never-prompted guard.
+//
+// Verified against live panes: claude, codex, agy. The others are extrapolated
+// from the same shape and should be confirmed before being relied on.
 const PANE_PATTERNS = Object.freeze({
   claude: {
     markers: ['❯', '>'],
@@ -61,6 +70,23 @@ const PANE_PATTERNS = Object.freeze({
     markers: ['❯'],
     placeholders: ['implement {feature}'],
     toolLine: null
+  },
+  agy: {
+    markers: ['>'],
+    // Mode hints an empty composer shows; default mode shows none.
+    placeholders: [
+      'auto mode: edits & safe commands auto-approved',
+      'accept-edits mode: file edits auto-approved',
+      'plan mode: research & plan only'
+    ],
+    composerRules: true,
+    promptAfterRule: true,
+    toolLine: null,
+    // See extractBusyStatus().
+    busy: {
+      status: /^[\u2800-\u28FF]\s+(\S.*)$/,
+      footer: /^esc to cancel\b/
+    }
   },
   default: {
     markers: ['❯', '›', '»'],
@@ -156,6 +182,7 @@ function locatePrompt(raw, agentType, options = {}) {
     const content = promptContent(lines[i], patterns.markers)
     if (!content) continue
     if (isPlaceholder(content, patterns.placeholders)) continue
+    if (patterns.promptAfterRule && !(i > 0 && RULE_LINE.test(cleanLine(lines[i - 1]).trim()))) continue
     return { prompt: content, composer }
   }
   return { prompt: undefined, composer }
@@ -273,8 +300,43 @@ function extractBackgroundWork(raw, agentType) {
   return null
 }
 
+// How many lines above the composer's upper rule a status line may sit: agy can
+// put a "└ Tip: …" line between the two.
+const BUSY_SEARCH_LINES = 2
+
+// The status line of a turn in progress, read off the raw screen. agy draws one
+// for exactly as long as a turn runs — a braille spinner, then "Generating...",
+// "Working...", "Loading..." or "Running command... 4s" — just above its
+// composer, with a footer that starts "esc to cancel". Normalization removes
+// the spinner before the model sees the screen, and what is left of
+// "Loading..." it took for a finished turn often enough to flip a running
+// session to DONE between two readings of "Working...".
+//
+// The footer is checked too: the footer also says "esc to cancel" while a menu
+// is open, but no status line is drawn then; and a frame left on screen by an
+// agy that exited mid-turn keeps its spinner but sits above a shell prompt.
+//
+// Returns the status text, such as "Loading..."; null when the screen shows
+// none; undefined for a CLI without the pattern.
+function extractBusyStatus(raw, agentType) {
+  const patterns = patternsFor(agentType)
+  const busy = patterns.busy
+  if (!raw || !busy) return undefined
+  const lines = withoutTrailingBlankRows(raw).split('\n')
+  if (!busy.footer.test(String(lines[lines.length - 1] || '').trim())) return null
+  const composer = findComposerIndex(lines, patterns, DEFAULT_COMPOSER_WINDOW)
+  if (composer < 2) return null
+  // composer - 1 is the composer's upper rule.
+  for (let i = composer - 2; i >= Math.max(0, composer - 1 - BUSY_SEARCH_LINES); i--) {
+    const match = String(lines[i] || '').replace(/\s+$/, '').match(busy.status)
+    if (match) return match[1].trim()
+  }
+  return null
+}
+
 module.exports = {
   extractBackgroundWork,
+  extractBusyStatus,
   extractPromptAndTitle,
   extractToolLine
 }

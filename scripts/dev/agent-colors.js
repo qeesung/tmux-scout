@@ -13,7 +13,8 @@ const AGENT_DOCS = {
   kimi: { name: 'Kimi CLI', flag: '--kimi', colorName: 'gray', slug: 'kimi' },
   hermes: { name: 'Hermes', flag: '--hermes', colorName: 'sand', slug: 'hermes' },
   coco: { name: 'Trae CLI', flag: '--trae', colorName: 'bright green', slug: 'trae' },
-  traex: { name: 'Traex CLI', flag: '--traex', colorName: 'mint', slug: 'traex' }
+  traex: { name: 'Traex CLI', flag: '--traex', colorName: 'mint', slug: 'traex' },
+  agy: { name: 'Antigravity CLI', flag: '--agy', colorName: 'gold', slug: 'agy' }
 }
 
 const XTERM_STEPS = [0, 95, 135, 175, 215, 255]

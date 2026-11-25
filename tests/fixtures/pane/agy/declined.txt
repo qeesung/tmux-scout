@@ -1,0 +1,29 @@
+> Run the shell command `sleep 20 && echo done` in this folder and tell me what it printed.
+
+○ Thought for 1m 18s (The command needs to run in the shell and its output reported back to th...)
+● Ran (sleep 20 && echo done) failed (ctrl+o to expand)
+
+────────────────────────────────────────────────────────────
+> Please run `echo hello` in the shell.
+
+○ Thought for 11.9s (A short echo command is enough here; its output will be reported back ...)
+● Ran (echo hello) (ctrl+o to expand)
+
+  Ran echo hello (exit code 0). Output:
+
+    hello
+
+────────────────────────────────────────────────────────────
+> Fetch https://example.com and tell me the page title.
+
+○ Thought for 15.1s (The available tools lack a direct URL fetching capability; `run_command` s...)
+● Ran (curl -sL --max-time 15 https://example.com) failed (ctrl+o to expand)
+
+Command
+  ⎿  User declined the tool call
+
+  ⎿  Interrupted · What should Antigravity CLI do instead?
+────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                               Gemini Pro · high

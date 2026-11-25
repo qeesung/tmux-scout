@@ -1,0 +1,86 @@
+{
+  "name": "agy turn with a question, a shell command and a normal Stop (payloads as agy 1.5.17 sends them)",
+  "agent": "agy",
+  "sessionId": "fixture-agy-completion",
+  "payloadDefaults": {
+    "conversationId": "fixture-agy-completion",
+    "cwd": "/tmp/tmux-scout-fixtures/agy",
+    "workspacePaths": ["/tmp/tmux-scout-fixtures/agy"],
+    "transcriptPath": "/tmp/tmux-scout-fixtures/home/.gemini/antigravity-cli/brain/fixture-agy-completion/.system_generated/logs/transcript_full.jsonl",
+    "artifactDirectoryPath": "/tmp/tmux-scout-fixtures/home/.gemini/antigravity-cli/brain/fixture-agy-completion",
+    "modelName": "Gemini Pro",
+    "lastUserInput": "ask me which file to read, then read it"
+  },
+  "steps": [
+    { "event": "SessionStart", "payload": { "hookEventName": "SessionStart" } },
+    { "event": "PreInvocation", "payload": { "hookEventName": "PreInvocation", "invocationNum": 0, "initialNumSteps": 1 } },
+    {
+      "event": "PreToolUse",
+      "payload": {
+        "hookEventName": "PreToolUse",
+        "stepIdx": 2,
+        "toolCall": {
+          "id": "call_1",
+          "name": "ask_question",
+          "args": { "questions": [{ "is_multi_select": false, "options": ["a.txt", "b.txt"], "question": "Which file should I read?" }] }
+        }
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "payload": {
+        "hookEventName": "PostToolUse",
+        "stepIdx": 2,
+        "error": "",
+        "toolCall": {
+          "id": "call_1",
+          "name": "ask_question",
+          "args": { "questions": [{ "is_multi_select": false, "options": ["a.txt", "b.txt"], "question": "Which file should I read?" }] }
+        }
+      }
+    },
+    { "event": "PreInvocation", "payload": { "hookEventName": "PreInvocation", "invocationNum": 1, "initialNumSteps": 3 } },
+    {
+      "event": "PreToolUse",
+      "payload": {
+        "hookEventName": "PreToolUse",
+        "stepIdx": 4,
+        "toolCall": { "id": "call_2", "name": "run_command", "args": { "CommandLine": "cat a.txt", "WaitMsBeforeAsync": 500, "toolSummary": "Read a.txt" } }
+      }
+    },
+    {
+      "event": "PostToolUse",
+      "payload": {
+        "hookEventName": "PostToolUse",
+        "stepIdx": 4,
+        "error": "",
+        "toolCall": { "id": "call_2", "name": "run_command", "args": { "CommandLine": "cat a.txt", "WaitMsBeforeAsync": 500, "toolSummary": "Read a.txt" } }
+      }
+    },
+    { "event": "PreInvocation", "payload": { "hookEventName": "PreInvocation", "invocationNum": 2, "initialNumSteps": 5 } },
+    {
+      "event": "Stop",
+      "payload": { "hookEventName": "Stop", "executionNum": 0, "terminationReason": "NO_TOOL_CALL", "error": "", "fullyIdle": true, "continuationActive": false }
+    }
+  ],
+  "expect": {
+    "agentType": "agy",
+    "status": "completed",
+    "phase": "completed",
+    "needsAttention": null,
+    "pendingInteraction": null,
+    "pendingToolUse": null,
+    "activeTool": null,
+    "sessionTitle": "ask me which file to read, then read it",
+    "lastUserPrompt": "ask me which file to read, then read it"
+  },
+  "expectEvidenceTypes": [
+    "session_start",
+    "prompt_submit",
+    "question_asked",
+    "question_answered",
+    "post_tool_use",
+    "tool_use",
+    "stop"
+  ]
+}

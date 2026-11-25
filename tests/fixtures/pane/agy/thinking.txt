@@ -1,0 +1,29 @@
+user@host example-repo $ agy
+
+      ▄▀▀▄        Antigravity CLI 1.5.17
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Run the shell command `sleep 20 && echo done` in this folder and tell me what it printed.
+⣟  Generating...                                                                     
+────────────────────────────────────────────────────────────────────────────────────────────────────
+>                                                                                                   
+────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                 Gemini Pro · high
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,9 @@
+{
+  "name": "agy 1.5.17 full-screen mode command approval",
+  "agent": "agy",
+  "expect": {
+    "choice": "awaiting_approval",
+    "phase": "waitingForApproval",
+    "pendingInteractionType": "approval"
+  }
+}

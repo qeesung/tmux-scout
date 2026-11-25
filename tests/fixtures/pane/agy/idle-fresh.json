@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 just started: banner, announcement and an auto-mode hint in the empty composer",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "completed"
+  }
+}

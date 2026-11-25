@@ -1,0 +1,29 @@
+user@host example-repo $ agy
+
+      ▄▀▀▄        Antigravity CLI 1.5.17
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo
+  ▄▀▀      ▀▀▄
+
+
+ ┃ Introducing Gemini Flash
+ ┃ Our best balance of intelligence, cost, and latency. Get building today with Flash.
+ ┃ esc to dismiss
+────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                        auto · Gemini Pro · high
+
+
+
+
+
+
+
+
+
+
+
+
+

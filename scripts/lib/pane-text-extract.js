@@ -85,7 +85,12 @@ const PANE_PATTERNS = Object.freeze({
     // See extractBusyStatus().
     busy: {
       status: /^[\u2800-\u28FF]\s+(\S.*)$/,
-      footer: /^esc to cancel\b/
+      // "esc to cancel", or while a message waits for the turn to end,
+      // "Press up to edit queued messages".
+      footer: /^(esc to cancel|press \S+ to edit queued messages)\b/i,
+      // What may sit between the status line and the composer: a "└ Tip: …",
+      // the plan's indented "⎿ ✓ step" checklist and queued messages.
+      between: /^(\s|└ Tip:|▸ .*\(\S+ to send immediately\)$)/
     }
   },
   default: {
@@ -300,17 +305,25 @@ function extractBackgroundWork(raw, agentType) {
   return null
 }
 
-// How many lines above the composer's upper rule a status line may sit: agy can
-// put a "└ Tip: …" line between the two.
-const BUSY_SEARCH_LINES = 2
+// How far above the composer's upper rule a status line may sit. agy puts a
+// "└ Tip: …" line, the steps of its plan or queued messages between the two; a
+// plan is a line per step.
+const BUSY_SEARCH_LINES = 40
 
 // The status line of a turn in progress, read off the raw screen. agy draws one
 // for exactly as long as a turn runs — a braille spinner, then "Generating...",
-// "Working...", "Loading..." or "Running command... 4s" — just above its
+// "Working...", "Loading...", "Running command... 4s" or a summary of what it
+// is doing, such as "5/6 steps · Checking the parser... 1m 15s" — above its
 // composer, with a footer that starts "esc to cancel". Normalization removes
 // the spinner before the model sees the screen, and what is left of
 // "Loading..." it took for a finished turn often enough to flip a running
-// session to DONE between two readings of "Working...".
+// session to DONE between two readings of "Working...". So did a long turn
+// whose plan's checklist hangs under the status line.
+//
+// Between the status line and the composer only a tip, indented lines and
+// queued messages are skipped: the first other line above the composer must be
+// the status line itself. A finished turn's history above the composer
+// ("● Ran …", "▸ Thought …") stops the search there.
 //
 // The footer is checked too: the footer also says "esc to cancel" while a menu
 // is open, but no status line is drawn then; and a frame left on screen by an
@@ -328,8 +341,10 @@ function extractBusyStatus(raw, agentType) {
   if (composer < 2) return null
   // composer - 1 is the composer's upper rule.
   for (let i = composer - 2; i >= Math.max(0, composer - 1 - BUSY_SEARCH_LINES); i--) {
-    const match = String(lines[i] || '').replace(/\s+$/, '').match(busy.status)
+    const line = String(lines[i] || '').replace(/\s+$/, '')
+    const match = line.match(busy.status)
     if (match) return match[1].trim()
+    if (line && !busy.between.test(line)) return null
   }
   return null
 }

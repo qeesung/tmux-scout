@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 running with a message queued under the status line",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

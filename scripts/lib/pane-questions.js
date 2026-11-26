@@ -27,6 +27,12 @@
 // (n * maxProbability - 1) / (n - 1): adding or removing an outcome shifts the
 // scale, so thresholds must be re-tuned when the outcome list changes.
 
+// v7: agy's working hint. A long turn hangs its plan's checklist under the
+// status line, and a message queued during a turn sits there too with
+// "Press up to edit queued messages" in the footer. Both push the status line
+// out of the bottom lines the model treats as authoritative, and with the
+// spinner normalized away it read a running turn as idle_ready at 0.70.
+//
 // v6: Antigravity CLI (agy) hints, written from live agy 1.5.17 panes. Its
 // approval and question dialogs keep "esc to cancel" in the footer, the same
 // words a running turn shows, so the hints name the status line above the
@@ -76,7 +82,7 @@
 // the confidence scale for every other answer.
 const { lastLines } = require('./pane-capture')
 
-const PANE_QUESTION_SET_VERSION = 6
+const PANE_QUESTION_SET_VERSION = 7
 const BOTTOM_LINES = 8
 
 const AGENT_LABELS = Object.freeze({
@@ -197,10 +203,14 @@ const AGENT_SCREENS = Object.freeze({
       'echoed in the transcript on a line starting with ">" under a rule. Typing "/" in it opens a command menu ' +
       'ending in "tab Complete": the person is typing and the agent is idle.',
     working:
-      'While a turn runs, the line just above the composer\'s upper rule is a status ending in "...": ' +
-      '"Generating...", "Working...", "Loading..." or "Running command... <dur>", sometimes with a "└ Tip:" line ' +
-      'under it. A prompt echo with only that status line under it is a turn that has just started. With no such ' +
-      'line the agent is not working, even though the footer also reads "esc to cancel" while a menu is open.',
+      'While a turn runs, a status line sits above the composer\'s upper rule: "Generating...", "Working...", ' +
+      '"Loading...", "Running command... <dur>", or what the agent is doing cut short and followed by its time, ' +
+      'such as "5/6 steps · Checking the config loader... <dur>". Under it there may be a "└ Tip:" line, the ' +
+      'steps of its plan, from "⎿ ✓ Review the parser changes" to "* Run tests and static checks", or a message ' +
+      'the person queued for later, ending "(alt+m to send immediately)", with "Press up to edit queued messages" ' +
+      'in the footer. Those can push the status line out of the last lines; the turn is still running. A prompt ' +
+      'echo with only that status line under it is a turn that has just started. With no such line the agent is ' +
+      'not working, even though the footer also reads "esc to cancel" while a menu is open.',
     finished:
       'A finished turn leaves no status line: the composer is empty and the footer starts with "? for shortcuts". ' +
       '"* Ran (npm test)" and "▸ Thought for <dur>, <tok>" are history. After the person cancels a turn, a fixed ' +

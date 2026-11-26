@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.17 a long turn whose plan's steps hang under the status line",
+  "agent": "agy",
+  "expect": {
+    "choice": "working",
+    "phase": "running"
+  }
+}

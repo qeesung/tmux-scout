@@ -4393,11 +4393,24 @@ test('agy: the status line over the composer is found only while a turn runs', (
     'loading-after-turn': 'Loading...',
     'loading-tip': 'Loading...',
     'running-command': 'Running command... 4s',
-    'altscreen-running': 'Running command... 4s'
+    'altscreen-running': 'Running command... 4s',
+    // The plan's checklist, or a queued message with its own footer, between
+    // the status line and the composer.
+    'running-plan-steps': '5/6 steps · Rejecting a malformed config before the server starts keeps a bad deploy from ever taking traffic... 1m 15s',
+    'running-queued-message': 'Adjusting responsive layout breakpoints to keep the side panels from crowding the canvas on mid-sized and desktop ... 15s'
   }
   for (const [name, status] of Object.entries(busy)) {
     assert.strictEqual(extractBusyStatus(agyPane(name), 'agy'), status, name)
   }
+  // Only a tip, indented lines and queued messages are looked past: a line of
+  // history at column zero ends the search, so a spinner further up is not this
+  // turn's.
+  const steps = agyPane('running-plan-steps').split('\n')
+  const stepAt = steps.findIndex(line => line.includes('⎿  ✓'))
+  const behindHistory = [...steps.slice(0, stepAt), '● Ran (npm test)', ...steps.slice(stepAt)].join('\n')
+  assert.strictEqual(extractBusyStatus(behindHistory, 'agy'), null)
+  const finished = agyPane('running-queued-message').replace(/\n[^\n]*Press up to edit queued messages[^\n]*/, '\n? for shortcuts')
+  assert.strictEqual(extractBusyStatus(finished, 'agy'), null)
   // The "/" menu keeps "esc to cancel" in the footer with no status line; an
   // exited agy leaves its frame above a shell prompt.
   for (const name of ['idle-fresh', 'slash-menu', 'approval-command', 'question', 'interrupted', 'done-after-tool', 'shell-exited']) {

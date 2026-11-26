@@ -77,8 +77,8 @@ async function commandClassify(args) {
 
   const { capturePaneTail, DEFAULT_TAIL_LINES } = require('./lib/pane-capture')
   const { buildPaneState, paneQuestions, PANE_QUESTION_SET_VERSION } = require('./lib/pane-questions')
-  const { interpretPaneAnswers } = require('./lib/pane-classifier')
-  const { extractPromptAndTitle, extractToolLine } = require('./lib/pane-text-extract')
+  const { interpretPaneAnswers, withBusyStatus } = require('./lib/pane-classifier')
+  const { extractBusyStatus, extractPromptAndTitle, extractToolLine } = require('./lib/pane-text-extract')
   const { createJevClient, resolveApiKey } = require('./lib/jev-client')
 
   const lines = Number.parseInt(args.lines, 10) || DEFAULT_TAIL_LINES
@@ -87,8 +87,14 @@ async function commandClassify(args) {
 
   const paths = pathsFromArgs(args)
   const status = readJson(paths.statusFile, { sessions: {} })
-  const session = Object.values(status.sessions || {}).find(item => item && item.tmuxPane === paneId)
-  const agentType = String(args.agent || (session && session.agentType) || 'claude').toLowerCase()
+  // A pane keeps the records of every agent that ever ran in it; the one that
+  // matters is the requested agent's, else the most recently updated.
+  const onPane = Object.values(status.sessions || {})
+    .filter(item => item && item.tmuxPane === paneId)
+    .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0))
+  const wanted = args.agent ? String(args.agent).toLowerCase() : null
+  const session = (wanted && onPane.find(item => item.agentType === wanted)) || (wanted ? null : onPane[0]) || null
+  const agentType = String(wanted || (session && session.agentType) || 'claude').toLowerCase()
 
   console.log(`pane=${paneId} agent=${agentType} questionSet=v${PANE_QUESTION_SET_VERSION}`)
   console.log(`fingerprint=${capture.fingerprint} raw=${capture.raw.length}B normalized=${capture.text.length}B ` +
@@ -101,8 +107,10 @@ async function commandClassify(args) {
 
   const extracted = extractPromptAndTitle(capture.raw, agentType) || {}
   const tool = extractToolLine(capture.raw, agentType) || {}
+  const busyStatus = extractBusyStatus(capture.raw, agentType)
   console.log(`\nextracted  title=${JSON.stringify(extracted.sessionTitle)} ` +
-    `prompt=${JSON.stringify(extracted.lastUserPrompt)} tool=${JSON.stringify(tool.tool)}`)
+    `prompt=${JSON.stringify(extracted.lastUserPrompt)} tool=${JSON.stringify(tool.tool)}` +
+    (busyStatus === undefined ? '' : ` status=${JSON.stringify(busyStatus)}`))
 
   const log = message => console.error(message)
   const client = createJevClient({ apiKey: resolveApiKey(null, log), log })
@@ -126,11 +134,15 @@ async function commandClassify(args) {
   // The watcher's own thresholds: showing the default gate while it runs with a
   // configured one reports a verdict it would not reach.
   const { paneModelThresholds, readTmuxOption } = require('./lib/state-source')
-  const interp = interpretPaneAnswers(result.answers, {
+  const now = session ? currentPhase(session) : null
+  const reading = interpretPaneAnswers(result.answers, {
     agentType,
-    currentPhase: session ? currentPhase(session) : null,
+    currentPhase: now,
     thresholds: paneModelThresholds(readTmuxOption)
   })
+  // The watcher's status-line override, so the verdict is the one it reaches.
+  const interp = withBusyStatus(reading, { busyStatus }, now)
+  if (interp !== reading) console.log(`\nmodel read ${reading.verdict} (${reading.phase || 'null'}); the status line overrides it`)
   console.log(`\nverdict=${interp.verdict} gate=${interp.gate} phase=${interp.phase || 'null'} ` +
     `tool=${interp.activeTool || 'none'} resolvesWait=${interp.resolvesWait}`)
   if (interp.blockedReason) console.log(`blocked: ${interp.blockedReason}`)

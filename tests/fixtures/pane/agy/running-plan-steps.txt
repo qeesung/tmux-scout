@@ -1,0 +1,36 @@
+
+
+
+
+
+
+
+
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.17
+     ▀▀▀▀▀▀       user@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini Pro (High)
+   ▄▀▀    ▀▀▄     ~/repos/example-repo
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Review the changes on this branch against main.
+
+○ Thought for 3m 26s (Tests and static checks pass; the failures left come from the local environment, not from the changes u...)
+● Ran 3 commands (git status · git log · git show)
+● Explored 7 files (parser.go, lexer.go, token.go, +4)
+… 54 more actions (40 reads, 13 commands, 1 task: 3 failed) …
+● Ran (go vet ./... && echo "=== VET OK ===" && grep -E "^(PASS|FAIL|--- FAIL)" ~/repos/example-repo/test.log) (ctrl+o to expand)
+● Explored 4 files (config.go, config_test.go, server.go, +1) (ctrl+o to expand)
+⣽  5/6 steps · Rejecting a malformed config before the server starts keeps a bad deploy from ever taking traffic... 1m 15s
+  ⎿  ✓ Inspect the commit history
+     ✓ Review the parser changes
+     ✓ Review the lexer and token changes
+     ✓ Review the config loader
+     ✓ Review the HTTP handlers
+     ● Run tests and static checks
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                                                  auto · Gemini Pro · high

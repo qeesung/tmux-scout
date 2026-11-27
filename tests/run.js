@@ -4419,6 +4419,30 @@ test('agy: the status line over the composer is found only while a turn runs', (
   assert.strictEqual(extractBusyStatus(agyPane('loading-after-turn'), 'claude'), undefined)
 })
 
+test('agy: subagents still at work keep a finished turn running', () => {
+  // They are listed under the composer between rules of their own, so the
+  // composer is found above that list however many lines it runs to.
+  const screen = agyPane('subagents-running')
+  const extracted = extractPromptAndTitle(screen, 'agy')
+  assert.strictEqual(extracted.composer, true)
+  assert.strictEqual(extractBackgroundWork(screen, 'agy'), '3 subagents still running')
+  assert.strictEqual(extractBusyStatus(screen, 'agy'), null)
+  const one = screen.replace('3 subagent(s)', '1 subagent(s)')
+  assert.strictEqual(extractBackgroundWork(one, 'agy'), '1 subagent still running')
+  // A background command is listed the same way, but its footer counts tasks,
+  // which do not keep the turn open.
+  assert.strictEqual(extractBackgroundWork(agyPane('running-command'), 'agy'), null)
+  assert.strictEqual(extractBackgroundWork(agyPane('done-after-tool'), 'agy'), null)
+  // Claude's composer is still only ever the lowest pair of rules.
+  assert.strictEqual(extractPromptAndTitle(screen, 'claude').composer, false)
+
+  const session = { sessionId: 's1', agentType: 'agy', phase: 'running', status: 'working', lastUserPrompt: 'review it', stateEvidence: [] }
+  const options = { extracted: Object.assign({}, extracted, { backgroundWork: extractBackgroundWork(screen, 'agy') }) }
+  for (const event of paneEvents(confidently('idle_ready'), session, { options })) applySessionEvent(session, event)
+  assert.strictEqual(currentPhase(session), 'running')
+  assert.strictEqual(session.backgroundWork, '3 subagents still running')
+})
+
 test('agy: a status line on screen keeps a turn running whatever the reading', () => {
   const extracted = { busyStatus: 'Loading...', lastUserPrompt: 'list the files' }
   const toPhase = (answers, phase) => {

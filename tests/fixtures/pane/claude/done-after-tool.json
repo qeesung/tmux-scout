@@ -1,8 +1,8 @@
 {
-  "name": "claude finished its turn; a past-tense 'done' status line sits above the empty composer",
+  "name": "claude finished its turn; a past-tense 'done' status line sits above the empty composer, with a shell still running, so the session stays running",
   "agent": "claude",
   "expect": {
     "choice": "idle_ready",
-    "phase": "completed"
+    "phase": "running"
   }
 }

@@ -80,6 +80,9 @@ const PANE_PATTERNS = Object.freeze({
       'plan mode: research & plan only'
     ],
     composerRules: true,
+    // Background commands and subagents are listed under the composer, in a
+    // second pair of rules above the footer.
+    composerSections: 2,
     promptAfterRule: true,
     toolLine: null,
     // See extractBusyStatus().
@@ -91,6 +94,14 @@ const PANE_PATTERNS = Object.freeze({
       // What may sit between the status line and the composer: a "└ Tip: …",
       // the plan's indented "⎿ ✓ step" checklist and queued messages.
       between: /^(\s|└ Tip:|▸ .*\(\S+ to send immediately\)$)/
+    },
+    // See extractBackgroundWork(). A turn that hands work to subagents ends
+    // while they run, and they report back to a turn of its own; the footer
+    // counts them, as in "auto · Gemini Pro · high · 3 subagent(s)". The
+    // "1 task(s) · /tasks" of a background command is not counted.
+    background: {
+      footer: /·\s*(\d+)\s+subagent\(s\)(?=\s*(?:·|$))/,
+      describe: match => `${match[1]} subagent${match[1] === '1' ? '' : 's'} still running`
     }
   },
   default: {
@@ -138,6 +149,9 @@ const RULE_LINE = /^[─━]{10,}$/
 // Status lines under the lower rule; generous, since some CLIs draw two.
 const RULE_SEARCH_LINES = 6
 
+// `composerSections` is how many rule-bounded sections, counted up from the
+// lowest, may hold the composer: agy lists background work under its composer
+// between rules of its own, however many lines that list runs to.
 function ruleBoundedComposer(lines, patterns) {
   const floor = Math.max(0, lines.length - RULE_SEARCH_LINES)
   let lower = -1
@@ -145,11 +159,15 @@ function ruleBoundedComposer(lines, patterns) {
     if (RULE_LINE.test(cleanLine(lines[i]).trim())) { lower = i; break }
   }
   if (lower < 0) return -1
-  for (let i = lower - 1; i >= 0; i--) {
+  let sections = patterns.composerSections || 1
+  for (let i = lower - 1; i >= 0 && sections > 0; i--) {
     if (!RULE_LINE.test(cleanLine(lines[i]).trim())) continue
     // The marker is the first line inside the pair; anything else between two
-    // rules (a dialog's own borders) is not a composer.
-    return i + 1 < lower && promptContent(lines[i + 1], patterns.markers) !== null ? i + 1 : -1
+    // rules (a dialog's own borders, a list of background work) is not a
+    // composer.
+    if (i + 1 < lower && promptContent(lines[i + 1], patterns.markers) !== null) return i + 1
+    lower = i
+    sections--
   }
   return -1
 }
@@ -274,6 +292,9 @@ const LABELLED_RULE_LINE = /^[─━]{10,}/
 // "← 3 agents" in the same footer is neither: it is on every pane, finished
 // turns and running ones alike, and says nothing about what is running.
 //
+// agy has only the footer: "· 3 subagent(s)" while subagents a turn started
+// are still at work (see PANE_PATTERNS.agy.background).
+//
 // Returns what is running, such as "1 shell still running"; null when the
 // composer was found and nothing is; undefined when there is no telling.
 function extractBackgroundWork(raw, agentType) {
@@ -284,8 +305,9 @@ function extractBackgroundWork(raw, agentType) {
   const composer = findComposerIndex(lines, patterns, DEFAULT_COMPOSER_WINDOW)
   if (composer < 0) return undefined
 
+  const describe = background.describe || (match => `${match[1]} still running`)
   // The status line first: it names agents as well as shells.
-  const floor = Math.max(0, composer - 1 - STATUS_SEARCH_LINES)
+  const floor = background.statusLine ? Math.max(0, composer - 1 - STATUS_SEARCH_LINES) : composer
   for (let i = composer - 1; i >= floor; i--) {
     const line = cleanLine(lines[i])
     if (LABELLED_RULE_LINE.test(line.trim())) continue
@@ -300,7 +322,7 @@ function extractBackgroundWork(raw, agentType) {
   while (lower < lines.length && !LABELLED_RULE_LINE.test(cleanLine(lines[lower]).trim())) lower++
   for (let i = lower + 1; i < lines.length; i++) {
     const match = cleanLine(lines[i]).match(background.footer)
-    if (match) return `${match[1]} still running`
+    if (match) return describe(match)
   }
   return null
 }

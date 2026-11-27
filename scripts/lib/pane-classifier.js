@@ -445,5 +445,6 @@ module.exports = {
   interpretPaneAnswers,
   paneEventsFromInterpretation,
   waitExitReached,
+  withBackgroundWork,
   withBusyStatus
 }

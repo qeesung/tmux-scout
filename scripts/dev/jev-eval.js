@@ -16,8 +16,8 @@
 const { loadPaneFixtures } = require('../lib/pane-fixtures')
 const { captureFromText } = require('../lib/pane-capture')
 const { buildPaneState, paneQuestions, PANE_QUESTION_SET_VERSION } = require('../lib/pane-questions')
-const { interpretPaneAnswers, withBusyStatus } = require('../lib/pane-classifier')
-const { extractBusyStatus } = require('../lib/pane-text-extract')
+const { interpretPaneAnswers, withBackgroundWork, withBusyStatus } = require('../lib/pane-classifier')
+const { extractBackgroundWork, extractBusyStatus } = require('../lib/pane-text-extract')
 const { createJevClient, resolveApiKey } = require('../lib/jev-client')
 
 const { USD_PER_INPUT_MTOK } = require('../lib/pane-metrics')
@@ -97,12 +97,21 @@ async function main() {
     const confidence = answers.screen_state.confidence
     const expected = fixture.expect.choice
     const reading = interpretPaneAnswers(answers, { currentPhase: 'running' })
-    // What the watcher acts on: a status line the extractor finds overrides a
-    // reading that the turn is over (see withBusyStatus), so the row is judged
+    // What the watcher acts on: a status line, or work left running in the
+    // background, that the extractor finds overrides a reading that the turn
+    // is over (see withBusyStatus and withBackgroundWork), so the row is judged
     // by the phase that results rather than by the model's choice alone.
-    const interp = withBusyStatus(reading, { busyStatus: extractBusyStatus(fixture.text, fixture.agent) }, 'running')
+    const extracted = {
+      busyStatus: extractBusyStatus(fixture.text, fixture.agent),
+      backgroundWork: extractBackgroundWork(fixture.text, fixture.agent)
+    }
+    const interp = withBackgroundWork(withBusyStatus(reading, extracted, 'running'), extracted)
     const overridden = interp !== reading
-    const agrees = actual === expected || (overridden && interp.phase === (fixture.expect.phase || null))
+    // Where the extractor decides the phase, a choice either side of it lands
+    // on the same phase: a screen whose turn handed work to subagents reads as
+    // working or as finished, and is running either way.
+    const decided = overridden || Boolean(extracted.backgroundWork)
+    const agrees = actual === expected || (decided && interp.phase === (fixture.expect.phase || null))
     // A wrong answer the gate rejects costs nothing; a wrong answer it accepts
     // is what actually moves a session into the wrong state.
     const phaseMatches = interp.phase === (fixture.expect.phase || null)
@@ -113,7 +122,8 @@ async function main() {
     console.log(
       `${mark} ${pad(fixture.id, 28)} ${pad(actual, 22)} conf=${confidence.toFixed(2)} ` +
       `gate=${pad(interp.gate, 7)} phase=${pad(interp.phase || 'null', 19)} ${phaseMatches ? '' : `(expected ${fixture.expect.phase})`}` +
-      (overridden ? ` [status line: ${interp.busyStatus}]` : '')
+      (interp.busyStatus ? ` [status line: ${interp.busyStatus}]` : '') +
+      (interp.backgroundWork ? ` [${interp.backgroundWork}]` : '')
     )
     if (args.verbose) {
       for (const [name, answer] of Object.entries(answers)) {

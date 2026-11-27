@@ -1,0 +1,8 @@
+{
+  "name": "agy 1.5.18 waiting on three subagents it started, listed under the composer",
+  "agent": "agy",
+  "expect": {
+    "choice": "idle_ready",
+    "phase": "running"
+  }
+}
